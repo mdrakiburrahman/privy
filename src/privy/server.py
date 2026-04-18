@@ -29,6 +29,7 @@ import websocket
 from privy._relay import create_listen_url, create_sas_token, fqdn
 from privy.executor import execute
 from privy.protocol import ExecRequest, ExecResponse
+from privy.proxy import PROXY_KIND, ProxyRequest, ProxyResponse, handle_proxy_request
 
 
 def _ensure_default_logging() -> None:
@@ -141,6 +142,7 @@ class RelayServer:
         key: str,
         max_workers: int = 8,
         recv_timeout_s: float = 1.0,
+        proxy_target: str | None = None,
     ) -> None:
         if not all([namespace, path, keyrule, key]):
             raise ValueError("namespace, path, keyrule and key are all required")
@@ -150,6 +152,7 @@ class RelayServer:
         self._key = key
         self._max_workers = max_workers
         self._recv_timeout_s = recv_timeout_s
+        self._proxy_target = proxy_target
 
         self._stop = threading.Event()
         self._listening = threading.Event()
@@ -257,8 +260,12 @@ class RelayServer:
     def _handle_inline(self, ws: websocket.WebSocket, req_meta: dict[str, Any]) -> None:
         try:
             payload_raw = self._maybe_recv_body(ws, req_meta)
-            response = self._execute(payload_raw, request_id=req_meta.get("id"))
-            self._send_response(ws, req_meta.get("id"), response.to_json())
+            result = self._execute(payload_raw, request_id=req_meta.get("id"))
+            if isinstance(result, str):
+                # Proxy response — already JSON
+                self._send_response(ws, req_meta.get("id"), result)
+            else:
+                self._send_response(ws, req_meta.get("id"), result.to_json())
         except Exception as exc:  # noqa: BLE001
             log.exception("inline request handler crashed: %s", exc)
 
@@ -285,8 +292,11 @@ class RelayServer:
                 return
             inner = first.get("request", {})
             payload_raw = self._maybe_recv_body(opws, inner)
-            response = self._execute(payload_raw, request_id=inner.get("id") or req_meta.get("id"))
-            self._send_response(opws, inner.get("id") or req_meta.get("id"), response.to_json())
+            result = self._execute(payload_raw, request_id=inner.get("id") or req_meta.get("id"))
+            if isinstance(result, str):
+                self._send_response(opws, inner.get("id") or req_meta.get("id"), result)
+            else:
+                self._send_response(opws, inner.get("id") or req_meta.get("id"), result.to_json())
         finally:
             try:
                 opws.close()
@@ -315,7 +325,8 @@ class RelayServer:
         ws.send(json.dumps(frame))
         ws.send(body_json)
 
-    def _execute(self, payload_raw: str | None, *, request_id: Any) -> ExecResponse:
+    def _execute(self, payload_raw: str | None, *, request_id: Any) -> ExecResponse | str:
+        """Execute a request. Returns ExecResponse for code, or JSON string for proxy."""
         if not payload_raw:
             return ExecResponse.from_output(
                 exit_code=2,
@@ -324,6 +335,18 @@ class RelayServer:
                 duration_ms=0,
                 error="empty_body",
             )
+
+        # Check if this is an HTTP proxy request
+        try:
+            raw_obj = json.loads(payload_raw)
+            if raw_obj.get("kind") == PROXY_KIND and self._proxy_target:
+                proxy_req = ProxyRequest.from_json(payload_raw)
+                log.info("PROXY %s %s → %s", proxy_req.method, proxy_req.path, self._proxy_target)
+                proxy_resp = handle_proxy_request(proxy_req, self._proxy_target)
+                return proxy_resp.to_json()
+        except (json.JSONDecodeError, KeyError):
+            pass
+
         try:
             req = ExecRequest.from_json(payload_raw)
         except Exception as exc:  # noqa: BLE001
