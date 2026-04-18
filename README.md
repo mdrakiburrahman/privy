@@ -119,3 +119,36 @@ r = c.run_bash("pip install pandas")
 r = c.run_python("import pandas; print(pandas.__version__)")
 print(r.exit_code, r.stdout, r.stderr)
 ```
+
+# Browse a Fabric served API/UI locally
+
+In the Fabric notebook cell where you start Privy, use `proxy_target`:
+
+```python
+from privy import RelayServer
+RelayServer(
+    namespace="...", path="...", keyrule="...", key="...",
+    proxy_target="http://127.0.0.1:8080",
+).serve_forever()
+```
+
+On your laptop — start the local proxy:
+
+```bash
+set -a; source .env; set +a
+uv run python -c "
+import os
+from privy import ProxyClientServer
+
+proxy = ProxyClientServer(
+    namespace=os.environ['PRIVY_RELAY_NAMESPACE'],
+    path=os.environ['PRIVY_RELAY_PATH'],
+    keyrule=os.environ['PRIVY_RELAY_KEYRULE'],
+    key=os.environ['PRIVY_RELAY_KEY'],
+    local_port=3000,
+)
+proxy.serve_forever()
+"
+```
+
+Open http://localhost:3000 in your browser and browse the UI!
