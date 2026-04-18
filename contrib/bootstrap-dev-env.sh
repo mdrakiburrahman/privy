@@ -18,6 +18,7 @@ command -v python &>/dev/null || PACKAGES="python3 python-is-python3 python3-ven
 command -v pip &>/dev/null || PACKAGES="$PACKAGES python3-pip"
 command -v curl &>/dev/null || PACKAGES="$PACKAGES curl"
 command -v gh &>/dev/null || PACKAGES="$PACKAGES gh"
+command -v jq &>/dev/null || PACKAGES="$PACKAGES jq"
 
 [ -n "$PACKAGES" ] && sudo apt-get update -qq && sudo apt-get install -yqq $PACKAGES
 

@@ -5,6 +5,26 @@ Remote Python/bash execution over Azure Relay. Server runs in a Fabric notebook;
 ## Setup
 
 ```bash
+SUB="..."
+RG="..."
+NS="..."
+HC="demo"
+RULE="demo-listen-send"
+
+az account set --subscription "$SUB"
+az relay hyco create -g "$RG" --namespace-name "$NS" -n "$HC" --requires-client-authorization false 2>/dev/null || true
+az relay hyco authorization-rule create -g "$RG" --namespace-name "$NS" --hybrid-connection-name "$HC" -n "$RULE" --rights Listen Send 2>/dev/null || true
+KEY=$(az relay hyco authorization-rule keys list -g "$RG" --namespace-name "$NS" --hybrid-connection-name "$HC" -n "$RULE" --query primaryKey -o tsv)
+
+jq -n \
+  --arg namespace "$NS" \
+  --arg path "$HC" \
+  --arg keyrule "$RULE" \
+  --arg key "$KEY" \
+  '{namespace:$namespace, path:$path, keyrule:$keyrule, key:$key}' > credentials.json
+```
+
+```bash
 cp .env.template .env      # fill in values
 set -a; source .env; set +a
 uv sync                    # re-run after any pyproject.toml change

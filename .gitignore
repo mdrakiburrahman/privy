@@ -8,6 +8,7 @@ __pycache__/
 
 # Secrets
 .env
+credentials.json
 
 # C extensions
 *.so
