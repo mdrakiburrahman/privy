@@ -50,11 +50,17 @@
 
   ```bash
   curl -fsSL https://gh.io/copilot-install | bash
-  $HOME/.local/bin/copilot -i /login
+  $HOME/.local/bin/copilot --yolo
   ```
 
-1. Login to github and ensure to authorize `Microsoft` if you're an employee (optional):
+1. Login to github:
 
    ```bash
    gh auth login
+   ```
+
+1. If `uv` (or other tools installed by the bootstrapper) isn't found in a shell that was already open before running step 4, reload your shell config to pick up the updated `PATH`:
+
+   ```bash
+   source ~/.bashrc
    ```

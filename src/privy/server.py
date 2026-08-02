@@ -29,7 +29,7 @@ import websocket
 from privy._relay import create_listen_url, create_sas_token, fqdn
 from privy.executor import execute
 from privy.protocol import ExecRequest, ExecResponse
-from privy.proxy import PROXY_KIND, ProxyRequest, ProxyResponse, handle_proxy_request
+from privy.proxy import PROXY_KIND, ProxyRequest, handle_proxy_request
 
 
 def _ensure_default_logging() -> None:
