@@ -101,7 +101,7 @@ print(c.run_python('import sys; print(sys.version)').stdout)
 
 ```python
 from privy import RelayServer
-RelayServer(namespace="...", path="...", keyrule="...", key="...").serve_forever()
+RelayServer(namespace="...", path="...", keyrule="...", key="...", inprocess_globals={"spark": spark, "sc": sc}).serve_forever()
 ```
 
 ## Client
