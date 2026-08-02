@@ -5,13 +5,15 @@ Remote Python/bash execution over Azure Relay. Server runs in a Fabric notebook;
 ## Setup
 
 ```bash
-SUB="..."
-RG="..."
-NS="..."
-HC="demo"
-RULE="demo-listen-send"
+SUB="ce859648-30e1-4135-9d0f-8358aebfe789"
+RG="fabricbenchmark"
+NS="fabricbenchmark"
+HC="dbt"
+RULE="dbt-listen-send"
 
 az account set --subscription "$SUB"
+az group create -n "$RG" -l eastus 2>/dev/null || true
+az relay namespace create -g "$RG" -n "$NS" -l eastus 2>/dev/null || true
 az relay hyco create -g "$RG" --namespace-name "$NS" -n "$HC" --requires-client-authorization true 2>/dev/null || true
 az relay hyco authorization-rule create -g "$RG" --namespace-name "$NS" --hybrid-connection-name "$HC" -n "$RULE" --rights Listen Send 2>/dev/null || true
 KEY=$(az relay hyco authorization-rule keys list -g "$RG" --namespace-name "$NS" --hybrid-connection-name "$HC" -n "$RULE" --query primaryKey -o tsv)
@@ -25,6 +27,7 @@ EOF
 ```
 
 ```bash
+source ~/.bashrc
 set -a; source .env; set +a
 uv sync                    # re-run after any pyproject.toml change
 ```
@@ -151,3 +154,38 @@ proxy.serve_forever()
 ```
 
 Open http://localhost:3000 in your browser and browse the UI!
+
+## Stress test (32 concurrent calls)
+
+Terminal 1 — server:
+
+```bash
+set -a; source .env; set +a
+uv run python -c "
+import os
+from privy import RelayServer
+RelayServer(
+    namespace=os.environ['PRIVY_RELAY_NAMESPACE'],
+    path=os.environ['PRIVY_RELAY_PATH'],
+    keyrule=os.environ['PRIVY_RELAY_KEYRULE'],
+    key=os.environ['PRIVY_RELAY_KEY'],
+).serve_forever()
+"
+```
+
+Terminal 2 — client:
+
+```bash
+set -a; source .env; set +a
+uv run python -c "
+import os, time
+from concurrent.futures import ThreadPoolExecutor
+from privy import RelayClient
+c = RelayClient(**{k[12:].lower(): v for k, v in os.environ.items() if k.startswith('PRIVY_RELAY_')})
+NUM_CALLS = 10
+def worker(t):
+    for i in range(NUM_CALLS):
+        t0 = time.time(); c.run_bash('echo hi'); print(f'thread {t:02d} call {i:02d}: {time.time()-t0:.3f}s')
+with ThreadPoolExecutor(32) as ex: list(ex.map(worker, range(32)))
+"
+```

@@ -12,10 +12,10 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import urllib.request
 import urllib.error
+import urllib.request
 from dataclasses import dataclass
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 import requests as req_lib
@@ -40,13 +40,15 @@ class ProxyRequest:
     kind: str = PROXY_KIND
 
     def to_json(self) -> str:
-        return json.dumps({
-            "kind": self.kind,
-            "method": self.method,
-            "path": self.path,
-            "headers": self.headers,
-            "body_b64": self.body_b64,
-        })
+        return json.dumps(
+            {
+                "kind": self.kind,
+                "method": self.method,
+                "path": self.path,
+                "headers": self.headers,
+                "body_b64": self.body_b64,
+            }
+        )
 
     @classmethod
     def from_json(cls, raw: str | bytes) -> ProxyRequest:
@@ -70,12 +72,14 @@ class ProxyResponse:
     body_b64: str = ""
 
     def to_json(self) -> str:
-        return json.dumps({
-            "kind": PROXY_KIND,
-            "status": self.status,
-            "headers": self.headers,
-            "body_b64": self.body_b64,
-        })
+        return json.dumps(
+            {
+                "kind": PROXY_KIND,
+                "status": self.status,
+                "headers": self.headers,
+                "body_b64": self.body_b64,
+            }
+        )
 
     @classmethod
     def from_json(cls, raw: str | bytes) -> ProxyResponse:
@@ -90,6 +94,7 @@ class ProxyResponse:
 
 
 # ── Server-side: forward to local target ────────────────────────────
+
 
 def handle_proxy_request(proxy_req: ProxyRequest, target: str) -> ProxyResponse:
     """Forward a ProxyRequest to *target* and return a ProxyResponse."""
@@ -133,6 +138,7 @@ def handle_proxy_request(proxy_req: ProxyRequest, target: str) -> ProxyResponse:
 
 
 # ── Client-side: local HTTP server → relay → Fabric ────────────────
+
 
 class ProxyHandler(BaseHTTPRequestHandler):
     """HTTP handler that forwards requests through Azure Relay."""
