@@ -2,7 +2,9 @@
 
 Remote Python/bash execution over Azure Relay. Server runs in a Fabric notebook; clients POST code and get back stdout/stderr/exit_code.
 
-Work that runs longer than Azure Relay's ~60s response deadline is handled automatically — see [Long-running work](#long-running-work).
+![Architecture](.imgs/relay-tunnel.png)
+
+> [See more here - How to setup a secured tunnel from your local machine to Fabric, Databricks, Synapse or anywhere else](https://www.rakirahman.me/relay-tunnel/).
 
 ## Setup
 
