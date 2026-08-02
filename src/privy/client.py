@@ -148,8 +148,7 @@ class RelayClient:
         )
         if not result.job_id:
             raise RuntimeError(
-                "listener did not return a job_id — it is running a privy "
-                "version without async job support"
+                "listener did not return a job_id — it is running a privy version without async job support"
             )
         return result.job_id
 

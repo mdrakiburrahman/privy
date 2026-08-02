@@ -28,34 +28,18 @@ PRIVY_RELAY_KEY=$KEY
 EOF
 ```
 
+## Loop
+
 ```bash
 source ~/.bashrc
 set -a; source .env; set +a
+
 uv sync                    # re-run after any pyproject.toml change
-```
-
-## Build
-
-```bash
-uv build                   # → dist/privy-0.0.1-py3-none-any.whl
-```
-
-## Test
-
-```bash
-uv run pytest              # 21 tests; e2e ones hit real Relay
-```
-
-## Lint
-
-```bash
 uv run ruff check .        # static checks
 uv run ruff format .       # autoformat
-```
+uv run pytest              # unit tests
+uv build                   # → dist/privy-<version>-py3-none-any.whl (version comes from src/privy/__init__.py)
 
-## Upload wheel
-
-```bash
 ./scripts/upload_whl.sh    # az storage blob upload --overwrite
 ```
 
@@ -98,7 +82,7 @@ print(c.run_python('import sys; print(sys.version)').stdout)
 ## Fabric notebook (server)
 
 ```python
-%pip install --force-reinstall https://rakirahman.blob.core.windows.net/public/whls/privy-0.0.1-py3-none-any.whl
+%pip install --force-reinstall https://rakirahman.blob.core.windows.net/public/whls/privy-0.1.0-py3-none-any.whl
 ```
 
 ```python

@@ -104,7 +104,9 @@ def test_submit_returns_job_id_immediately():
 
 
 def test_poll_long_polls_until_done():
-    resp = execute(ExecRequest(kind="python", code="import time; time.sleep(1); print('ok')", action="submit"))
+    resp = execute(
+        ExecRequest(kind="python", code="import time; time.sleep(1); print('ok')", action="submit")
+    )
     # A single generous poll should return the finished result, not "running".
     final = poll_job(resp.job_id or "", wait_s=10.0)
     assert final.state == "done"
