@@ -150,12 +150,12 @@ minute:
 504 ... the listener did not respond in the required time
 ```
 
-That is a *transport* limit, not a limit on your code — a five-minute Spark
+That is a _transport_ limit, not a limit on your code — a five-minute Spark
 query would fail even though the query itself is fine.
 
 `privy` therefore runs long work as a **job**: the request returns a `job_id`
 immediately, the work continues in the background, and the client collects the
-result with follow-up polls. Each poll blocks *server-side* until the job
+result with follow-up polls. Each poll blocks _server-side_ until the job
 finishes or ~20s elapse (long-polling), so completion is noticed within
 milliseconds while still using very few relay round-trips.
 
@@ -192,13 +192,13 @@ c.cancel(req, job_id)                             # best-effort interrupt
 
 Notes:
 
-* Jobs are held in memory on the listener and reaped one hour after they finish
+- Jobs are held in memory on the listener and reaped one hour after they finish
   (`PRIVY_JOB_RETENTION_S`). A notebook restart loses them.
-* `mode="inprocess"` executions run **concurrently** — stdout/stderr are captured
+- `mode="inprocess"` executions run **concurrently** — stdout/stderr are captured
   per-thread, so parallel callers (e.g. dbt threads) no longer serialize behind
   one another. Set `PRIVY_SERIALIZE_INPROCESS=1` for the old one-at-a-time
   behaviour.
-* A long-polling request occupies one server worker for its wait, so keep
+- A long-polling request occupies one server worker for its wait, so keep
   `RelayServer(max_workers=...)` (default 32) above your expected concurrency.
 
 # Browse a Fabric served API/UI locally
