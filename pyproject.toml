@@ -1,6 +1,6 @@
 [project]
 name = "privy"
-version = "0.0.1"
+dynamic = ["version"]
 description = "Livy-style remote Python/bash execution over Azure Relay Hybrid Connections."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -28,6 +28,9 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/privy/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/privy"]

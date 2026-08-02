@@ -11,9 +11,12 @@ Hybrid Connection pattern used in the reference ``relay-demo``:
     - **rendezvous**: the control socket receives just ``{"request":
       {"address": "wss://…"}}``; we open that sub-websocket and the request
       frame + body arrive there; we also send the response there.
-* For inline requests we serve sequentially (single control socket), but small
-  inline POSTs complete very quickly. For rendezvous requests we hand work to
-  a thread pool so multiple senders can execute concurrently.
+* For inline requests the *body* must be read on the control socket in arrival
+  order, but execution then moves to the thread pool and the response frame is
+  written back under a lock (each frame carries its ``requestId``, so replies
+  may complete out of order). Without this a single slow request — notably a
+  long-polling ``action="poll"`` — would stall every other sender. For
+  rendezvous requests we hand the whole exchange to the pool.
 """
 
 from __future__ import annotations
@@ -85,11 +88,16 @@ def _indent(text: str, prefix: str = "    ") -> str:
 
 def _log_request(req: ExecRequest, request_id: Any) -> None:
     rid = _short_id(request_id)
+    if req.action in ("poll", "cancel"):
+        # One line — a long-running job produces many of these.
+        log.debug("▶ %s %s job=%s wait=%ss", req.action.upper(), rid, _short_id(req.job_id), req.wait_s)
+        return
     code_preview = (
         req.code if len(req.code) <= _MAX_LOG_BYTES else req.code[:_MAX_LOG_BYTES] + "\n… [truncated]"
     )
     msg = (
-        f"\n┌── ▶ REQUEST  {rid}  kind={req.kind}  mode={req.mode}  timeout={req.timeout_s}s\n"
+        f"\n┌── ▶ {req.action.upper():<7}{rid}  kind={req.kind}  mode={req.mode}  "
+        f"timeout={req.timeout_s}s\n"
         f"{_indent(code_preview, '│   ')}\n"
         f"└────────────────────────────────────────────────"
     )
@@ -98,12 +106,17 @@ def _log_request(req: ExecRequest, request_id: Any) -> None:
 
 def _log_response(resp: ExecResponse, request_id: Any) -> None:
     rid = _short_id(request_id)
+    if resp.state == "running":
+        # Job accepted, or still going — nothing interesting to dump yet.
+        log.debug("◀ %s job=%s state=running", rid, _short_id(resp.job_id))
+        return
     status = "✓" if resp.exit_code == 0 and not resp.timed_out else "✗"
     header = (
         f"\n┌── ◀ RESPONSE {rid}  {status} exit={resp.exit_code}  "
         f"{resp.duration_ms}ms"
         + ("  timed_out" if resp.timed_out else "")
         + (f"  error={resp.error}" if resp.error else "")
+        + (f"  job={_short_id(resp.job_id)}" if resp.job_id else "")
     )
     parts = [header]
     stdout_text = _decode_for_log(resp.stdout)
@@ -142,11 +155,14 @@ class RelayServer:
         path: str,
         keyrule: str,
         key: str,
-        max_workers: int = 8,
+        max_workers: int = 32,
         recv_timeout_s: float = 1.0,
         proxy_target: str | None = None,
         inprocess_globals: dict[str, Any] | None = None,
     ) -> None:
+        # NOTE: a long-polling ``action="poll"`` occupies a worker for the
+        # duration of its wait, so the pool must comfortably exceed the number
+        # of concurrent clients (e.g. dbt threads).
         if not all([namespace, path, keyrule, key]):
             raise ValueError("namespace, path, keyrule and key are all required")
         self._namespace = namespace
@@ -165,6 +181,9 @@ class RelayServer:
         self._stop = threading.Event()
         self._listening = threading.Event()
         self._pool: ThreadPoolExecutor | None = None
+        # The control websocket is a single byte stream: only one writer at a
+        # time may emit a (response frame, body frame) pair.
+        self._send_lock = threading.Lock()
 
     # ---- lifecycle -----------------------------------------------------
 
@@ -242,9 +261,8 @@ class RelayServer:
 
                 if "method" in req_meta:
                     # Inline mode: body (if any) comes on the same control
-                    # socket, response goes back on the same control socket.
-                    # We must serve synchronously here — the control socket is
-                    # a single byte stream.
+                    # socket, and the response goes back on it too. Read the
+                    # body here (ordering matters), then execute off-thread.
                     self._handle_inline(ws, req_meta)
                 else:
                     # Rendezvous mode: hand off to a worker which opens a
@@ -268,14 +286,25 @@ class RelayServer:
     def _handle_inline(self, ws: websocket.WebSocket, req_meta: dict[str, Any]) -> None:
         try:
             payload_raw = self._maybe_recv_body(ws, req_meta)
-            result = self._execute(payload_raw, request_id=req_meta.get("id"))
-            if isinstance(result, str):
-                # Proxy response — already JSON
-                self._send_response(ws, req_meta.get("id"), result)
-            else:
-                self._send_response(ws, req_meta.get("id"), result.to_json())
         except Exception as exc:  # noqa: BLE001
-            log.exception("inline request handler crashed: %s", exc)
+            log.exception("inline body read failed: %s", exc)
+            return
+
+        request_id = req_meta.get("id")
+
+        def work() -> None:
+            try:
+                result = self._execute(payload_raw, request_id=request_id)
+                body = result if isinstance(result, str) else result.to_json()
+                with self._send_lock:
+                    self._send_response(ws, request_id, body)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("inline request handler crashed: %s", exc)
+
+        if self._pool is None:  # pragma: no cover - defensive
+            work()
+        else:
+            self._pool.submit(work)
 
     def _handle_rendezvous(self, req_meta: dict[str, Any]) -> None:
         addr = req_meta.get("address")
