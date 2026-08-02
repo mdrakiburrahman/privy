@@ -1,6 +1,6 @@
 [project]
 name = "privy"
-version = "0.0.1"
+version = "0.1.0"
 description = "Livy-style remote Python/bash execution over Azure Relay Hybrid Connections."
 readme = "README.md"
 license = { file = "LICENSE" }

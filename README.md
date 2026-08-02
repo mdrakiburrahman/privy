@@ -2,6 +2,8 @@
 
 Remote Python/bash execution over Azure Relay. Server runs in a Fabric notebook; clients POST code and get back stdout/stderr/exit_code.
 
+Work that runs longer than Azure Relay's ~60s response deadline is handled automatically — see [Long-running work](#long-running-work).
+
 ## Setup
 
 ```bash
@@ -138,6 +140,66 @@ c = RelayClient(
 print(c.run_python('spark.sql(\"SHOW DATABASES\").show(truncate=False)', mode='inprocess').stdout)
 "
 ```
+
+## Long-running work
+
+Azure Relay kills any request whose listener has not responded in roughly a
+minute:
+
+```
+504 ... the listener did not respond in the required time
+```
+
+That is a *transport* limit, not a limit on your code — a five-minute Spark
+query would fail even though the query itself is fine.
+
+`privy` therefore runs long work as a **job**: the request returns a `job_id`
+immediately, the work continues in the background, and the client collects the
+result with follow-up polls. Each poll blocks *server-side* until the job
+finishes or ~20s elapse (long-polling), so completion is noticed within
+milliseconds while still using very few relay round-trips.
+
+This is automatic — anything with `timeout_s` above `RELAY_RESPONSE_LIMIT_S`
+(55s) takes the job path, and the returned `ExecResult` is identical either way:
+
+```python
+# Runs for 10 minutes; returns normally instead of a 504.
+r = c.run_python("df = spark.sql(big_query); print(df.count())",
+                 mode="inprocess", timeout_s=1200)
+print(r.exit_code, r.stdout, r.job_id)
+```
+
+Override the choice with `async_job=True` / `async_job=False`:
+
+```python
+c.run_python("print('hi')", timeout_s=600, async_job=False)  # force one round-trip
+c.run_bash("pip install torch", timeout_s=30, async_job=True)  # force a job
+```
+
+The job API is also usable directly, e.g. to submit work now and collect it
+later, or from a different process:
+
+```python
+from privy import ExecRequest
+
+req = ExecRequest(kind="python", code="spark.sql(q).write.save(path)",
+                  mode="inprocess", timeout_s=3600)
+job_id = c.submit(req)
+...
+state, result = c.poll(req, job_id, wait_s=20)   # state: running | done | cancelled | missing
+c.cancel(req, job_id)                             # best-effort interrupt
+```
+
+Notes:
+
+* Jobs are held in memory on the listener and reaped one hour after they finish
+  (`PRIVY_JOB_RETENTION_S`). A notebook restart loses them.
+* `mode="inprocess"` executions run **concurrently** — stdout/stderr are captured
+  per-thread, so parallel callers (e.g. dbt threads) no longer serialize behind
+  one another. Set `PRIVY_SERIALIZE_INPROCESS=1` for the old one-at-a-time
+  behaviour.
+* A long-polling request occupies one server worker for its wait, so keep
+  `RelayServer(max_workers=...)` (default 32) above your expected concurrency.
 
 # Browse a Fabric served API/UI locally
 

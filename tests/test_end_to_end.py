@@ -11,9 +11,10 @@ through Azure Relay via a ``RelayClient``, and assert on stdout/stderr/exit.
 from __future__ import annotations
 
 import sys
+import time
 import uuid
 
-from privy import RelayClient
+from privy import RELAY_RESPONSE_LIMIT_S, RelayClient
 
 
 def test_bash_echo(relay_client: RelayClient):
@@ -69,3 +70,48 @@ def test_full_pip_then_python_loop(relay_client: RelayClient, tmp_path_factory):
 def test_timeout_returns_timed_out(relay_client: RelayClient):
     r = relay_client.run_python("import time; time.sleep(5)", timeout_s=1)
     assert r.timed_out is True
+
+
+def test_async_job_outlives_relay_response_limit(relay_client: RelayClient):
+    """The regression this whole API exists for.
+
+    A synchronous relay round-trip is killed by Azure at ~60s
+    ("the listener did not respond in the required time", HTTP 504). The same
+    work submitted as a job must complete cleanly.
+    """
+    sleep_s = RELAY_RESPONSE_LIMIT_S + 20
+    r = relay_client.run_python(
+        f"import time; time.sleep({sleep_s}); print('survived')",
+        timeout_s=sleep_s + 120,
+    )
+    assert r.ok, f"exit={r.exit_code} stderr={r.stderr!r}"
+    assert "survived" in r.stdout
+    assert r.job_id, "long work should have gone through the async job path"
+
+
+def test_async_job_is_opt_outable(relay_client: RelayClient):
+    r = relay_client.run_python("print('sync')", timeout_s=600, async_job=False)
+    assert r.ok
+    assert r.stdout.strip() == "sync"
+    assert r.job_id is None
+
+
+def test_short_calls_stay_synchronous(relay_client: RelayClient):
+    r = relay_client.run_python("print('quick')", timeout_s=10)
+    assert r.ok
+    assert r.job_id is None
+
+
+def test_async_job_reports_errors(relay_client: RelayClient):
+    r = relay_client.run_python("raise RuntimeError('async-kaboom')", timeout_s=600)
+    assert not r.ok
+    assert "async-kaboom" in r.stderr
+
+
+def test_async_job_latency_is_small(relay_client: RelayClient):
+    """Long-polling means completion is noticed almost immediately."""
+    start = time.monotonic()
+    r = relay_client.run_python("print('fast-async')", timeout_s=600)
+    assert r.ok
+    assert "fast-async" in r.stdout
+    assert time.monotonic() - start < 15

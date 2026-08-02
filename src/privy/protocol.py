@@ -13,9 +13,16 @@ from typing import Any, Literal
 
 Kind = Literal["python", "bash"]
 Mode = Literal["subprocess", "inprocess"]
+Action = Literal["exec", "submit", "poll", "cancel"]
+JobState = Literal["running", "done", "cancelled", "missing"]
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 DEFAULT_TIMEOUT_S = 600.0
+
+#: Longest a ``poll`` may block server-side before answering "still running".
+#: Must stay comfortably below Azure Relay's ~60s response deadline.
+DEFAULT_POLL_WAIT_S = 20.0
+MAX_POLL_WAIT_S = 45.0
 
 
 def b64encode_bytes(data: bytes) -> str:
@@ -28,10 +35,27 @@ def b64decode_str(text: str) -> bytes:
 
 @dataclass
 class ExecRequest:
+    """A unit of work sent to the listener.
+
+    ``action`` selects the execution shape:
+
+    * ``exec``   — classic synchronous run; the response carries the output.
+    * ``submit`` — start the code as a background job and answer immediately
+      with a ``job_id``. Used when the work outlives Azure Relay's per-request
+      response deadline (~60s).
+    * ``poll``   — ask about a job. The listener blocks up to ``wait_s`` for it
+      to finish, so completion is observed almost instantly without hammering
+      the relay. Returns the full output once the job is done.
+    * ``cancel`` — best-effort interrupt + forget of a job.
+    """
+
     kind: Kind
     code: str
     mode: Mode = "subprocess"
     timeout_s: float = DEFAULT_TIMEOUT_S
+    action: Action = "exec"
+    job_id: str | None = None
+    wait_s: float = DEFAULT_POLL_WAIT_S
     protocol_version: int = PROTOCOL_VERSION
 
     def to_json(self) -> str:
@@ -42,6 +66,9 @@ class ExecRequest:
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode("utf-8")
         obj: dict[str, Any] = json.loads(raw)
+        action = obj.get("action", "exec")
+        if action not in ("exec", "submit", "poll", "cancel"):
+            raise ValueError(f"invalid action: {action!r}")
         kind = obj.get("kind")
         if kind not in ("python", "bash"):
             raise ValueError(f"invalid kind: {kind!r}")
@@ -53,12 +80,19 @@ class ExecRequest:
         code = obj.get("code")
         if not isinstance(code, str):
             raise ValueError("code must be a string")
+        job_id = obj.get("job_id")
+        if action in ("poll", "cancel") and not job_id:
+            raise ValueError(f"action={action!r} requires job_id")
         timeout_s = float(obj.get("timeout_s", DEFAULT_TIMEOUT_S))
+        wait_s = min(float(obj.get("wait_s", DEFAULT_POLL_WAIT_S)), MAX_POLL_WAIT_S)
         return cls(
             kind=kind,
             code=code,
             mode=mode,
             timeout_s=timeout_s,
+            action=action,
+            job_id=job_id,
+            wait_s=wait_s,
             protocol_version=int(obj.get("protocol_version", PROTOCOL_VERSION)),
         )
 
@@ -71,6 +105,11 @@ class ExecResponse:
     duration_ms: int = 0
     timed_out: bool = False
     error: str | None = None
+    #: Set on ``submit``/``poll``/``cancel`` responses.
+    job_id: str | None = None
+    #: ``running`` while a submitted job is still executing; ``done`` once the
+    #: output fields below are final; ``missing`` for an unknown/expired job.
+    state: JobState | None = None
     protocol_version: int = PROTOCOL_VERSION
 
     @classmethod
@@ -83,6 +122,8 @@ class ExecResponse:
         duration_ms: int,
         timed_out: bool = False,
         error: str | None = None,
+        job_id: str | None = None,
+        state: JobState | None = None,
     ) -> ExecResponse:
         return cls(
             exit_code=exit_code,
@@ -91,6 +132,8 @@ class ExecResponse:
             duration_ms=duration_ms,
             timed_out=timed_out,
             error=error,
+            job_id=job_id,
+            state=state,
         )
 
     def to_json(self) -> str:
@@ -108,6 +151,8 @@ class ExecResponse:
             duration_ms=int(obj.get("duration_ms", 0)),
             timed_out=bool(obj.get("timed_out", False)),
             error=obj.get("error"),
+            job_id=obj.get("job_id"),
+            state=obj.get("state"),
             protocol_version=int(obj.get("protocol_version", PROTOCOL_VERSION)),
         )
 
