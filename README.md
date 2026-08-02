@@ -101,7 +101,7 @@ print(c.run_python('import sys; print(sys.version)').stdout)
 
 ```python
 from privy import RelayServer
-RelayServer(namespace="...", path="...", keyrule="...", key="...").serve_forever()
+RelayServer(namespace="...", path="...", keyrule="...", key="...", inprocess_globals={"spark": spark, "sc": sc}).serve_forever()
 ```
 
 ## Client
@@ -120,6 +120,23 @@ c = RelayClient(
 r = c.run_bash("pip install pandas")
 r = c.run_python("import pandas; print(pandas.__version__)")
 print(r.exit_code, r.stdout, r.stderr)
+```
+
+Or:
+
+```bash
+set -a; source .env; set +a
+uv run python -c "
+import os
+from privy import RelayClient
+c = RelayClient(
+    namespace=os.environ['PRIVY_RELAY_NAMESPACE'],
+    path=os.environ['PRIVY_RELAY_PATH'],
+    keyrule=os.environ['PRIVY_RELAY_KEYRULE'],
+    key=os.environ['PRIVY_RELAY_KEY'],
+)
+print(c.run_python('spark.sql(\"SHOW DATABASES\").show(truncate=False)', mode='inprocess').stdout)
+"
 ```
 
 # Browse a Fabric served API/UI locally

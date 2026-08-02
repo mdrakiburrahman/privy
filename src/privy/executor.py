@@ -31,6 +31,17 @@ _INPROCESS_GLOBALS: dict[str, Any] = {"__name__": "__privy_inprocess__"}
 _INPROCESS_LOCK = threading.Lock()
 
 
+def seed_inprocess_globals(mapping: dict[str, Any]) -> None:
+    """Merge ``mapping`` into the shared inprocess globals.
+
+    Lets the host notebook (e.g. a Fabric cell) expose its own live objects —
+    most commonly ``spark``/``sc`` — to code later submitted with
+    ``mode="inprocess"``. Safe to call repeatedly (e.g. on notebook restart).
+    """
+    with _INPROCESS_LOCK:
+        _INPROCESS_GLOBALS.update(mapping)
+
+
 def execute(req: ExecRequest) -> ExecResponse:
     """Dispatch an ExecRequest to the right backend and return an ExecResponse."""
     start = time.monotonic()

@@ -27,7 +27,7 @@ from typing import Any
 import websocket
 
 from privy._relay import create_listen_url, create_sas_token, fqdn
-from privy.executor import execute
+from privy.executor import execute, seed_inprocess_globals
 from privy.protocol import ExecRequest, ExecResponse
 from privy.proxy import PROXY_KIND, ProxyRequest, handle_proxy_request
 
@@ -130,6 +130,8 @@ class RelayServer:
             path="demo",
             keyrule="demo-listen-send",
             key="<primary-key>",
+            # Expose this cell's live `spark`/`sc` to mode="inprocess" requests.
+            inprocess_globals={"spark": spark, "sc": sc},
         ).serve_forever()
     """
 
@@ -143,6 +145,7 @@ class RelayServer:
         max_workers: int = 8,
         recv_timeout_s: float = 1.0,
         proxy_target: str | None = None,
+        inprocess_globals: dict[str, Any] | None = None,
     ) -> None:
         if not all([namespace, path, keyrule, key]):
             raise ValueError("namespace, path, keyrule and key are all required")
@@ -153,6 +156,11 @@ class RelayServer:
         self._max_workers = max_workers
         self._recv_timeout_s = recv_timeout_s
         self._proxy_target = proxy_target
+
+        if inprocess_globals:
+            # Lets the host notebook expose live objects (e.g. Fabric's
+            # `spark`/`sc`) to code later submitted with mode="inprocess".
+            seed_inprocess_globals(inprocess_globals)
 
         self._stop = threading.Event()
         self._listening = threading.Event()
