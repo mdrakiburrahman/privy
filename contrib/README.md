@@ -53,7 +53,7 @@
   $HOME/.local/bin/copilot -i /login
   ```
 
-1. Login to github and ensure to authorize `Microsoft` if you're an employee (optional):
+1. Login to github:
 
    ```bash
    gh auth login
