@@ -106,7 +106,7 @@ Versioned URL: `bins/privy-<version>-linux-x86_64`. Build locally with `./script
 
 Client exits with the remote exit code (`124` on timeout). `--timeout-s` above 55s auto-uses the job path.
 
-Caveats: linux x86_64, glibc-linked (build on the oldest distro you target). With no `python3` on `PATH`,
+Caveats: linux x86_64. Statically linked (staticx), so it runs on old glibc too. With no `python3` on `PATH`,
 `--python --mode subprocess` fails by design — use `--mode inprocess` or `--bash`.
 
 ## Fabric notebook (server)

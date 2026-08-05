@@ -29,6 +29,7 @@ dev = [
 ]
 binary = [
     "pyinstaller>=6",
+    "staticx>=0.14",
 ]
 
 [build-system]
