@@ -11,6 +11,9 @@ dependencies = [
     "websocket-client>=1.7",
 ]
 
+[project.scripts]
+privy = "privy.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
@@ -23,6 +26,10 @@ dev = [
     "pytest>=8",
     "build>=1.2",
     "ruff>=0.6",
+]
+binary = [
+    "pyinstaller>=6",
+    "staticx>=0.14",
 ]
 
 [build-system]
