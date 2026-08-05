@@ -25,6 +25,7 @@ from __future__ import annotations
 import ctypes
 import io
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -102,6 +103,58 @@ def _invalid_mode(start: float) -> ExecResponse:
     )
 
 
+def _python_executable() -> str:
+    """Interpreter to use for ``mode="subprocess"``.
+
+    In the PyInstaller binary ``sys.executable`` is the binary itself, so a real
+    Python from PATH is required; otherwise only bash and ``mode="inprocess"``
+    work on that box.
+    """
+    if getattr(sys, "frozen", False):
+        found = shutil.which("python3") or shutil.which("python")
+        if not found:
+            raise FileNotFoundError(
+                "no python3 on PATH — the privy binary cannot run mode='subprocess' "
+                "python; use mode='inprocess' or kind='bash'"
+            )
+        return found
+    return sys.executable
+
+
+#: Variables PyInstaller rewrites for its own bundled libraries. Leaking them
+#: into a child makes system binaries (e.g. `az` → system python3) load privy's
+#: bundled libpython/libssl and segfault. PyInstaller stashes the pre-launch
+#: value in ``<VAR>_ORIG``, so restore that when present and drop it otherwise.
+_PYI_LEAKED_VARS = (
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "LIBPATH",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+)
+
+
+def _child_env() -> dict[str, str]:
+    """Environment for subprocesses, scrubbed of PyInstaller's runtime tweaks."""
+    env = dict(os.environ)
+    if getattr(sys, "frozen", False):
+        for var in _PYI_LEAKED_VARS:
+            original = env.pop(f"{var}_ORIG", None)
+            if original:
+                env[var] = original
+            else:
+                env.pop(var, None)
+        env.pop("_MEIPASS2", None)
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass and env.get("PATH"):
+            env["PATH"] = os.pathsep.join(
+                p for p in env["PATH"].split(os.pathsep) if p and not p.startswith(meipass)
+            )
+    return env
+
+
 def _run_subprocess(
     kind: str,
     code: str,
@@ -109,18 +162,18 @@ def _run_subprocess(
     start: float,
     on_proc: Callable[[subprocess.Popen], None] | None = None,
 ) -> ExecResponse:
-    if kind == "python":
-        argv = [sys.executable, "-u", "-c", code]
-    elif kind == "bash":
-        argv = ["bash", "-lc", code]
-    else:  # pragma: no cover - guarded by protocol
-        raise ValueError(f"invalid kind: {kind!r}")
-
-    env = dict(os.environ)
+    env = _child_env()
     # Force unbuffered text so partial output is not lost on timeout.
     env.setdefault("PYTHONUNBUFFERED", "1")
 
     try:
+        if kind == "python":
+            argv = [_python_executable(), "-u", "-c", code]
+        elif kind == "bash":
+            argv = ["bash", "-lc", code]
+        else:  # pragma: no cover - guarded by protocol
+            raise ValueError(f"invalid kind: {kind!r}")
+
         proc = subprocess.Popen(
             argv,
             stdout=subprocess.PIPE,

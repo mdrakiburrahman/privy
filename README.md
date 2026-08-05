@@ -41,8 +41,8 @@ uv run ruff check .        # static checks
 uv run ruff format .       # autoformat
 uv run pytest              # unit tests
 uv build                   # → dist/privy-<version>-py3-none-any.whl (version comes from src/privy/__init__.py)
-
-./scripts/upload_whl.sh    # az storage blob upload --overwrite
+./scripts/build_binary.sh  # → dist/privy (self-contained Linux binary, no Python needed on target)
+./scripts/upload_whl.sh    # az storage blob upload --overwrite (wheel + binary)
 ```
 
 ## Run server locally (two terminals)
@@ -80,6 +80,34 @@ print(c.run_bash('echo hello from privy').stdout)
 print(c.run_python('import sys; print(sys.version)').stdout)
 "
 ```
+
+## Random box with no Python
+
+Self-contained Linux binary (~11 MB, bundled interpreter). No Python, pip or venv on the target.
+
+```bash
+export PRIVY_RELAY_NAMESPACE=... PRIVY_RELAY_PATH=... PRIVY_RELAY_KEYRULE=... PRIVY_RELAY_KEY=...
+
+curl -fsSL https://rakirahman.blob.core.windows.net/public/bins/privy-linux-x86_64 -o privy && chmod +x privy
+./privy server -v                                                 # SERVER (-v = pretty req/resp boxes)
+./privy client --bash "uname -a"                                  # CLIENT
+./privy client --python "import sys; print(sys.version)" --mode inprocess
+./privy proxy --local-port 3000                                   # PROXY
+```
+
+Flags override the four `PRIVY_RELAY_*` env vars: `--namespace --path --keyrule --key`, plus `-v/-vv`.
+Versioned URL: `bins/privy-<version>-linux-x86_64`. Build locally with `./scripts/build_binary.sh`.
+
+| Subcommand | Args                                                                                                                                                                                          |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `server`   | `--max-workers 32` · `--recv-timeout-s 1.0` · `--proxy-target URL`                                                                                                                            |
+| `client`   | `--bash CODE` \| `--python CODE` \| `--file PATH` (`-` = stdin) · `--file-kind python\|bash` · `--mode subprocess\|inprocess` · `--timeout-s 600` · `--async-job`/`--no-async-job` · `--json` |
+| `proxy`    | `--local-port 3000`                                                                                                                                                                           |
+
+Client exits with the remote exit code (`124` on timeout). `--timeout-s` above 55s auto-uses the job path.
+
+Caveats: linux x86_64, glibc-linked (build on the oldest distro you target). With no `python3` on `PATH`,
+`--python --mode subprocess` fails by design — use `--mode inprocess` or `--bash`.
 
 ## Fabric notebook (server)
 
