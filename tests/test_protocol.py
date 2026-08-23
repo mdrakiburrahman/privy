@@ -13,7 +13,13 @@ def test_b64_roundtrip_non_utf8():
 
 
 def test_exec_request_roundtrip():
-    req = ExecRequest(kind="python", code="print(1)", mode="subprocess", timeout_s=10)
+    req = ExecRequest(
+        kind="python",
+        code="print(1)",
+        mode="subprocess",
+        timeout_s=10,
+        request_id="req-123",
+    )
     parsed = ExecRequest.from_json(req.to_json())
     assert parsed == req
 
@@ -41,6 +47,7 @@ def test_exec_request_defaults_to_exec_action():
     parsed = ExecRequest.from_json('{"kind":"python","code":"print(1)"}')
     assert parsed.action == "exec"
     assert parsed.job_id is None
+    assert parsed.request_id is None
 
 
 def test_exec_request_job_roundtrip():
@@ -70,6 +77,15 @@ def test_exec_request_poll_requires_job_id():
 def test_exec_request_clamps_poll_wait():
     parsed = ExecRequest.from_json('{"kind":"python","code":"","action":"poll","job_id":"a","wait_s":600}')
     assert parsed.wait_s == MAX_POLL_WAIT_S
+
+
+def test_exec_request_rejects_non_string_request_id():
+    try:
+        ExecRequest.from_json('{"kind":"python","code":"","request_id":123}')
+    except ValueError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("request_id should be a string when provided")
 
 
 def test_exec_response_carries_job_state():

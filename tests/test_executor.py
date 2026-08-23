@@ -1,6 +1,9 @@
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
-from privy.executor import cancel_job, execute, poll_job
+import privy.executor as executor
+from privy.executor import cancel_job, execute, poll_job, seed_inprocess_globals
 from privy.protocol import ExecRequest
 
 
@@ -154,8 +157,200 @@ def test_cancel_job():
     submitted = execute(ExecRequest(kind="bash", code="sleep 30", action="submit"))
     cancelled = cancel_job(submitted.job_id or "")
     assert cancelled.state == "cancelled"
-    # Handle is forgotten, so a later poll no longer knows about it.
-    assert poll_job(submitted.job_id or "", wait_s=0.1).state == "missing"
+    assert poll_job(submitted.job_id or "", wait_s=0.1).state == "cancelled"
+
+
+def test_submit_request_id_is_idempotent_across_concurrent_retries():
+    submitters = 20
+    start = threading.Barrier(submitters + 1)
+    started = threading.Event()
+    release = threading.Event()
+    ran = {"count": 0}
+    ran_lock = threading.Lock()
+
+    seed_inprocess_globals(
+        {
+            "__privy_same_key_started__": started,
+            "__privy_same_key_release__": release,
+            "__privy_same_key_runs__": ran,
+            "__privy_same_key_runs_lock__": ran_lock,
+        }
+    )
+    code = (
+        "with __privy_same_key_runs_lock__:\n"
+        "    __privy_same_key_runs__['count'] += 1\n"
+        "__privy_same_key_started__.set()\n"
+        "release = __privy_same_key_release__\n"
+        "release.wait(5)\n"
+        "print(__privy_same_key_runs__['count'])\n"
+    )
+
+    def submit_once():
+        start.wait()
+        return execute(
+            ExecRequest(
+                kind="python",
+                code=code,
+                mode="inprocess",
+                action="submit",
+                request_id="same-key",
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=submitters) as pool:
+        futures = [pool.submit(submit_once) for _ in range(submitters)]
+        start.wait()
+        results = [future.result(timeout=10) for future in futures]
+
+    job_ids = {result.job_id for result in results}
+    assert len(job_ids) == 1
+    assert started.wait(timeout=5)
+    assert ran["count"] == 1
+
+    release.set()
+    final = _drain(results[0].job_id or "")
+    assert final.state == "done"
+    assert final.stdout == b"1\n"
+
+
+def test_different_request_ids_run_independently():
+    submitters = 2
+    start = threading.Barrier(submitters + 1)
+    overlap = threading.Barrier(submitters)
+    started = threading.Event()
+    release = threading.Event()
+    ran = {"count": 0}
+    ran_lock = threading.Lock()
+
+    seed_inprocess_globals(
+        {
+            "__privy_diff_key_overlap__": overlap,
+            "__privy_diff_key_started__": started,
+            "__privy_diff_key_release__": release,
+            "__privy_diff_key_runs__": ran,
+            "__privy_diff_key_runs_lock__": ran_lock,
+        }
+    )
+    code = (
+        "__privy_diff_key_overlap__.wait()\n"
+        "with __privy_diff_key_runs_lock__:\n"
+        "    __privy_diff_key_runs__['count'] += 1\n"
+        "    started = __privy_diff_key_runs__['count'] == 2\n"
+        "if started:\n"
+        "    __privy_diff_key_started__.set()\n"
+        "__privy_diff_key_release__.wait(5)\n"
+    )
+
+    def submit_once(request_id: str):
+        start.wait()
+        return execute(
+            ExecRequest(
+                kind="python",
+                code=code,
+                mode="inprocess",
+                action="submit",
+                request_id=request_id,
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=submitters) as pool:
+        futures = [pool.submit(submit_once, request_id) for request_id in ("key-a", "key-b")]
+        start.wait()
+        results = [future.result(timeout=10) for future in futures]
+
+    assert len({result.job_id for result in results}) == 2
+    assert started.wait(timeout=5)
+    assert ran["count"] == 2
+
+    release.set()
+    for result in results:
+        assert _drain(result.job_id or "").state == "done"
+
+
+def test_submit_request_id_rejects_mismatched_payload():
+    started = threading.Event()
+    release = threading.Event()
+    ran = {"count": 0}
+    ran_lock = threading.Lock()
+    request_id = "mismatch-key"
+
+    seed_inprocess_globals(
+        {
+            "__privy_mismatch_started__": started,
+            "__privy_mismatch_release__": release,
+            "__privy_mismatch_runs__": ran,
+            "__privy_mismatch_runs_lock__": ran_lock,
+        }
+    )
+    code = (
+        "with __privy_mismatch_runs_lock__:\n"
+        "    __privy_mismatch_runs__['count'] += 1\n"
+        "__privy_mismatch_started__.set()\n"
+        "__privy_mismatch_release__.wait(5)\n"
+    )
+
+    first = execute(
+        ExecRequest(
+            kind="python",
+            code=code,
+            mode="inprocess",
+            action="submit",
+            request_id=request_id,
+        )
+    )
+    conflict = execute(
+        ExecRequest(
+            kind="python",
+            code="print('other payload')",
+            mode="inprocess",
+            action="submit",
+            request_id=request_id,
+        )
+    )
+
+    assert first.state == "running"
+    assert conflict.error == "request_id_conflict"
+    assert conflict.job_id is None
+    assert started.wait(timeout=5)
+    assert ran["count"] == 1
+
+    release.set()
+    assert _drain(first.job_id or "").state == "done"
+
+
+def test_cancelled_request_id_reuses_original_job_until_reaped():
+    request = ExecRequest(
+        kind="bash",
+        code="sleep 30",
+        action="submit",
+        request_id="cancel-key",
+    )
+    submitted = execute(request)
+    cancelled = cancel_job(submitted.job_id or "")
+    assert cancelled.state == "cancelled"
+
+    retried = execute(
+        ExecRequest(
+            kind="bash",
+            code="sleep 30",
+            action="submit",
+            request_id="cancel-key",
+        )
+    )
+    assert retried.job_id == submitted.job_id
+    assert retried.state == "cancelled"
+    assert poll_job(submitted.job_id or "", wait_s=0.1).state == "cancelled"
+
+    job = executor._JOBS[submitted.job_id or ""]
+    assert job.done.wait(timeout=5)
+    job.finished_at = time.monotonic() - executor._JOB_RETENTION_S - 1
+    executor._reap_jobs()
+    assert submitted.job_id not in executor._JOBS
+
+    resubmitted = execute(request)
+    assert resubmitted.job_id
+    assert resubmitted.job_id != submitted.job_id
+    cancel_job(resubmitted.job_id or "")
 
 
 def test_concurrent_inprocess_output_is_not_interleaved():

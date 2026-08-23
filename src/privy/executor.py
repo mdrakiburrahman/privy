@@ -33,6 +33,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 from typing import Any
 
 from privy.protocol import DEFAULT_POLL_WAIT_S, MAX_POLL_WAIT_S, ExecRequest, ExecResponse
@@ -430,6 +431,7 @@ class _Job:
         self.finished_at: float | None = None
         self._run: _InprocessRun | None = None
         self._proc: subprocess.Popen | None = None
+        self._state = threading.Condition()
         self._thread = threading.Thread(target=self._target, name=f"privy-job-{self.id[:8]}", daemon=True)
 
     def start(self) -> None:
@@ -461,18 +463,35 @@ class _Job:
                 duration_ms=int((time.monotonic() - start) * 1000),
                 error=type(exc).__name__,
             )
-        self.response = resp
-        self.finished_at = time.monotonic()
-        self.done.set()
+        with self._state:
+            self.response = resp
+            self.finished_at = time.monotonic()
+            self.done.set()
+            self._state.notify_all()
 
     def _adopt_run(self, run: _InprocessRun) -> None:
         self._run = run
+        if self.cancelled:
+            run.interrupt()
 
     def _adopt_proc(self, proc: subprocess.Popen) -> None:
         self._proc = proc
+        if self.cancelled and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:  # pragma: no cover
+                pass
 
-    def cancel(self) -> None:
-        self.cancelled = True
+    def wait(self, timeout: float) -> None:
+        with self._state:
+            self._state.wait_for(lambda: self.cancelled or self.done.is_set(), timeout=max(0.0, timeout))
+
+    def cancel(self) -> bool:
+        with self._state:
+            if self.done.is_set():
+                return False
+            self.cancelled = True
+            self._state.notify_all()
         if self._run is not None:
             self._run.interrupt()
         if self._proc is not None and self._proc.poll() is None:
@@ -480,9 +499,19 @@ class _Job:
                 self._proc.kill()
             except Exception:  # pragma: no cover
                 pass
+        return True
 
 
 _JOBS: dict[str, _Job] = {}
+
+
+@dataclass(frozen=True)
+class _IdempotencyRecord:
+    fingerprint: tuple[str, str, str, float]
+    job_id: str
+
+
+_REQUESTS: dict[str, _IdempotencyRecord] = {}
 _JOBS_LOCK = threading.Lock()
 
 #: How long a finished job's result is retained after the last poll could have
@@ -490,33 +519,131 @@ _JOBS_LOCK = threading.Lock()
 _JOB_RETENTION_S = float(os.environ.get("PRIVY_JOB_RETENTION_S", "3600"))
 
 
-def _reap_jobs() -> None:
-    now = time.monotonic()
-    with _JOBS_LOCK:
-        stale = [
-            jid
-            for jid, job in _JOBS.items()
-            if job.finished_at is not None and (now - job.finished_at) > _JOB_RETENTION_S
-        ]
-        for jid in stale:
-            _JOBS.pop(jid, None)
+def _request_fingerprint(req: ExecRequest) -> tuple[str, str, str, float]:
+    return (req.kind, req.code, req.mode, req.timeout_s)
 
 
-def submit_job(req: ExecRequest) -> ExecResponse:
-    """Start ``req`` in the background and answer immediately with its id."""
-    _reap_jobs()
-    job = _Job(req)
-    with _JOBS_LOCK:
-        _JOBS[job.id] = job
-    job.start()
+def _job_state(job: _Job) -> str:
+    if job.cancelled:
+        return "cancelled"
+    if not job.done.is_set():
+        return "running"
+    return "done"
+
+
+def _running_response(job: _Job) -> ExecResponse:
     return ExecResponse.from_output(
         exit_code=0,
         stdout=b"",
         stderr=b"",
-        duration_ms=0,
+        duration_ms=int((time.monotonic() - job.created_at) * 1000),
         job_id=job.id,
         state="running",
     )
+
+
+def _cancelled_response(job: _Job) -> ExecResponse:
+    if job.response is None:
+        return ExecResponse.from_output(
+            exit_code=1,
+            stdout=b"",
+            stderr=b"job cancelled\n",
+            duration_ms=int((time.monotonic() - job.created_at) * 1000),
+            error="cancelled",
+            job_id=job.id,
+            state="cancelled",
+        )
+    return ExecResponse.from_output(
+        exit_code=job.response.exit_code or 1,
+        stdout=job.response.stdout,
+        stderr=job.response.stderr or b"job cancelled\n",
+        duration_ms=job.response.duration_ms,
+        timed_out=job.response.timed_out,
+        error=job.response.error or "cancelled",
+        job_id=job.id,
+        state="cancelled",
+    )
+
+
+def _job_response(job: _Job) -> ExecResponse:
+    state = _job_state(job)
+    if state == "running":
+        return _running_response(job)
+    if state == "cancelled":
+        return _cancelled_response(job)
+    resp = replace(job.response)
+    resp.job_id = job.id
+    resp.state = "done"
+    return resp
+
+
+def _request_conflict_response(req: ExecRequest, existing: _IdempotencyRecord) -> ExecResponse:
+    return ExecResponse.from_output(
+        exit_code=1,
+        stdout=b"",
+        stderr=(
+            f"request_id already maps to a different submit payload (existing job_id={existing.job_id})\n"
+        ).encode(),
+        duration_ms=0,
+        error="request_id_conflict",
+    )
+
+
+def _reap_jobs_locked() -> None:
+    now = time.monotonic()
+    stale = [
+        jid
+        for jid, job in _JOBS.items()
+        if job.finished_at is not None and (now - job.finished_at) > _JOB_RETENTION_S
+    ]
+    for jid in stale:
+        job = _JOBS.pop(jid, None)
+        if job is None or not job.request.request_id:
+            continue
+        record = _REQUESTS.get(job.request.request_id)
+        if record is not None and record.job_id == jid:
+            _REQUESTS.pop(job.request.request_id, None)
+    for request_id, record in list(_REQUESTS.items()):
+        if record.job_id not in _JOBS:
+            _REQUESTS.pop(request_id, None)
+
+
+def _reap_jobs() -> None:
+    with _JOBS_LOCK:
+        _reap_jobs_locked()
+
+
+def submit_job(req: ExecRequest) -> ExecResponse:
+    """Start ``req`` in the background and answer immediately with its id."""
+    with _JOBS_LOCK:
+        _reap_jobs_locked()
+        if req.request_id:
+            record = _REQUESTS.get(req.request_id)
+            if record is not None:
+                if record.fingerprint != _request_fingerprint(req):
+                    return _request_conflict_response(req, record)
+                existing = _JOBS.get(record.job_id)
+                if existing is not None:
+                    return _job_response(existing)
+                _REQUESTS.pop(req.request_id, None)
+        job = _Job(req)
+        _JOBS[job.id] = job
+        if req.request_id:
+            _REQUESTS[req.request_id] = _IdempotencyRecord(
+                fingerprint=_request_fingerprint(req),
+                job_id=job.id,
+            )
+    try:
+        job.start()
+    except Exception:
+        with _JOBS_LOCK:
+            _JOBS.pop(job.id, None)
+            if req.request_id:
+                record = _REQUESTS.get(req.request_id)
+                if record is not None and record.job_id == job.id:
+                    _REQUESTS.pop(req.request_id, None)
+        raise
+    return _job_response(job)
 
 
 def poll_job(job_id: str, wait_s: float = DEFAULT_POLL_WAIT_S) -> ExecResponse:
@@ -534,28 +661,14 @@ def poll_job(job_id: str, wait_s: float = DEFAULT_POLL_WAIT_S) -> ExecResponse:
             state="missing",
         )
 
-    job.done.wait(timeout=max(0.0, min(wait_s, MAX_POLL_WAIT_S)))
-    if not job.done.is_set():
-        return ExecResponse.from_output(
-            exit_code=0,
-            stdout=b"",
-            stderr=b"",
-            duration_ms=int((time.monotonic() - job.created_at) * 1000),
-            job_id=job_id,
-            state="running",
-        )
-
-    resp = job.response
-    assert resp is not None  # set before ``done``
-    resp.job_id = job_id
-    resp.state = "cancelled" if job.cancelled else "done"
-    return resp
+    job.wait(timeout=min(wait_s, MAX_POLL_WAIT_S))
+    return _job_response(job)
 
 
 def cancel_job(job_id: str) -> ExecResponse:
-    """Best-effort interrupt of a running job; always forgets the handle."""
+    """Best-effort interrupt of a running job while retaining its dedupe tombstone."""
     with _JOBS_LOCK:
-        job = _JOBS.pop(job_id, None)
+        job = _JOBS.get(job_id)
     if job is None:
         return ExecResponse.from_output(
             exit_code=1,
@@ -566,7 +679,8 @@ def cancel_job(job_id: str) -> ExecResponse:
             job_id=job_id,
             state="missing",
         )
-    job.cancel()
+    if not job.cancel():
+        return _job_response(job)
     return ExecResponse.from_output(
         exit_code=0,
         stdout=b"",

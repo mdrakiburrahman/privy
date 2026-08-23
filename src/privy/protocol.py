@@ -46,7 +46,10 @@ class ExecRequest:
     * ``poll``   — ask about a job. The listener blocks up to ``wait_s`` for it
       to finish, so completion is observed almost instantly without hammering
       the relay. Returns the full output once the job is done.
-    * ``cancel`` — best-effort interrupt + forget of a job.
+    * ``cancel`` — best-effort interrupt of a job.
+
+    ``request_id`` is optional and only affects ``action="submit"``: retries
+    of the same payload reuse the original job instead of creating duplicates.
     """
 
     kind: Kind
@@ -55,6 +58,7 @@ class ExecRequest:
     timeout_s: float = DEFAULT_TIMEOUT_S
     action: Action = "exec"
     job_id: str | None = None
+    request_id: str | None = None
     wait_s: float = DEFAULT_POLL_WAIT_S
     protocol_version: int = PROTOCOL_VERSION
 
@@ -83,6 +87,11 @@ class ExecRequest:
         job_id = obj.get("job_id")
         if action in ("poll", "cancel") and not job_id:
             raise ValueError(f"action={action!r} requires job_id")
+        request_id = obj.get("request_id")
+        if request_id == "":
+            request_id = None
+        elif request_id is not None and not isinstance(request_id, str):
+            raise ValueError("request_id must be a string when provided")
         timeout_s = float(obj.get("timeout_s", DEFAULT_TIMEOUT_S))
         wait_s = min(float(obj.get("wait_s", DEFAULT_POLL_WAIT_S)), MAX_POLL_WAIT_S)
         return cls(
@@ -92,6 +101,7 @@ class ExecRequest:
             timeout_s=timeout_s,
             action=action,
             job_id=job_id,
+            request_id=request_id,
             wait_s=wait_s,
             protocol_version=int(obj.get("protocol_version", PROTOCOL_VERSION)),
         )

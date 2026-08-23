@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from dataclasses import dataclass, replace
 
 import requests
@@ -138,19 +139,24 @@ class RelayClient:
             async_job = request.timeout_s > RELAY_RESPONSE_LIMIT_S
         if not async_job:
             return self._send(request)
+        self._ensure_request_id(request)
         return self._run_as_job(request)
 
     def submit(self, request: ExecRequest) -> str:
         """Start ``request`` in the background; returns its ``job_id``."""
+        self._ensure_request_id(request)
         result = self._send(
             replace(request, action="submit"),
             http_timeout_s=_CONTROL_HTTP_TIMEOUT_S,
         )
-        if not result.job_id:
-            raise RuntimeError(
-                "listener did not return a job_id — it is running a privy version without async job support"
-            )
-        return result.job_id
+        if result.job_id:
+            return result.job_id
+        if result.error or result.exit_code != 0:
+            detail = result.stderr.strip() or result.error or "submit failed"
+            raise RuntimeError(detail)
+        raise RuntimeError(
+            "listener did not return a job_id — it is running a privy version without async job support"
+        )
 
     def poll(
         self,
@@ -177,10 +183,13 @@ class RelayClient:
     # ---- async job driver ---------------------------------------------
 
     def _run_as_job(self, request: ExecRequest) -> ExecResult:
-        submitted = self._send(
+        state, submitted = self._send(
             replace(request, action="submit"),
             http_timeout_s=_CONTROL_HTTP_TIMEOUT_S,
+            return_state=True,
         )
+        if state and state != "running":
+            return submitted
         if not submitted.job_id:
             # Older listener: it just ran the code synchronously. The result is
             # already final, so hand it back rather than failing.
@@ -219,6 +228,11 @@ class RelayClient:
         except KeyboardInterrupt:
             self.cancel(request, job_id)
             raise
+
+    @staticmethod
+    def _ensure_request_id(request: ExecRequest) -> None:
+        if request.request_id is None:
+            request.request_id = uuid.uuid4().hex
 
     # ---- internals -----------------------------------------------------
 

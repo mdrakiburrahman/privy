@@ -117,7 +117,10 @@ Caveats: linux x86_64. Statically linked (staticx), so it runs on old glibc too.
 
 ```python
 from privy import RelayServer
-RelayServer(namespace="...", path="...", keyrule="...", key="...", inprocess_globals={"spark": spark, "sc": sc}).serve_forever()
+
+RelayServer(
+    namespace="...", path="...", keyrule="...", key="...", inprocess_globals={"spark": spark, "sc": sc}
+).serve_forever()
 ```
 
 ## Client
@@ -178,8 +181,7 @@ This is automatic — anything with `timeout_s` above `RELAY_RESPONSE_LIMIT_S`
 
 ```python
 # Runs for 10 minutes; returns normally instead of a 504.
-r = c.run_python("df = spark.sql(big_query); print(df.count())",
-                 mode="inprocess", timeout_s=1200)
+r = c.run_python("df = spark.sql(big_query); print(df.count())", mode="inprocess", timeout_s=1200)
 print(r.exit_code, r.stdout, r.job_id)
 ```
 
@@ -196,16 +198,24 @@ later, or from a different process:
 ```python
 from privy import ExecRequest
 
-req = ExecRequest(kind="python", code="spark.sql(q).write.save(path)",
-                  mode="inprocess", timeout_s=3600)
+req = ExecRequest(
+    kind="python",
+    code="spark.sql(q).write.save(path)",
+    mode="inprocess",
+    timeout_s=3600,
+    request_id="stable-client-generated-uuid",
+)
 job_id = c.submit(req)
 ...
-state, result = c.poll(req, job_id, wait_s=20)   # state: running | done | cancelled | missing
-c.cancel(req, job_id)                             # best-effort interrupt
+state, result = c.poll(req, job_id, wait_s=20)  # state: running | done | cancelled | missing
+c.cancel(req, job_id)  # best-effort interrupt
 ```
 
 Notes:
 
+- `request_id` is optional but recommended for retry-safe `action="submit"`:
+  retries of the same payload return the original `job_id`, while reusing the
+  same key for a different payload is rejected explicitly.
 - Jobs are held in memory on the listener and reaped one hour after they finish
   (`PRIVY_JOB_RETENTION_S`). A notebook restart loses them.
 - `mode="inprocess"` executions run **concurrently** — stdout/stderr are captured
@@ -221,8 +231,12 @@ In the Fabric notebook cell where you start Privy, use `proxy_target`:
 
 ```python
 from privy import RelayServer
+
 RelayServer(
-    namespace="...", path="...", keyrule="...", key="...",
+    namespace="...",
+    path="...",
+    keyrule="...",
+    key="...",
     proxy_target="http://127.0.0.1:8080",
 ).serve_forever()
 ```
