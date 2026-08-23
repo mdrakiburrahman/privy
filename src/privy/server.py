@@ -12,11 +12,11 @@ Hybrid Connection pattern used in the reference ``relay-demo``:
       {"address": "wss://…"}}``; we open that sub-websocket and the request
       frame + body arrive there; we also send the response there.
 * For inline requests the *body* must be read on the control socket in arrival
-  order, but execution then moves to the thread pool and the response frame is
-  written back under a lock (each frame carries its ``requestId``, so replies
-  may complete out of order). Without this a single slow request — notably a
-  long-polling ``action="poll"`` — would stall every other sender. For
-  rendezvous requests we hand the whole exchange to the pool.
+  order, but execution then moves to the thread pool and the response is
+  queued back to the listener thread for emission on that same control socket.
+  This keeps request execution parallel without having worker threads race on
+  the shared websocket. For rendezvous requests we hand the whole exchange to
+  the pool because each one has its own dedicated sub-websocket.
 """
 
 from __future__ import annotations
@@ -24,7 +24,9 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any
 
 import websocket
@@ -129,6 +131,54 @@ def _log_response(resp: ExecResponse, request_id: Any) -> None:
     log.info("\n".join(parts))
 
 
+@dataclass
+class _PendingInlineResponse:
+    request_id: Any
+    body_json: str
+
+
+class _InlineResponsePump:
+    """Thread-safe queue for inline control-channel responses.
+
+    The Azure Relay control websocket is both the inbound listener socket and
+    the outbound response channel for inline requests. Keep all control-socket
+    I/O on the listener thread: workers execute requests in parallel, but only
+    enqueue their completed responses here.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending: deque[_PendingInlineResponse] = deque()
+        self._ready = threading.Event()
+        self._closed = False
+
+    def submit(self, request_id: Any, body_json: str) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            self._pending.append(_PendingInlineResponse(request_id=request_id, body_json=body_json))
+            self._ready.set()
+            return True
+
+    def drain(self) -> list[_PendingInlineResponse]:
+        with self._lock:
+            items = list(self._pending)
+            self._pending.clear()
+            self._ready.clear()
+            return items
+
+    def has_pending(self) -> bool:
+        return self._ready.is_set()
+
+    def close(self) -> int:
+        with self._lock:
+            self._closed = True
+            dropped = len(self._pending)
+            self._pending.clear()
+            self._ready.clear()
+            return dropped
+
+
 class RelayServer:
     """Long-running listener that executes requests arriving via Azure Relay.
 
@@ -181,9 +231,6 @@ class RelayServer:
         self._stop = threading.Event()
         self._listening = threading.Event()
         self._pool: ThreadPoolExecutor | None = None
-        # The control websocket is a single byte stream: only one writer at a
-        # time may emit a (response frame, body frame) pair.
-        self._send_lock = threading.Lock()
 
     # ---- lifecycle -----------------------------------------------------
 
@@ -237,12 +284,17 @@ class RelayServer:
         ws.settimeout(self._recv_timeout_s)
         self._listening.set()
         log.info("Listening on Azure Relay: wss://%s/$hc/%s", ns, self._path)
+        inline_responses = _InlineResponsePump()
 
         try:
             while not self._stop.is_set():
+                if inline_responses.has_pending():
+                    self._flush_inline_responses(ws, inline_responses)
+                    continue
                 try:
                     raw = ws.recv()
                 except websocket.WebSocketTimeoutException:
+                    self._flush_inline_responses(ws, inline_responses)
                     continue
                 if raw is None or raw == "":
                     log.warning("Control channel closed by peer.")
@@ -263,7 +315,7 @@ class RelayServer:
                     # Inline mode: body (if any) comes on the same control
                     # socket, and the response goes back on it too. Read the
                     # body here (ordering matters), then execute off-thread.
-                    self._handle_inline(ws, req_meta)
+                    self._handle_inline(ws, req_meta, inline_responses)
                 else:
                     # Rendezvous mode: hand off to a worker which opens a
                     # dedicated sub-websocket per request, leaving the
@@ -271,8 +323,12 @@ class RelayServer:
                     if self._pool is None:  # pragma: no cover
                         raise RuntimeError("worker pool not initialised")
                     self._pool.submit(self._handle_rendezvous, req_meta)
+                self._flush_inline_responses(ws, inline_responses)
         finally:
             self._listening.clear()
+            dropped = inline_responses.close()
+            if dropped:
+                log.warning("Dropping %s inline response(s) on control-channel loss.", dropped)
             try:
                 ws.close()
             except Exception:  # pragma: no cover
@@ -283,7 +339,12 @@ class RelayServer:
     #   2) execute the request
     #   3) write a response frame (+ body frame) back on `opws`
 
-    def _handle_inline(self, ws: websocket.WebSocket, req_meta: dict[str, Any]) -> None:
+    def _handle_inline(
+        self,
+        ws: websocket.WebSocket,
+        req_meta: dict[str, Any],
+        inline_responses: _InlineResponsePump,
+    ) -> None:
         try:
             payload_raw = self._maybe_recv_body(ws, req_meta)
         except Exception as exc:  # noqa: BLE001
@@ -296,8 +357,7 @@ class RelayServer:
             try:
                 result = self._execute(payload_raw, request_id=request_id)
                 body = result if isinstance(result, str) else result.to_json()
-                with self._send_lock:
-                    self._send_response(ws, request_id, body)
+                inline_responses.submit(request_id, body)
             except Exception as exc:  # noqa: BLE001
                 log.exception("inline request handler crashed: %s", exc)
 
@@ -361,6 +421,14 @@ class RelayServer:
         }
         ws.send(json.dumps(frame))
         ws.send(body_json)
+
+    def _flush_inline_responses(
+        self,
+        ws: websocket.WebSocket,
+        inline_responses: _InlineResponsePump,
+    ) -> None:
+        for pending in inline_responses.drain():
+            self._send_response(ws, pending.request_id, pending.body_json)
 
     def _execute(self, payload_raw: str | None, *, request_id: Any) -> ExecResponse | str:
         """Execute a request. Returns ExecResponse for code, or JSON string for proxy."""
