@@ -48,8 +48,17 @@ def create_sas_token(
     return f"SharedAccessSignature sr={encoded_uri}&sig={sig}&se={expiry}&skn={sas_key_name}"
 
 
-def create_listen_url(service_namespace: str, entity_path: str, token: str | None = None) -> str:
-    url = f"wss://{service_namespace}/$hc/{entity_path}?sb-hc-action=listen&sb-hc-id=privy"
+def create_listen_url(
+    service_namespace: str,
+    entity_path: str,
+    token: str | None = None,
+    connection_id: str = "privy",
+) -> str:
+    encoded_id = urllib.parse.quote(connection_id, safe="")
+    url = (
+        f"wss://{service_namespace}/$hc/{entity_path}"
+        f"?sb-hc-action=listen&sb-hc-id={encoded_id}"
+    )
     if token:
         url += "&sb-hc-token=" + urllib.parse.quote(token)
     return url

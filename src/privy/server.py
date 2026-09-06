@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -228,13 +229,22 @@ class RelayServer:
         self._key = key
         self._max_workers = max_workers
         self._listener_connections = listener_connections
+        server_id = uuid.uuid4().hex
+        self._listener_connection_ids = tuple(
+            f"privy-{server_id}-{index + 1}"
+            for index in range(listener_connections)
+        )
         self._recv_timeout_s = recv_timeout_s
         self._proxy_target = proxy_target
 
-        if inprocess_globals:
-            # Lets the host notebook expose live objects (e.g. Fabric's
-            # `spark`/`sc`) to code later submitted with mode="inprocess".
-            seed_inprocess_globals(inprocess_globals)
+        # Expose the host's live objects and this server's listener readiness
+        # to in-process requests.
+        seed_inprocess_globals(
+            {
+                **(inprocess_globals or {}),
+                "_privy_relay_server": self,
+            }
+        )
 
         self._stop = threading.Event()
         self._listening = threading.Event()
@@ -249,8 +259,13 @@ class RelayServer:
         self._stop.set()
 
     def wait_until_listening(self, timeout: float | None = None) -> bool:
-        """Block until the listener websocket is connected (useful for tests)."""
+        """Block until every configured listener websocket is connected."""
         return self._listening.wait(timeout)
+
+    @property
+    def active_listener_connections(self) -> int:
+        with self._listener_state_lock:
+            return self._active_listener_count
 
     def serve_forever(self) -> None:
         """Run listener connections forever, reconnecting each independently."""
@@ -289,7 +304,7 @@ class RelayServer:
         backoff = 1.0
         while not self._stop.is_set():
             try:
-                self._serve_once()
+                self._serve_once(index)
                 backoff = 1.0
             except Exception as exc:  # noqa: BLE001
                 log.warning(
@@ -306,25 +321,37 @@ class RelayServer:
     def _listener_connected(self) -> None:
         with self._listener_state_lock:
             self._active_listener_count += 1
-            self._listening.set()
+            if self._active_listener_count == self._listener_connections:
+                self._listening.set()
 
     def _listener_disconnected(self) -> None:
         with self._listener_state_lock:
             self._active_listener_count = max(0, self._active_listener_count - 1)
-            if self._active_listener_count == 0:
+            if self._active_listener_count < self._listener_connections:
                 self._listening.clear()
 
-    def _listen_url(self) -> str:
+    def _listen_url(self, index: int) -> str:
         ns = fqdn(self._namespace)
         token = create_sas_token(ns, self._path, self._keyrule, self._key)
-        return create_listen_url(ns, self._path, token)
+        return create_listen_url(
+            ns,
+            self._path,
+            token,
+            connection_id=self._listener_connection_ids[index],
+        )
 
-    def _serve_once(self) -> None:
+    def _serve_once(self, index: int) -> None:
         ns = fqdn(self._namespace)
-        ws = websocket.create_connection(self._listen_url())
+        ws = websocket.create_connection(self._listen_url(index))
         ws.settimeout(self._recv_timeout_s)
         self._listener_connected()
-        log.info("Listening on Azure Relay: wss://%s/$hc/%s", ns, self._path)
+        log.info(
+            "Listener %s/%s connected to Azure Relay: wss://%s/$hc/%s",
+            index + 1,
+            self._listener_connections,
+            ns,
+            self._path,
+        )
         inline_responses = _InlineResponsePump()
 
         try:
