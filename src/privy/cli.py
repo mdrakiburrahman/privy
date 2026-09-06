@@ -138,6 +138,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_relay_args(server)
     server.add_argument("--max-workers", type=int, default=32, help="worker threads (default: 32)")
     server.add_argument(
+        "--listener-connections",
+        type=int,
+        default=1,
+        help="parallel Azure Relay listener connections, 1-25 (default: 1)",
+    )
+    server.add_argument(
         "--recv-timeout-s",
         type=float,
         default=1.0,
@@ -204,6 +210,7 @@ def _cmd_server(args: argparse.Namespace) -> int:
     server = RelayServer(
         **_resolve_relay(args),
         max_workers=args.max_workers,
+        listener_connections=args.listener_connections,
         recv_timeout_s=args.recv_timeout_s,
         proxy_target=args.proxy_target,
     )

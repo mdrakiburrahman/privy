@@ -206,6 +206,7 @@ class RelayServer:
         keyrule: str,
         key: str,
         max_workers: int = 32,
+        listener_connections: int = 1,
         recv_timeout_s: float = 1.0,
         proxy_target: str | None = None,
         inprocess_globals: dict[str, Any] | None = None,
@@ -215,11 +216,18 @@ class RelayServer:
         # of concurrent clients (e.g. dbt threads).
         if not all([namespace, path, keyrule, key]):
             raise ValueError("namespace, path, keyrule and key are all required")
+        if (
+            isinstance(listener_connections, bool)
+            or not isinstance(listener_connections, int)
+            or not 1 <= listener_connections <= 25
+        ):
+            raise ValueError("listener_connections must be between 1 and 25")
         self._namespace = namespace
         self._path = path
         self._keyrule = keyrule
         self._key = key
         self._max_workers = max_workers
+        self._listener_connections = listener_connections
         self._recv_timeout_s = recv_timeout_s
         self._proxy_target = proxy_target
 
@@ -230,6 +238,8 @@ class RelayServer:
 
         self._stop = threading.Event()
         self._listening = threading.Event()
+        self._listener_state_lock = threading.Lock()
+        self._active_listener_count = 0
         self._pool: ThreadPoolExecutor | None = None
 
     # ---- lifecycle -----------------------------------------------------
@@ -243,35 +253,66 @@ class RelayServer:
         return self._listening.wait(timeout)
 
     def serve_forever(self) -> None:
-        """Run the listen loop forever, reconnecting with exponential backoff."""
+        """Run listener connections forever, reconnecting each independently."""
         _ensure_default_logging()
-        backoff = 1.0
         self._pool = ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="privy-worker")
+        listeners = [
+            threading.Thread(
+                target=self._serve_listener,
+                args=(index,),
+                name=f"privy-listener-{index + 1}",
+                daemon=True,
+            )
+            for index in range(self._listener_connections)
+        ]
         try:
-            while not self._stop.is_set():
-                try:
-                    self._serve_once()
-                    backoff = 1.0
-                except KeyboardInterrupt:
-                    log.info("Exiting listener.")
-                    return
-                except Exception as exc:  # noqa: BLE001
-                    log.warning(
-                        "Listener error (%s: %s). Reconnecting in %ss…",
-                        type(exc).__name__,
-                        exc,
-                        backoff,
-                    )
-                    if self._stop.wait(backoff):
-                        return
-                    backoff = min(backoff * 2, 30.0)
+            for listener in listeners:
+                listener.start()
+            while not self._stop.wait(0.5):
+                if not any(listener.is_alive() for listener in listeners):
+                    raise RuntimeError("all Azure Relay listener threads exited")
+        except KeyboardInterrupt:
+            log.info("Exiting listener.")
+            self.stop()
         finally:
+            self.stop()
+            for listener in listeners:
+                listener.join(timeout=max(1.0, self._recv_timeout_s + 1.0))
             if self._pool is not None:
                 self._pool.shutdown(wait=False, cancel_futures=True)
                 self._pool = None
             self._listening.clear()
 
     # ---- internals -----------------------------------------------------
+
+    def _serve_listener(self, index: int) -> None:
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                self._serve_once()
+                backoff = 1.0
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Listener %s error (%s: %s). Reconnecting in %ss…",
+                    index + 1,
+                    type(exc).__name__,
+                    exc,
+                    backoff,
+                )
+                if self._stop.wait(backoff):
+                    return
+                backoff = min(backoff * 2, 30.0)
+
+    def _listener_connected(self) -> None:
+        with self._listener_state_lock:
+            self._active_listener_count += 1
+            self._listening.set()
+
+    def _listener_disconnected(self) -> None:
+        with self._listener_state_lock:
+            self._active_listener_count = max(0, self._active_listener_count - 1)
+            if self._active_listener_count == 0:
+                self._listening.clear()
 
     def _listen_url(self) -> str:
         ns = fqdn(self._namespace)
@@ -282,7 +323,7 @@ class RelayServer:
         ns = fqdn(self._namespace)
         ws = websocket.create_connection(self._listen_url())
         ws.settimeout(self._recv_timeout_s)
-        self._listening.set()
+        self._listener_connected()
         log.info("Listening on Azure Relay: wss://%s/$hc/%s", ns, self._path)
         inline_responses = _InlineResponsePump()
 
@@ -325,7 +366,7 @@ class RelayServer:
                     self._pool.submit(self._handle_rendezvous, req_meta)
                 self._flush_inline_responses(ws, inline_responses)
         finally:
-            self._listening.clear()
+            self._listener_disconnected()
             dropped = inline_responses.close()
             if dropped:
                 log.warning("Dropping %s inline response(s) on control-channel loss.", dropped)
