@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import queue
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
 import requests
@@ -98,6 +101,9 @@ class RelayClient:
         self._keyrule = keyrule
         self._key = key
         self._http_timeout_s = http_timeout_s
+        self._sessions: queue.LifoQueue[requests.Session] = queue.LifoQueue()
+        self._warmup_lock = threading.Lock()
+        self._warm_session_count = 0
 
     # ---- public API ----------------------------------------------------
 
@@ -180,6 +186,51 @@ class RelayClient:
             http_timeout_s=_CONTROL_HTTP_TIMEOUT_S,
         )
 
+    def warmup(self, connections: int, *, timeout_s: float = 30.0) -> int:
+        """Pre-open reusable Relay HTTPS connections for a concurrent burst."""
+        if isinstance(connections, bool) or not isinstance(connections, int) or connections < 1:
+            raise ValueError("connections must be a positive integer")
+        if timeout_s <= 0:
+            raise ValueError("timeout_s must be positive")
+
+        with self._warmup_lock:
+            needed = connections - self._warm_session_count
+            if needed <= 0:
+                return self._warm_session_count
+
+            sessions = [requests.Session() for _ in range(needed)]
+            probe = ExecRequest(
+                kind="python",
+                code="1",
+                mode="inprocess",
+                timeout_s=timeout_s,
+            )
+            try:
+                with ThreadPoolExecutor(max_workers=needed) as pool:
+                    futures = [
+                        pool.submit(
+                            self._send_with_session,
+                            session,
+                            probe,
+                            http_timeout_s=timeout_s,
+                        )
+                        for session in sessions
+                    ]
+                    results = [future.result() for future in futures]
+                failed = next((result for result in results if not result.ok), None)
+                if failed is not None:
+                    detail = failed.stderr.strip() or failed.error or "warmup failed"
+                    raise RuntimeError(detail)
+            except BaseException:
+                for session in sessions:
+                    session.close()
+                raise
+
+            for session in sessions:
+                self._sessions.put(session)
+            self._warm_session_count += needed
+            return self._warm_session_count
+
     # ---- async job driver ---------------------------------------------
 
     def _run_as_job(self, request: ExecRequest) -> ExecResult:
@@ -243,11 +294,35 @@ class RelayClient:
         http_timeout_s: float | None = None,
         return_state: bool = False,
     ):
+        try:
+            session = self._sessions.get_nowait()
+        except queue.Empty:
+            session = None
+        try:
+            return self._send_with_session(
+                session,
+                request,
+                http_timeout_s=http_timeout_s,
+                return_state=return_state,
+            )
+        finally:
+            if session is not None:
+                self._sessions.put(session)
+
+    def _send_with_session(
+        self,
+        session: requests.Session | None,
+        request: ExecRequest,
+        *,
+        http_timeout_s: float | None = None,
+        return_state: bool = False,
+    ):
         ns = fqdn(self._namespace)
         token = create_sas_token(ns, self._path, self._keyrule, self._key)
         url = create_http_send_url(ns, self._path, token)
 
-        r = requests.post(
+        post = requests.post if session is None else session.post
+        r = post(
             url,
             headers={"Content-Type": "application/json"},
             data=request.to_json(),
