@@ -31,6 +31,21 @@ dist/privy
 The binary build runs version and command-help smoke checks. It uses PyInstaller plus staticx so the
 target does not need Python and can use an older glibc.
 
+Build the native Windows x86_64 executable on Windows:
+
+```powershell
+.\scripts\build_binary.ps1
+```
+
+Output:
+
+```text
+dist\privy.exe
+```
+
+The PowerShell build verifies the PE architecture and runs the same version and command-help smoke
+checks. PyInstaller artifacts are built on their target operating system rather than cross-compiled.
+
 Running the packaged CLI as a Linux listener requires `unshare` from util-linux, enabled
 unprivileged user namespaces, and a dedicated non-root account. The listener uses a private PID/proc
 namespace so remote execution cannot inspect credential-bearing binary launcher processes; it fails
@@ -90,10 +105,17 @@ PR workflows can execute code with the relay E2E secret.
 
 `.github/workflows/gci.yml` runs two required jobs for PRs targeting `main`:
 
-1. `ci` runs `scripts/check_ci.sh`, builds both release artifacts with `scripts/build_release.sh`,
-   verifies them, and uploads them for review. It receives no secrets.
-2. `gci` waits for `ci`, rejects fork-based PRs, and runs `scripts/run_gci.sh` with the relay-only
-   `gci` environment's `BASE64_ENV`.
+1. `ci` runs `scripts/check_ci.sh`, builds the wheel and Linux executable with
+   `scripts/build_release.sh`, verifies them, and uploads them for review. It receives no secrets.
+2. `windows-ci` builds and smoke-tests `privy.exe` on `windows-latest`, verifies that it is an
+   x86_64 PE executable, and uploads it for the secret-backed test.
+3. `gci-linux` rejects fork-based PRs and runs `scripts/run_gci.sh` with the relay-only `gci`
+   environment's `BASE64_ENV`.
+4. `gci-windows` downloads the exact artifact from `windows-ci`, starts one binary server process,
+   and invokes a separate binary client process through the Relay. It runs after `gci-linux` so the
+   shared Hybrid Connection cannot route the request to the wrong listener.
+5. The final `gci` job preserves the repository's required status-check name and fails unless both
+   platform GCI jobs succeed.
 
 PR builds never upload to Azure Storage.
 
@@ -107,8 +129,10 @@ review is required, and repository admins may bypass the rule.
 
 `.github/workflows/publish.yml` runs for every push to `main`. It:
 
-1. Builds and verifies the wheel and CLI with `scripts/build_release.sh`.
-2. Runs `scripts/publish_release.sh` with the `main`-restricted `production` environment's
+1. Builds and verifies the wheel/Linux executable on Ubuntu and the Windows executable on Windows.
+2. Transfers those artifacts to one Ubuntu publish job.
+3. Verifies all expected artifact types before making an upload.
+4. Runs `scripts/publish_release.sh` with the `main`-restricted `production` environment's
    `BASE64_ENV`.
 
 It does not rerun Ruff, pytest, or E2E after merge. GCI is the test gate.
@@ -127,6 +151,8 @@ Default upload destinations:
 https://rakirahman.blob.core.windows.net/public/whls/privy-<version>-py3-none-any.whl
 https://rakirahman.blob.core.windows.net/public/bins/privy-<version>-linux-x86_64
 https://rakirahman.blob.core.windows.net/public/bins/privy-linux-x86_64
+https://rakirahman.blob.core.windows.net/public/bins/privy-<version>-windows-x86_64.exe
+https://rakirahman.blob.core.windows.net/public/bins/privy-windows-x86_64.exe
 ```
 
 All uploads use overwrite semantics.
@@ -140,7 +166,8 @@ set +a
 
 uv build
 ./scripts/build_binary.sh
+# Copy dist/privy.exe from a native Windows build.
 ./scripts/upload_whl.sh
 ```
 
-The script fails when `STORAGE_KEY`, the wheel, or the CLI is missing.
+The script fails when `STORAGE_KEY`, the wheel, the Linux CLI, or the Windows CLI is missing.

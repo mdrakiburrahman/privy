@@ -1,13 +1,13 @@
 # privy
 
-Remote Python and Bash execution, resumable file transfer, and HTTP proxying over Azure Relay Hybrid
-Connections.
+Remote Python, Bash, and PowerShell execution, resumable file transfer, and HTTP proxying over Azure
+Relay Hybrid Connections.
 
 ![Architecture](.imgs/relay-tunnel.png)
 
-Privy can run as a Python package or as a self-contained Linux x86_64 CLI. The listener is commonly
-hosted in a Fabric notebook or another remote compute environment; clients connect without opening
-an inbound port on that environment.
+Privy can run as a Python package or as a self-contained Linux or Windows x86_64 CLI. The listener
+is commonly hosted in a Fabric notebook or another remote compute environment; clients connect
+without opening an inbound port on that environment.
 
 ## Quick start
 
@@ -49,6 +49,7 @@ examples in one deterministic plain-text document.
 
 | Guide                                    | Contents                                                                                      |
 | ---------------------------------------- | --------------------------------------------------------------------------------------------- |
+| [Installation](INSTALL.md)               | Install the Python package or standalone Linux and Windows executables.                       |
 | [Setup](docs/SETUP.md)                   | Provision Azure Relay, configure credentials, and split Listen/Send rules.                    |
 | [Server](docs/SERVER.md)                 | Run the listener, expose notebook globals, manage long jobs, and proxy a local service.       |
 | [CLI](docs/CLI.md)                       | Complete command behavior, output and exit contracts, dependency manifests, and runtime help. |
@@ -57,6 +58,7 @@ examples in one deterministic plain-text document.
 | [File transfer](docs/FILE_TRANSFER.md)   | Chunking, resume, SHA-256 integrity, paths, and overwrite behavior.                           |
 | [HTTP proxy](docs/PROXY.md)              | Browse or call a remote HTTP service through the Relay listener.                              |
 | [Deployment](docs/DEPLOYMENT.md)         | Build the wheel/CLI, run GCI, publish after merge, and download artifacts.                    |
+| [Python package feeds](docs/PYPI.md)     | Use an approved package mirror when direct PyPI access is blocked.                            |
 | [Contributing](contrib/README.md)        | Bootstrap the development environment.                                                        |
 
 ## Markdown checks
@@ -68,14 +70,30 @@ examples in one deterministic plain-text document.
 
 ## Download the standalone CLI
 
+Linux:
+
 ```bash
 curl -fsSL https://rakirahman.blob.core.windows.net/public/bins/privy-linux-x86_64 -o privy
 chmod +x privy
 ./privy --help
 ```
 
+Windows PowerShell:
+
+```powershell
+Invoke-WebRequest `
+  -Uri "https://rakirahman.blob.core.windows.net/public/bins/privy-windows-x86_64.exe" `
+  -OutFile "privy.exe"
+Unblock-File -LiteralPath ".\privy.exe"
+.\privy.exe --help
+```
+
+See [INSTALL.md](INSTALL.md) for PATH setup, the unsigned Windows binary policy, package-feed
+configuration, runtime dependencies, and source builds.
+
 The binary bundles Python for in-process execution. A real `python3` on `PATH` is still required for
-`--python --mode subprocess`; Bash and `--mode inprocess` work without it.
+`--python --mode subprocess`. Bash requires `bash`; PowerShell uses `pwsh` when available and falls
+back to Windows PowerShell. Python `--mode inprocess` needs neither external runtime.
 
 ## License
 

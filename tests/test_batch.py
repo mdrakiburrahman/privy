@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 
 import pytest
@@ -54,8 +55,8 @@ def test_parse_batch_manifest():
                     {"id": "one", "kind": "bash", "code": "echo one"},
                     {
                         "id": "two",
-                        "kind": "python",
-                        "code": "print('two')",
+                        "kind": "powershell",
+                        "code": "Write-Output two",
                         "depends_on": ["one"],
                     },
                 ],
@@ -65,6 +66,14 @@ def test_parse_batch_manifest():
 
     assert manifest.max_parallel == 4
     assert manifest.commands[1].depends_on == ("one",)
+    assert manifest.commands[1].kind == "powershell"
+
+
+def test_parse_batch_manifest_rejects_inprocess_powershell():
+    with pytest.raises(BatchValidationError, match="cannot run powershell inprocess"):
+        parse_batch_manifest(
+            '{"commands":[{"id":"one","kind":"powershell","code":"echo","mode":"inprocess"}]}'
+        )
 
 
 def test_manifest_defaults_to_32_parallel_jobs():
@@ -121,7 +130,7 @@ def test_run_many_unlocks_dependencies_and_preserves_input_order():
         "succeeded",
     ]
     assert result.outcomes[0].result.stdout == "a\n"
-    assert result.outcomes[1].result.stdout == "b\n"
+    assert result.outcomes[1].result.stdout == f"b{os.linesep}"
     assert client.submitted.index("echo c") > client.submitted.index("sleep 0.1; echo a")
 
 

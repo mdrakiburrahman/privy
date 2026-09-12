@@ -39,14 +39,14 @@ class CommandSpec:
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id.strip():
             raise BatchValidationError("command id must be a non-empty string")
-        if self.kind not in ("python", "bash"):
-            raise BatchValidationError(f"command {self.id!r} kind must be 'python' or 'bash'")
+        if self.kind not in ("python", "bash", "powershell"):
+            raise BatchValidationError(f"command {self.id!r} kind must be 'python', 'bash', or 'powershell'")
         if not isinstance(self.code, str):
             raise BatchValidationError(f"command {self.id!r} code must be a string")
         if self.mode not in ("subprocess", "inprocess"):
             raise BatchValidationError(f"command {self.id!r} mode must be 'subprocess' or 'inprocess'")
-        if self.kind == "bash" and self.mode != "subprocess":
-            raise BatchValidationError(f"command {self.id!r} cannot run Bash inprocess")
+        if self.kind != "python" and self.mode != "subprocess":
+            raise BatchValidationError(f"command {self.id!r} cannot run {self.kind} inprocess")
         _positive_number(self.timeout_s, f"command {self.id!r} timeout_s")
         if not isinstance(self.depends_on, tuple) or not all(
             isinstance(item, str) and item for item in self.depends_on
@@ -63,16 +63,18 @@ class CommandSpec:
         if not isinstance(command_id, str) or not command_id.strip():
             raise BatchValidationError("each command requires a non-empty string id")
         kind = value.get("kind")
-        if kind not in ("python", "bash"):
-            raise BatchValidationError(f"command {command_id!r} kind must be 'python' or 'bash'")
+        if kind not in ("python", "bash", "powershell"):
+            raise BatchValidationError(
+                f"command {command_id!r} kind must be 'python', 'bash', or 'powershell'"
+            )
         code = value.get("code")
         if not isinstance(code, str):
             raise BatchValidationError(f"command {command_id!r} code must be a string")
         mode = value.get("mode", "subprocess")
         if mode not in ("subprocess", "inprocess"):
             raise BatchValidationError(f"command {command_id!r} mode must be 'subprocess' or 'inprocess'")
-        if kind == "bash" and mode != "subprocess":
-            raise BatchValidationError(f"command {command_id!r} cannot run Bash inprocess")
+        if kind != "python" and mode != "subprocess":
+            raise BatchValidationError(f"command {command_id!r} cannot run {kind} inprocess")
         timeout_s = _positive_number(
             value.get("timeout_s", DEFAULT_TIMEOUT_S),
             f"command {command_id!r} timeout_s",

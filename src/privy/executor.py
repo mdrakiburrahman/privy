@@ -2,9 +2,9 @@
 
 Two strategies:
 
-* ``run_subprocess``  — spawns a fresh ``bash -lc`` or ``python -c``; truly
-  stateless, works for ``kind="bash"`` and ``kind="python"``. This is the
-  default and the only option that can run shell commands (``pip install`` etc).
+* ``run_subprocess``  — spawns a fresh Bash, PowerShell, or Python process;
+  truly stateless and the only option that can run shell commands
+  (``pip install`` etc).
 * ``run_inprocess_python`` — executes inside the current interpreter via
   ``exec()``. Shares globals across calls so Fabric notebook objects (e.g.
   ``spark``) are visible. Python only.
@@ -54,6 +54,143 @@ _SERIALIZE_INPROCESS = os.environ.get("PRIVY_SERIALIZE_INPROCESS", "").strip().l
     "true",
     "yes",
 )
+
+_POWERSHELL_STDIN_BOOTSTRAP = (
+    "$utf8=[Text.UTF8Encoding]::new($false);"
+    "[Console]::OutputEncoding=$utf8;"
+    "$OutputEncoding=$utf8;"
+    "$stream=[Console]::OpenStandardInput();"
+    "$memory=[IO.MemoryStream]::new();"
+    "$stream.CopyTo($memory);"
+    "& ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString($memory.ToArray())))"
+)
+_WINDOWS_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_CLOSE = 0x00002000
+_WINDOWS_PROCESS_SET_QUOTA = 0x0100
+_WINDOWS_PROCESS_TERMINATE = 0x0001
+_PROCESS_JOB_LOCK = threading.Lock()
+
+
+class _WindowsIoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong),
+        ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong),
+        ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong),
+        ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+
+class _WindowsBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _WindowsExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _WindowsBasicLimitInformation),
+        ("IoInfo", _WindowsIoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+def _windows_kernel32():
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.SetInformationJobObject.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    kernel32.SetInformationJobObject.restype = ctypes.c_int
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+    kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.TerminateJobObject.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    return kernel32
+
+
+def _attach_process_tree(proc: subprocess.Popen) -> None:
+    if os.name != "nt":
+        return
+    kernel32 = _windows_kernel32()
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    info = _WindowsExtendedLimitInformation()
+    info.BasicLimitInformation.LimitFlags = _WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_CLOSE
+    try:
+        if not kernel32.SetInformationJobObject(
+            job,
+            _WINDOWS_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        process = kernel32.OpenProcess(
+            _WINDOWS_PROCESS_SET_QUOTA | _WINDOWS_PROCESS_TERMINATE,
+            False,
+            proc.pid,
+        )
+        if not process:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if not kernel32.AssignProcessToJobObject(job, process):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            kernel32.CloseHandle(process)
+    except Exception:
+        kernel32.CloseHandle(job)
+        raise
+
+    with _PROCESS_JOB_LOCK:
+        proc._privy_windows_job = job
+
+
+def _take_windows_job(proc: subprocess.Popen):
+    if os.name != "nt":
+        return None
+    with _PROCESS_JOB_LOCK:
+        job = getattr(proc, "_privy_windows_job", None)
+        proc._privy_windows_job = None
+    return job
+
+
+def _release_process_tree(proc: subprocess.Popen) -> None:
+    job = _take_windows_job(proc)
+    if job:
+        _windows_kernel32().CloseHandle(job)
+
+
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    job = _take_windows_job(proc)
+    if job:
+        kernel32 = _windows_kernel32()
+        kernel32.TerminateJobObject(job, 1)
+        kernel32.CloseHandle(job)
+    elif proc.poll() is None:
+        proc.kill()
 
 
 def seed_inprocess_globals(mapping: dict[str, Any]) -> None:
@@ -122,6 +259,13 @@ def _python_executable() -> str:
     return sys.executable
 
 
+def _powershell_executable() -> str:
+    found = shutil.which("pwsh") or shutil.which("powershell") or shutil.which("powershell.exe")
+    if not found:
+        raise FileNotFoundError("PowerShell is not installed or is not on PATH")
+    return found
+
+
 #: Variables PyInstaller rewrites for its own bundled libraries. Leaking them
 #: into a child makes system binaries (e.g. `az` → system python3) load privy's
 #: bundled libpython/libssl and segfault. PyInstaller stashes the pre-launch
@@ -175,11 +319,23 @@ def _run_subprocess(
     # Force unbuffered text so partial output is not lost on timeout.
     env.setdefault("PYTHONUNBUFFERED", "1")
 
+    proc: subprocess.Popen | None = None
+    stdin_payload: bytes | None = None
     try:
         if kind == "python":
             argv = [_python_executable(), "-u", "-c", code]
         elif kind == "bash":
             argv = ["bash", "-lc", code]
+        elif kind == "powershell":
+            argv = [
+                _powershell_executable(),
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                _POWERSHELL_STDIN_BOOTSTRAP,
+            ]
+            stdin_payload = code.encode("utf-8")
         else:  # pragma: no cover - guarded by protocol
             raise ValueError(f"invalid kind: {kind!r}")
 
@@ -187,10 +343,11 @@ def _run_subprocess(
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if stdin_payload is not None else subprocess.DEVNULL,
             env=env,
             close_fds=True,
         )
+        _attach_process_tree(proc)
     except FileNotFoundError as exc:
         return ExecResponse.from_output(
             exit_code=127,
@@ -199,20 +356,33 @@ def _run_subprocess(
             duration_ms=int((time.monotonic() - start) * 1000),
             error="not_found",
         )
+    except OSError as exc:
+        if proc is not None:
+            _terminate_process_tree(proc)
+        return ExecResponse.from_output(
+            exit_code=126,
+            stdout=b"",
+            stderr=f"{exc}\n".encode(),
+            duration_ms=int((time.monotonic() - start) * 1000),
+            error="process_setup",
+        )
 
     if on_proc is not None:
         on_proc(proc)
 
     timed_out = False
     try:
-        stdout, stderr = proc.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        proc.kill()
         try:
-            stdout, stderr = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:  # pragma: no cover
-            stdout, stderr = b"", b""
+            stdout, stderr = proc.communicate(input=stdin_payload, timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _terminate_process_tree(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:  # pragma: no cover
+                stdout, stderr = b"", b""
+    finally:
+        _release_process_tree(proc)
 
     return ExecResponse.from_output(
         exit_code=proc.returncode if proc.returncode is not None else -1,
@@ -370,7 +540,7 @@ def _run_inprocess_python(
     code: str,
     timeout_s: float,
     start: float,
-    on_run: Callable[[_InprocessRun], None] | None = None,
+    on_run: Callable[[_InprocessRun], bool] | None = None,
 ) -> ExecResponse:
     """Run ``code`` inside this interpreter, capturing stdout/stderr.
 
@@ -383,9 +553,15 @@ def _run_inprocess_python(
     async job can keep a handle on it for cancellation.
     """
     run = _InprocessRun(code)
+    if on_run is not None and not on_run(run):
+        return ExecResponse.from_output(
+            exit_code=130,
+            stdout=b"",
+            stderr=b"",
+            duration_ms=int((time.monotonic() - start) * 1000),
+            error="cancelled",
+        )
     run.start()
-    if on_run is not None:
-        on_run(run)
 
     finished = run.join(timeout=timeout_s)
     timed_out = not finished
@@ -432,61 +608,96 @@ class _Job:
     def __init__(self, req: ExecRequest) -> None:
         self.id = uuid.uuid4().hex
         self.request = req
-        self.done = threading.Event()
+        self.done: threading.Event | None = threading.Event()
         self.response: ExecResponse | None = None
         self.cancelled = False
         self.created_at = time.monotonic()
         self.finished_at: float | None = None
         self._run: _InprocessRun | None = None
         self._proc: subprocess.Popen | None = None
-        self._thread = threading.Thread(target=self._target, name=f"privy-job-{self.id[:8]}", daemon=True)
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = threading.Thread(
+            target=self._target,
+            name=f"privy-job-{self.id[:8]}",
+            daemon=True,
+        )
 
     def start(self) -> None:
+        assert self._thread is not None
         self._thread.start()
 
     def _target(self) -> None:
         start = time.monotonic()
-        try:
-            if self.request.mode == "inprocess":
-                resp = _run_inprocess_python(
-                    self.request.code,
-                    self.request.timeout_s,
-                    start,
-                    on_run=self._adopt_run,
-                )
-            else:
-                resp = _run_subprocess(
-                    self.request.kind,
-                    self.request.code,
-                    self.request.timeout_s,
-                    start,
-                    on_proc=self._adopt_proc,
-                )
-        except Exception as exc:  # noqa: BLE001 - safety net
+        with self._lock:
+            cancelled = self.cancelled
+        if cancelled:
             resp = ExecResponse.from_output(
-                exit_code=1,
+                exit_code=130,
                 stdout=b"",
-                stderr=("job error: " + traceback.format_exc()).encode("utf-8", "replace"),
-                duration_ms=int((time.monotonic() - start) * 1000),
-                error=type(exc).__name__,
+                stderr=b"",
+                duration_ms=0,
+                error="cancelled",
             )
-        self.response = resp
-        self.finished_at = time.monotonic()
-        self.done.set()
+        else:
+            try:
+                if self.request.mode == "inprocess":
+                    resp = _run_inprocess_python(
+                        self.request.code,
+                        self.request.timeout_s,
+                        start,
+                        on_run=self._adopt_run,
+                    )
+                else:
+                    resp = _run_subprocess(
+                        self.request.kind,
+                        self.request.code,
+                        self.request.timeout_s,
+                        start,
+                        on_proc=self._adopt_proc,
+                    )
+            except Exception as exc:  # noqa: BLE001 - safety net
+                resp = ExecResponse.from_output(
+                    exit_code=1,
+                    stdout=b"",
+                    stderr=("job error: " + traceback.format_exc()).encode("utf-8", "replace"),
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                    error=type(exc).__name__,
+                )
 
-    def _adopt_run(self, run: _InprocessRun) -> None:
-        self._run = run
+        with self._lock:
+            self.response = resp
+            self.finished_at = time.monotonic()
+            self._run = None
+            self._proc = None
+            self._thread = None
+            done = self.done
+            self.done = None
+        if done is not None:
+            done.set()
+        _reap_jobs()
+
+    def _adopt_run(self, run: _InprocessRun) -> bool:
+        with self._lock:
+            self._run = run
+            return not self.cancelled
 
     def _adopt_proc(self, proc: subprocess.Popen) -> None:
-        self._proc = proc
+        with self._lock:
+            self._proc = proc
+            cancelled = self.cancelled
+        if cancelled:
+            _terminate_process_tree(proc)
 
     def cancel(self) -> None:
-        self.cancelled = True
-        if self._run is not None:
-            self._run.interrupt()
-        if self._proc is not None and self._proc.poll() is None:
+        with self._lock:
+            self.cancelled = True
+            run = self._run
+            proc = self._proc
+        if run is not None:
+            run.interrupt()
+        if proc is not None:
             try:
-                self._proc.kill()
+                _terminate_process_tree(proc)
             except Exception:  # pragma: no cover
                 pass
 
@@ -497,16 +708,27 @@ _JOBS_LOCK = threading.Lock()
 #: How long a finished job's result is retained after the last poll could have
 #: read it. Generous: a client that briefly loses the relay can still collect.
 _JOB_RETENTION_S = float(os.environ.get("PRIVY_JOB_RETENTION_S", "3600"))
+_MAX_RETAINED_JOB_RESULTS = max(1, int(os.environ.get("PRIVY_MAX_RETAINED_JOB_RESULTS", "1024")))
 
 
 def _reap_jobs() -> None:
     now = time.monotonic()
     with _JOBS_LOCK:
-        stale = [
+        stale = {
             jid
             for jid, job in _JOBS.items()
             if job.finished_at is not None and (now - job.finished_at) > _JOB_RETENTION_S
-        ]
+        }
+        completed = sorted(
+            (
+                (job.finished_at, jid)
+                for jid, job in _JOBS.items()
+                if job.finished_at is not None and jid not in stale
+            ),
+            key=lambda item: item[0],
+        )
+        overflow = max(0, len(completed) - _MAX_RETAINED_JOB_RESULTS)
+        stale.update(jid for _, jid in completed[:overflow])
         for jid in stale:
             _JOBS.pop(jid, None)
 
@@ -543,8 +765,10 @@ def poll_job(job_id: str, wait_s: float = DEFAULT_POLL_WAIT_S) -> ExecResponse:
             state="missing",
         )
 
-    job.done.wait(timeout=max(0.0, min(wait_s, MAX_POLL_WAIT_S)))
-    if not job.done.is_set():
+    done = job.done
+    if done is not None:
+        done.wait(timeout=max(0.0, min(wait_s, MAX_POLL_WAIT_S)))
+    if job.response is None:
         return ExecResponse.from_output(
             exit_code=0,
             stdout=b"",

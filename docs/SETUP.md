@@ -4,7 +4,7 @@
 
 - An Azure subscription and Azure CLI login.
 - Permission to create an Azure Relay namespace, Hybrid Connection, and authorization rules.
-- Python plus `uv`, or the standalone Linux x86_64 binary.
+- Python plus `uv`, or a standalone Linux or Windows x86_64 binary from [INSTALL.md](../INSTALL.md).
 
 ## Provision Azure Relay
 

@@ -1,7 +1,7 @@
 # CLI
 
-The same CLI is installed by the Python package and bundled in the standalone Linux x86_64
-executable.
+The same CLI is installed by the Python package and bundled in the standalone Linux and Windows
+x86_64 executables.
 
 ## Runtime reference
 
@@ -45,8 +45,10 @@ exclusive. `--ttl-seconds` controls tokens minted internally from a key.
 ```bash
 privy client --bash 'uname -a'
 privy client --python 'print(6 * 7)'
+privy client --powershell 'Get-ComputerInfo'
 privy client --file script.py --file-kind python
 cat script.sh | privy client --file - --file-kind bash
+Get-Content script.ps1 | privy client --file - --file-kind powershell
 ```
 
 Python modes:
@@ -58,9 +60,12 @@ Python modes:
 privy client --python 'print(spark.version)' --mode inprocess
 ```
 
+PowerShell is subprocess-only. The listener runs `pwsh` when available, then falls back to Windows
+PowerShell. Commands are passed as one argument rather than interpolated into a shell command line.
+
 ## Timeouts and async jobs
 
-`--timeout-s` applies to both Python and Bash and is passed to the remote executor:
+`--timeout-s` applies to Python, Bash, and PowerShell and is passed to the remote executor:
 
 ```bash
 privy client --bash './long-job.sh' --timeout-s 1200
@@ -99,8 +104,8 @@ Use `--batch FILE`, or `--batch -` for stdin:
     },
     {
       "id": "right",
-      "kind": "bash",
-      "code": "./build-right.sh",
+      "kind": "powershell",
+      "code": ".\\build-right.ps1",
       "depends_on": ["extract"]
     },
     {

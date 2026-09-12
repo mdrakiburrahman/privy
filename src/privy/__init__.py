@@ -1,4 +1,4 @@
-"""privy — remote Python/bash execution over Azure Relay Hybrid Connections."""
+"""privy — remote Python, Bash, and PowerShell execution over Azure Relay."""
 
 from privy._relay import (
     RelayTokenAudienceError,

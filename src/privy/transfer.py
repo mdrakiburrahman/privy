@@ -642,7 +642,8 @@ def _upload_complete(request: TransferRequest) -> TransferResponse:
                 "checksum_mismatch",
                 f"upload SHA-256 mismatch: expected {request.sha256}, got {digest}",
             )
-        with partial.open("rb") as stream:
+        # Windows requires a writable handle for FlushFileBuffers, which backs os.fsync.
+        with partial.open("r+b") as stream:
             os.fsync(stream.fileno())
         marker = _write_completion_marker(
             destination,
