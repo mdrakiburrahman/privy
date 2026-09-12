@@ -78,31 +78,45 @@ export PRIVY_RELAY_PATH=my-path
 export PRIVY_RELAY_KEYRULE=all
 export PRIVY_RELAY_KEY=...
 
-mkdir -p .temp
-cd .temp
+cd /tmp
 curl -fsSL https://rakirahman.blob.core.windows.net/public/bins/privy-linux-x86_64 -o privy && chmod +x privy
 ./privy server -v
 ```
 
-Windows PowerShell:
+Windows PowerShell - write one time secret:
 
 ```powershell
+$work = "C:\.temp\privy"
+New-Item -ItemType Directory -Force $work | Out-Null
+
+Invoke-WebRequest `
+    -Uri "https://rakirahman.blob.core.windows.net/public/bins/privy-windows-x86_64.exe" `
+    -OutFile "$work\privy.exe" `
+    -UseBasicParsing
+
+Unblock-File "$work\privy.exe"
+
+@'
 $env:PRIVY_RELAY_NAMESPACE = "my-relay"
 $env:PRIVY_RELAY_PATH = "my-path"
 $env:PRIVY_RELAY_KEYRULE = "all"
 $env:PRIVY_RELAY_KEY = "..."
+$env:TEMP = "C:\.temp\privy"
+$env:TMP = "C:\.temp\privy"
+'@ | Set-Content "$work\relay.env.ps1"
+```
 
-$work = "C:\.temp\privy"
-New-Item -ItemType Directory -Force $work | Out-Null
+Use it:
 
-$env:TEMP = $work
-$env:TMP = $work
+```powershell
+. "C:\.temp\privy\relay.env.ps1"
+& "C:\.temp\privy\privy.exe" client --bash "uname -a"
+```
 
-$exe = "$work\privy.exe"
-Invoke-WebRequest "https://rakirahman.blob.core.windows.net/public/bins/privy-windows-x86_64.exe" -OutFile $exe
-Unblock-File $exe
+The linux will return:
 
-& $exe client --bash "uname -a"
+```text
+Linux f28c785d888e 6.18.33.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun 18 21:54:43 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
 ```
 
 See [INSTALL.md](INSTALL.md) for PATH setup, the unsigned Windows binary policy, package-feed
