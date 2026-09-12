@@ -20,7 +20,13 @@ from typing import Any
 
 import requests as req_lib
 
-from privy._relay import create_http_send_url, create_sas_token, fqdn
+from privy._relay import (
+    DEFAULT_TOKEN_TTL_SECONDS,
+    RelayCredential,
+    TokenProvider,
+    create_http_send_url,
+    redact_relay_secrets,
+)
 
 log = logging.getLogger("privy.proxy")
 
@@ -143,11 +149,7 @@ def handle_proxy_request(proxy_req: ProxyRequest, target: str) -> ProxyResponse:
 class ProxyHandler(BaseHTTPRequestHandler):
     """HTTP handler that forwards requests through Azure Relay."""
 
-    # Set by ProxyClientServer before starting
-    relay_namespace: str = ""
-    relay_path: str = ""
-    relay_keyrule: str = ""
-    relay_key: str = ""
+    relay_credential: RelayCredential | None = None
 
     def _proxy(self, method: str) -> None:
         # Read request body
@@ -164,11 +166,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         )
 
         # Send to relay
-        ns = fqdn(self.relay_namespace)
-        token = create_sas_token(ns, self.relay_path, self.relay_keyrule, self.relay_key)
-        url = create_http_send_url(ns, self.relay_path, token)
-
         try:
+            if self.relay_credential is None:  # pragma: no cover - construction invariant
+                raise RuntimeError("relay credential is not configured")
+            token, _ = self.relay_credential.resolve()
+            url = create_http_send_url(
+                self.relay_credential.namespace,
+                self.relay_credential.path,
+                token,
+            )
             r = req_lib.post(
                 url,
                 headers={"Content-Type": "application/json"},
@@ -178,7 +184,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             r.raise_for_status()
             proxy_resp = ProxyResponse.from_json(r.text)
         except Exception as exc:
-            self.send_error(502, f"Relay error: {exc}")
+            self.send_error(502, f"Relay error: {redact_relay_secrets(str(exc))}")
             return
 
         # Send response to browser
@@ -243,19 +249,30 @@ class ProxyClientServer:
         *,
         namespace: str,
         path: str,
-        keyrule: str,
-        key: str,
+        keyrule: str | None = None,
+        key: str | None = None,
+        token: TokenProvider | None = None,
+        ttl_seconds: int = DEFAULT_TOKEN_TTL_SECONDS,
         local_port: int = 3000,
     ) -> None:
-        ProxyHandler.relay_namespace = namespace
-        ProxyHandler.relay_path = path
-        ProxyHandler.relay_keyrule = keyrule
-        ProxyHandler.relay_key = key
+        self._credential = RelayCredential(
+            namespace=namespace,
+            path=path,
+            keyrule=keyrule,
+            key=key,
+            token=token,
+            ttl_seconds=ttl_seconds,
+        )
         self._port = local_port
         self._server: HTTPServer | None = None
 
     def serve_forever(self) -> None:
-        self._server = HTTPServer(("127.0.0.1", self._port), ProxyHandler)
+        credential = self._credential
+
+        class BoundProxyHandler(ProxyHandler):
+            relay_credential = credential
+
+        self._server = HTTPServer(("127.0.0.1", self._port), BoundProxyHandler)
         log.info("Proxy listening on http://127.0.0.1:%d", self._port)
         print(f"Open http://localhost:{self._port} in your browser")
         self._server.serve_forever()

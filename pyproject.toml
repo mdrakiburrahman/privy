@@ -43,11 +43,22 @@ path = "src/privy/__init__.py"
 packages = ["src/privy"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/privy", "README.md", "LICENSE", "pyproject.toml"]
+include = [
+    "src/privy",
+    "docs",
+    ".imgs/relay-tunnel.png",
+    ".env.template",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "e2e: requires a real Azure Relay Hybrid Connection",
+]
 
 [tool.ruff]
 line-length = 110

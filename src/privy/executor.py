@@ -35,6 +35,7 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
+from privy._relay import RELAY_SECRET_ENV_VARS
 from privy.protocol import DEFAULT_POLL_WAIT_S, MAX_POLL_WAIT_S, ExecRequest, ExecResponse
 
 # A single globals dict shared across all inprocess invocations; mirrors how
@@ -135,10 +136,18 @@ _PYI_LEAKED_VARS = (
     "SSL_CERT_DIR",
 )
 
+_EXECUTION_SECRET_ENV_VARS = (
+    *RELAY_SECRET_ENV_VARS,
+    "BASE64_ENV",
+    "STORAGE_KEY",
+)
+
 
 def _child_env() -> dict[str, str]:
     """Environment for subprocesses, scrubbed of PyInstaller's runtime tweaks."""
     env = dict(os.environ)
+    for var in _EXECUTION_SECRET_ENV_VARS:
+        env.pop(var, None)
     if getattr(sys, "frozen", False):
         for var in _PYI_LEAKED_VARS:
             original = env.pop(f"{var}_ORIG", None)

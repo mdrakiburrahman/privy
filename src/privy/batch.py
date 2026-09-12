@@ -1,0 +1,406 @@
+"""Client-side dependency graph scheduling over privy's async job API."""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import time
+from collections import deque
+from collections.abc import Iterable, Mapping
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
+
+from privy.protocol import DEFAULT_POLL_WAIT_S, DEFAULT_TIMEOUT_S, ExecRequest, Kind, Mode
+
+if TYPE_CHECKING:
+    from privy.client import ExecResult, RelayClient
+
+DEFAULT_MAX_PARALLEL = 32
+log = logging.getLogger("privy.batch")
+
+CommandState = Literal["pending", "running", "succeeded", "failed", "skipped", "cancelled"]
+
+
+class BatchValidationError(ValueError):
+    """A command graph or JSON manifest is invalid."""
+
+
+@dataclass(frozen=True)
+class CommandSpec:
+    id: str
+    kind: Kind
+    code: str
+    mode: Mode = "subprocess"
+    timeout_s: float = DEFAULT_TIMEOUT_S
+    depends_on: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not self.id.strip():
+            raise BatchValidationError("command id must be a non-empty string")
+        if self.kind not in ("python", "bash"):
+            raise BatchValidationError(f"command {self.id!r} kind must be 'python' or 'bash'")
+        if not isinstance(self.code, str):
+            raise BatchValidationError(f"command {self.id!r} code must be a string")
+        if self.mode not in ("subprocess", "inprocess"):
+            raise BatchValidationError(f"command {self.id!r} mode must be 'subprocess' or 'inprocess'")
+        if self.kind == "bash" and self.mode != "subprocess":
+            raise BatchValidationError(f"command {self.id!r} cannot run Bash inprocess")
+        _positive_number(self.timeout_s, f"command {self.id!r} timeout_s")
+        if not isinstance(self.depends_on, tuple) or not all(
+            isinstance(item, str) and item for item in self.depends_on
+        ):
+            raise BatchValidationError(f"command {self.id!r} depends_on must be a tuple of IDs")
+        if len(set(self.depends_on)) != len(self.depends_on):
+            raise BatchValidationError(f"command {self.id!r} has duplicate dependencies")
+        if self.id in self.depends_on:
+            raise BatchValidationError(f"command {self.id!r} cannot depend on itself")
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> CommandSpec:
+        command_id = value.get("id")
+        if not isinstance(command_id, str) or not command_id.strip():
+            raise BatchValidationError("each command requires a non-empty string id")
+        kind = value.get("kind")
+        if kind not in ("python", "bash"):
+            raise BatchValidationError(f"command {command_id!r} kind must be 'python' or 'bash'")
+        code = value.get("code")
+        if not isinstance(code, str):
+            raise BatchValidationError(f"command {command_id!r} code must be a string")
+        mode = value.get("mode", "subprocess")
+        if mode not in ("subprocess", "inprocess"):
+            raise BatchValidationError(f"command {command_id!r} mode must be 'subprocess' or 'inprocess'")
+        if kind == "bash" and mode != "subprocess":
+            raise BatchValidationError(f"command {command_id!r} cannot run Bash inprocess")
+        timeout_s = _positive_number(
+            value.get("timeout_s", DEFAULT_TIMEOUT_S),
+            f"command {command_id!r} timeout_s",
+        )
+        raw_dependencies = value.get("depends_on", [])
+        if not isinstance(raw_dependencies, (list, tuple)) or not all(
+            isinstance(item, str) and item for item in raw_dependencies
+        ):
+            raise BatchValidationError(f"command {command_id!r} depends_on must be a list of IDs")
+        dependencies = tuple(raw_dependencies)
+        if len(set(dependencies)) != len(dependencies):
+            raise BatchValidationError(f"command {command_id!r} has duplicate dependencies")
+        if command_id in dependencies:
+            raise BatchValidationError(f"command {command_id!r} cannot depend on itself")
+        return cls(
+            id=command_id,
+            kind=kind,
+            code=code,
+            mode=mode,
+            timeout_s=timeout_s,
+            depends_on=dependencies,
+        )
+
+    def to_request(self) -> ExecRequest:
+        return ExecRequest(
+            kind=self.kind,
+            code=self.code,
+            mode=self.mode,
+            timeout_s=self.timeout_s,
+        )
+
+
+@dataclass(frozen=True)
+class CommandOutcome:
+    id: str
+    state: CommandState
+    result: ExecResult | None = None
+    error: str | None = None
+    skipped_due_to: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "id": self.id,
+            "state": self.state,
+            "error": self.error,
+            "skipped_due_to": list(self.skipped_due_to),
+            "result": None,
+        }
+        if self.result is not None:
+            value["result"] = {
+                "exit_code": self.result.exit_code,
+                "stdout": self.result.stdout,
+                "stderr": self.result.stderr,
+                "duration_ms": self.result.duration_ms,
+                "timed_out": self.result.timed_out,
+                "error": self.result.error,
+                "job_id": self.result.job_id,
+            }
+        return value
+
+
+@dataclass(frozen=True)
+class BatchResult:
+    outcomes: tuple[CommandOutcome, ...]
+    duration_ms: int
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.outcomes) and all(outcome.state == "succeeded" for outcome in self.outcomes)
+
+    @property
+    def exit_code(self) -> int:
+        return 0 if self.ok else 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "exit_code": self.exit_code,
+            "duration_ms": self.duration_ms,
+            "commands": [outcome.to_dict() for outcome in self.outcomes],
+        }
+
+
+@dataclass(frozen=True)
+class BatchManifest:
+    commands: tuple[CommandSpec, ...]
+    max_parallel: int = DEFAULT_MAX_PARALLEL
+
+
+def parse_batch_manifest(raw: str | bytes) -> BatchManifest:
+    """Parse and validate the JSON representation accepted by the CLI."""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise BatchValidationError(f"batch manifest is not valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise BatchValidationError("batch manifest must be a JSON object")
+    raw_commands = value.get("commands")
+    if not isinstance(raw_commands, list) or not raw_commands:
+        raise BatchValidationError("batch manifest requires a non-empty commands array")
+    commands: list[CommandSpec] = []
+    for item in raw_commands:
+        if not isinstance(item, dict):
+            raise BatchValidationError("each batch command must be a JSON object")
+        commands.append(CommandSpec.from_dict(item))
+    max_parallel = _positive_int(value.get("max_parallel", DEFAULT_MAX_PARALLEL), "max_parallel")
+    validated = validate_commands(commands)
+    return BatchManifest(commands=validated, max_parallel=max_parallel)
+
+
+def validate_commands(commands: Iterable[CommandSpec]) -> tuple[CommandSpec, ...]:
+    """Validate graph references and reject dependency cycles."""
+    ordered = tuple(commands)
+    if not ordered:
+        raise BatchValidationError("at least one command is required")
+    by_id: dict[str, CommandSpec] = {}
+    for command in ordered:
+        if not isinstance(command, CommandSpec):
+            raise BatchValidationError("commands must contain CommandSpec values")
+        if command.id in by_id:
+            raise BatchValidationError(f"duplicate command id: {command.id!r}")
+        by_id[command.id] = command
+    for command in ordered:
+        missing = [dependency for dependency in command.depends_on if dependency not in by_id]
+        if missing:
+            raise BatchValidationError(
+                f"command {command.id!r} has unknown dependencies: {', '.join(missing)}"
+            )
+
+    indegree = {command.id: len(command.depends_on) for command in ordered}
+    dependents = _dependents(ordered)
+    ready = deque(command.id for command in ordered if indegree[command.id] == 0)
+    visited = 0
+    while ready:
+        command_id = ready.popleft()
+        visited += 1
+        for dependent_id in dependents[command_id]:
+            indegree[dependent_id] -= 1
+            if indegree[dependent_id] == 0:
+                ready.append(dependent_id)
+    if visited != len(ordered):
+        cycle_ids = [command.id for command in ordered if indegree[command.id] > 0]
+        raise BatchValidationError("dependency cycle detected involving: " + ", ".join(cycle_ids))
+    return ordered
+
+
+def run_many(
+    client: RelayClient,
+    commands: Iterable[CommandSpec],
+    *,
+    max_parallel: int = DEFAULT_MAX_PARALLEL,
+) -> BatchResult:
+    """Run a validated command DAG and return every terminal outcome."""
+    ordered = validate_commands(commands)
+    max_parallel = _positive_int(max_parallel, "max_parallel")
+    started = time.monotonic()
+    by_id = {command.id: command for command in ordered}
+    dependents = _dependents(ordered)
+    remaining = {command.id: len(command.depends_on) for command in ordered}
+    ready = deque(command.id for command in ordered if not command.depends_on)
+    outcomes: dict[str, CommandOutcome] = {}
+    running: dict[str, tuple[CommandSpec, str]] = {}
+    polls: dict[Future[tuple[str | None, ExecResult]], str] = {}
+
+    def skip_descendants(failed_id: str) -> None:
+        queue = deque(dependents[failed_id])
+        while queue:
+            command_id = queue.popleft()
+            if command_id in outcomes or command_id in running:
+                continue
+            causes = tuple(
+                dependency
+                for dependency in by_id[command_id].depends_on
+                if dependency == failed_id
+                or outcomes.get(dependency, CommandOutcome(dependency, "pending")).state
+                in ("failed", "skipped", "cancelled")
+            )
+            outcomes[command_id] = CommandOutcome(
+                id=command_id,
+                state="skipped",
+                error="dependency_failed",
+                skipped_due_to=causes or (failed_id,),
+            )
+            queue.extend(dependents[command_id])
+
+    def finish(command_id: str, outcome: CommandOutcome) -> None:
+        outcomes[command_id] = outcome
+        running.pop(command_id, None)
+        if outcome.state != "succeeded":
+            skip_descendants(command_id)
+            return
+        for dependent_id in dependents[command_id]:
+            if dependent_id in outcomes:
+                continue
+            remaining[dependent_id] -= 1
+            if remaining[dependent_id] == 0:
+                ready.append(dependent_id)
+
+    def cancel_running() -> None:
+        for command_id, (command, job_id) in list(running.items()):
+            try:
+                client.cancel(command.to_request(), job_id)
+            except Exception as exc:
+                log.warning("Failed to cancel job %s for command %s: %s", job_id, command_id, exc)
+            outcomes[command_id] = CommandOutcome(
+                id=command_id,
+                state="cancelled",
+                error="batch_cancelled",
+            )
+        running.clear()
+
+    with ThreadPoolExecutor(max_workers=max_parallel, thread_name_prefix="privy-batch-poll") as pool:
+        try:
+            while ready or running:
+                while ready and len(running) < max_parallel:
+                    command_id = ready.popleft()
+                    if command_id in outcomes:
+                        continue
+                    command = by_id[command_id]
+                    try:
+                        job_id = client.submit(command.to_request())
+                    except Exception as exc:
+                        finish(
+                            command_id,
+                            CommandOutcome(
+                                id=command_id,
+                                state="failed",
+                                error=f"submit failed: {exc}",
+                            ),
+                        )
+                        continue
+                    running[command_id] = (command, job_id)
+                    future = pool.submit(
+                        client.poll,
+                        command.to_request(),
+                        job_id,
+                        wait_s=min(DEFAULT_POLL_WAIT_S, max(1.0, command.timeout_s)),
+                    )
+                    polls[future] = command_id
+
+                if not running:
+                    continue
+                completed, _ = wait(tuple(polls), return_when=FIRST_COMPLETED)
+                for future in completed:
+                    command_id = polls.pop(future)
+                    if command_id not in running:
+                        continue
+                    command, job_id = running[command_id]
+                    try:
+                        state, result = future.result()
+                    except Exception as exc:
+                        try:
+                            client.cancel(command.to_request(), job_id)
+                        except Exception as cancel_exc:
+                            log.warning(
+                                "Failed to cancel job %s after poll failure: %s",
+                                job_id,
+                                cancel_exc,
+                            )
+                        finish(
+                            command_id,
+                            CommandOutcome(
+                                id=command_id,
+                                state="failed",
+                                error=f"poll failed: {exc}",
+                            ),
+                        )
+                        continue
+                    if state == "running":
+                        next_poll = pool.submit(
+                            client.poll,
+                            command.to_request(),
+                            job_id,
+                            wait_s=min(DEFAULT_POLL_WAIT_S, max(1.0, command.timeout_s)),
+                        )
+                        polls[next_poll] = command_id
+                        continue
+                    if state == "done" and result.ok:
+                        finish(
+                            command_id,
+                            CommandOutcome(id=command_id, state="succeeded", result=result),
+                        )
+                    else:
+                        terminal_state: CommandState = "cancelled" if state == "cancelled" else "failed"
+                        finish(
+                            command_id,
+                            CommandOutcome(
+                                id=command_id,
+                                state=terminal_state,
+                                result=result,
+                                error=result.error or f"job ended in state {state!r}",
+                            ),
+                        )
+        except BaseException:
+            cancel_running()
+            for future in polls:
+                future.cancel()
+            raise
+
+    return BatchResult(
+        outcomes=tuple(outcomes[command.id] for command in ordered),
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+
+
+def _dependents(commands: Iterable[CommandSpec]) -> dict[str, list[str]]:
+    values = tuple(commands)
+    result = {command.id: [] for command in values}
+    for command in values:
+        for dependency in command.depends_on:
+            result[dependency].append(command.id)
+    return result
+
+
+def _positive_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise BatchValidationError(f"{name} must be a positive integer")
+    return value
+
+
+def _positive_number(value: Any, name: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise BatchValidationError(f"{name} must be a positive number")
+    return float(value)

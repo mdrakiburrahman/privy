@@ -3,17 +3,45 @@
 from __future__ import annotations
 
 import json
+import os
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from typing import Any
 
 import requests
 
-from privy._relay import create_http_send_url, create_sas_token, fqdn
+from privy._relay import (
+    DEFAULT_TOKEN_TTL_SECONDS,
+    RelayCredential,
+    TokenProvider,
+    create_http_send_url,
+    redact_relay_secrets,
+)
+from privy.batch import (
+    DEFAULT_MAX_PARALLEL,
+    BatchResult,
+    CommandSpec,
+)
+from privy.batch import (
+    run_many as run_command_batch,
+)
 from privy.protocol import (
     DEFAULT_POLL_WAIT_S,
     DEFAULT_TIMEOUT_S,
     ExecRequest,
     ExecResponse,
+)
+from privy.transfer import (
+    DEFAULT_CHUNK_SIZE,
+    ProgressCallback,
+    TransferResult,
+)
+from privy.transfer import (
+    download_file as download_over_relay,
+)
+from privy.transfer import (
+    upload_file as upload_over_relay,
 )
 
 #: Azure Relay fails a request whose listener has not responded within roughly
@@ -86,16 +114,20 @@ class RelayClient:
         *,
         namespace: str,
         path: str,
-        keyrule: str,
-        key: str,
+        keyrule: str | None = None,
+        key: str | None = None,
+        token: TokenProvider | None = None,
+        ttl_seconds: int = DEFAULT_TOKEN_TTL_SECONDS,
         http_timeout_s: float = DEFAULT_TIMEOUT_S + 30.0,
     ) -> None:
-        if not all([namespace, path, keyrule, key]):
-            raise ValueError("namespace, path, keyrule and key are all required")
-        self._namespace = namespace
-        self._path = path
-        self._keyrule = keyrule
-        self._key = key
+        self._credential = RelayCredential(
+            namespace=namespace,
+            path=path,
+            keyrule=keyrule,
+            key=key,
+            token=token,
+            ttl_seconds=ttl_seconds,
+        )
         self._http_timeout_s = http_timeout_s
 
     # ---- public API ----------------------------------------------------
@@ -124,6 +156,53 @@ class RelayClient:
             ExecRequest(kind="bash", code=code, mode="subprocess", timeout_s=timeout_s),
             async_job=async_job,
         )
+
+    def upload_file(
+        self,
+        local_path: str | os.PathLike[str],
+        remote_path: str | os.PathLike[str],
+        *,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        overwrite: bool = False,
+        progress: ProgressCallback | None = None,
+    ) -> TransferResult:
+        """Upload one file to the listener, resuming a matching partial upload."""
+        return upload_over_relay(
+            self._post_json,
+            local_path,
+            remote_path,
+            chunk_size=chunk_size,
+            overwrite=overwrite,
+            progress=progress,
+        )
+
+    def download_file(
+        self,
+        remote_path: str | os.PathLike[str],
+        local_path: str | os.PathLike[str],
+        *,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        overwrite: bool = False,
+        progress: ProgressCallback | None = None,
+    ) -> TransferResult:
+        """Download one file from the listener, resuming a matching partial download."""
+        return download_over_relay(
+            self._post_json,
+            remote_path,
+            local_path,
+            chunk_size=chunk_size,
+            overwrite=overwrite,
+            progress=progress,
+        )
+
+    def run_many(
+        self,
+        commands: Iterable[CommandSpec],
+        *,
+        max_parallel: int = DEFAULT_MAX_PARALLEL,
+    ) -> BatchResult:
+        """Run commands according to their dependency graph."""
+        return run_command_batch(self, commands, max_parallel=max_parallel)
 
     def send(self, request: ExecRequest, *, async_job: bool | None = None) -> ExecResult:
         """Send an :class:`ExecRequest`, synchronously or as a background job.
@@ -229,25 +308,46 @@ class RelayClient:
         http_timeout_s: float | None = None,
         return_state: bool = False,
     ):
-        ns = fqdn(self._namespace)
-        token = create_sas_token(ns, self._path, self._keyrule, self._key)
-        url = create_http_send_url(ns, self._path, token)
-
-        r = requests.post(
-            url,
-            headers={"Content-Type": "application/json"},
-            data=request.to_json(),
-            timeout=http_timeout_s or self._http_timeout_s,
+        payload = self._post_json(
+            request.to_json(),
+            http_timeout_s=http_timeout_s,
         )
-        r.raise_for_status()
-        try:
-            payload = r.json()
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"server returned non-JSON response (status={r.status_code}): {r.text[:200]!r}"
-            ) from exc
         resp = ExecResponse.from_json(json.dumps(payload))
         result = ExecResult.from_response(resp)
         if return_state:
             return resp.state, result
         return result
+
+    def _post_json(
+        self,
+        payload: str,
+        *,
+        http_timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        token, _ = self._credential.resolve()
+        url = create_http_send_url(
+            self._credential.namespace,
+            self._credential.path,
+            token,
+        )
+        try:
+            response = requests.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                data=payload,
+                timeout=http_timeout_s or self._http_timeout_s,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            message = redact_relay_secrets(str(exc))
+            raise RuntimeError(f"relay request failed: {message}") from None
+        try:
+            decoded = response.json()
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"server returned non-JSON response (status={response.status_code}): "
+                f"{redact_relay_secrets(response.text[:200])!r}"
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise RuntimeError(f"server returned {type(decoded).__name__}, expected a JSON object")
+        return decoded

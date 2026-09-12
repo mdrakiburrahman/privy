@@ -53,6 +53,8 @@ echo ">> smoke test"
 "./$BIN" client --help >/dev/null
 "./$BIN" server --help >/dev/null
 "./$BIN" proxy --help >/dev/null
+"./$BIN" file --help >/dev/null
+"./$BIN" token --help >/dev/null
 if file "$BIN" | grep -q "statically linked"; then
   echo "   statically linked — portable across glibc versions"
 else

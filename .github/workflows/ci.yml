@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_PYTHON: "3.12"
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.13"
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --locked --group dev --group binary
+
+      - name: Check lint and formatting
+        run: |
+          uv run --locked ruff check .
+          uv run --locked ruff format --check .
+
+      - name: Run non-E2E tests
+        run: uv run --locked pytest -m "not e2e"
+
+      - name: Build wheel
+        run: uv build
+
+      - name: Build static Linux x86_64 CLI
+        run: ./scripts/build_binary.sh
+
+      - name: Verify build artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          wheels=(dist/privy-*.whl)
+          if (( ${#wheels[@]} != 1 )); then
+            echo "::error::Expected exactly one wheel in dist, found ${#wheels[@]}."
+            exit 1
+          fi
+          if [[ ! -s "${wheels[0]}" ]]; then
+            echo "::error::Wheel is missing or empty."
+            exit 1
+          fi
+          if [[ ! -x dist/privy || ! -s dist/privy ]]; then
+            echo "::error::Static CLI is missing, empty, or not executable."
+            exit 1
+          fi
+
+          binary_info="$(file dist/privy)"
+          if [[ "$binary_info" != *"ELF 64-bit"* || "$binary_info" != *"x86-64"* ]]; then
+            echo "::error::CLI is not a Linux x86_64 ELF binary."
+            exit 1
+          fi
+          if [[ "$binary_info" != *"statically linked"* ]]; then
+            echo "::error::CLI is not statically linked."
+            exit 1
+          fi
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: privy-ci-wheel-${{ github.sha }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: privy-ci-linux-x86_64-${{ github.sha }}
+          path: dist/privy
+          if-no-files-found: error
+          retention-days: 30

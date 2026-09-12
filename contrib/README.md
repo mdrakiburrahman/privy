@@ -1,5 +1,8 @@
 # Contributing
 
+For build, test, packaging, GCI, and publishing commands, see the
+[deployment guide](../docs/DEPLOYMENT.md).
+
 ## How to use, on a Windows machine by installing WSL
 
 1. Windows pre-reqs

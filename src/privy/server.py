@@ -7,7 +7,8 @@ Hybrid Connection pattern used in the reference ``relay-demo``:
   two delivery modes:
     - **inline**: the control websocket receives a request frame that already
       contains ``"method": "POST"``; the body arrives as the next frame on the
-      same control socket; the response is also sent on the control socket.
+      same control socket. Responses up to 64 KiB return on the control socket;
+      larger responses upgrade through the request's rendezvous address.
     - **rendezvous**: the control socket receives just ``{"request":
       {"address": "wss://…"}}``; we open that sub-websocket and the request
       frame + body arrive there; we also send the response there.
@@ -24,15 +25,26 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import websocket
 
-from privy._relay import create_listen_url, create_sas_token, fqdn
+from privy._relay import (
+    DEFAULT_TOKEN_TTL_SECONDS,
+    RelayCredential,
+    RelayTokenError,
+    TokenProvider,
+    create_listen_url,
+    redact_relay_secrets,
+)
 from privy.executor import execute, seed_inprocess_globals
 from privy.protocol import ExecRequest, ExecResponse
 from privy.proxy import PROXY_KIND, ProxyRequest, handle_proxy_request
+from privy.transfer import FILE_TRANSFER_KIND, handle_transfer_request
+
+CONTROL_CHANNEL_BODY_LIMIT = 64 * 1024
 
 
 def _ensure_default_logging() -> None:
@@ -62,6 +74,16 @@ def _ensure_default_logging() -> None:
 log = logging.getLogger("privy.server")
 
 _MAX_LOG_BYTES = 4000  # truncate very long output in the console dump
+
+
+def _format_lifetime(seconds: int) -> str:
+    if seconds >= 86400:
+        return f"{seconds // 86400}d"
+    if seconds >= 3600:
+        return f"{seconds // 3600}h"
+    if seconds >= 60:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
 
 
 def _short_id(request_id: Any) -> str:
@@ -153,8 +175,10 @@ class RelayServer:
         *,
         namespace: str,
         path: str,
-        keyrule: str,
-        key: str,
+        keyrule: str | None = None,
+        key: str | None = None,
+        token: TokenProvider | None = None,
+        ttl_seconds: int = DEFAULT_TOKEN_TTL_SECONDS,
         max_workers: int = 32,
         recv_timeout_s: float = 1.0,
         proxy_target: str | None = None,
@@ -163,15 +187,18 @@ class RelayServer:
         # NOTE: a long-polling ``action="poll"`` occupies a worker for the
         # duration of its wait, so the pool must comfortably exceed the number
         # of concurrent clients (e.g. dbt threads).
-        if not all([namespace, path, keyrule, key]):
-            raise ValueError("namespace, path, keyrule and key are all required")
-        self._namespace = namespace
-        self._path = path
-        self._keyrule = keyrule
-        self._key = key
+        self._credential = RelayCredential(
+            namespace=namespace,
+            path=path,
+            keyrule=keyrule,
+            key=key,
+            token=token,
+            ttl_seconds=ttl_seconds,
+        )
         self._max_workers = max_workers
         self._recv_timeout_s = recv_timeout_s
         self._proxy_target = proxy_target
+        self._token_expires_at: int | None = None
 
         if inprocess_globals:
             # Lets the host notebook expose live objects (e.g. Fabric's
@@ -208,11 +235,13 @@ class RelayServer:
                 except KeyboardInterrupt:
                     log.info("Exiting listener.")
                     return
+                except RelayTokenError:
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     log.warning(
                         "Listener error (%s: %s). Reconnecting in %ss…",
                         type(exc).__name__,
-                        exc,
+                        redact_relay_secrets(str(exc)),
                         backoff,
                     )
                     if self._stop.wait(backoff):
@@ -227,16 +256,25 @@ class RelayServer:
     # ---- internals -----------------------------------------------------
 
     def _listen_url(self) -> str:
-        ns = fqdn(self._namespace)
-        token = create_sas_token(ns, self._path, self._keyrule, self._key)
-        return create_listen_url(ns, self._path, token)
+        token, claims = self._credential.resolve()
+        self._token_expires_at = claims["se"]
+        return create_listen_url(
+            self._credential.namespace,
+            self._credential.path,
+            token,
+        )
 
     def _serve_once(self) -> None:
-        ns = fqdn(self._namespace)
         ws = websocket.create_connection(self._listen_url())
         ws.settimeout(self._recv_timeout_s)
         self._listening.set()
-        log.info("Listening on Azure Relay: wss://%s/$hc/%s", ns, self._path)
+        remaining = max(0, (self._token_expires_at or 0) - int(time.time()))
+        log.info(
+            "Listening on Azure Relay: wss://%s/$hc/%s (token valid for %s)",
+            self._credential.namespace,
+            self._credential.path,
+            _format_lifetime(remaining),
+        )
 
         try:
             while not self._stop.is_set():
@@ -296,10 +334,13 @@ class RelayServer:
             try:
                 result = self._execute(payload_raw, request_id=request_id)
                 body = result if isinstance(result, str) else result.to_json()
-                with self._send_lock:
-                    self._send_response(ws, request_id, body)
+                self._send_inline_response(ws, req_meta, request_id, body)
             except Exception as exc:  # noqa: BLE001
-                log.exception("inline request handler crashed: %s", exc)
+                log.error(
+                    "inline request handler crashed (%s: %s)",
+                    type(exc).__name__,
+                    redact_relay_secrets(str(exc)),
+                )
 
         if self._pool is None:  # pragma: no cover - defensive
             work()
@@ -314,7 +355,11 @@ class RelayServer:
         try:
             opws = websocket.create_connection(addr)
         except Exception as exc:  # noqa: BLE001
-            log.exception("failed to open rendezvous %s: %s", addr, exc)
+            log.error(
+                "failed to open rendezvous %s: %s",
+                redact_relay_secrets(addr),
+                redact_relay_secrets(str(exc)),
+            )
             return
         try:
             try:
@@ -337,6 +382,35 @@ class RelayServer:
         finally:
             try:
                 opws.close()
+            except Exception:  # pragma: no cover
+                pass
+
+    def _send_inline_response(
+        self,
+        control_ws: websocket.WebSocket,
+        req_meta: dict[str, Any],
+        request_id: Any,
+        body_json: str,
+    ) -> None:
+        if len(body_json.encode("utf-8")) <= CONTROL_CHANNEL_BODY_LIMIT:
+            with self._send_lock:
+                self._send_response(control_ws, request_id, body_json)
+            return
+
+        address = req_meta.get("address")
+        if not isinstance(address, str) or not address:
+            raise RuntimeError("large inline response is missing its rendezvous address")
+        try:
+            response_ws = websocket.create_connection(address)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"cannot open response rendezvous ({type(exc).__name__}: {redact_relay_secrets(str(exc))})"
+            ) from None
+        try:
+            self._send_response(response_ws, request_id, body_json)
+        finally:
+            try:
+                response_ws.close()
             except Exception:  # pragma: no cover
                 pass
 
@@ -376,7 +450,10 @@ class RelayServer:
         # Check if this is an HTTP proxy request
         try:
             raw_obj = json.loads(payload_raw)
-            if raw_obj.get("kind") == PROXY_KIND and self._proxy_target:
+            if isinstance(raw_obj, dict) and raw_obj.get("kind") == FILE_TRANSFER_KIND:
+                log.info("FILE %s %s", raw_obj.get("action", "unknown"), raw_obj.get("path", ""))
+                return handle_transfer_request(payload_raw).to_json()
+            if isinstance(raw_obj, dict) and raw_obj.get("kind") == PROXY_KIND and self._proxy_target:
                 proxy_req = ProxyRequest.from_json(payload_raw)
                 log.info("PROXY %s %s → %s", proxy_req.method, proxy_req.path, self._proxy_target)
                 proxy_resp = handle_proxy_request(proxy_req, self._proxy_target)
