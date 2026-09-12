@@ -42,6 +42,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -55,6 +60,9 @@ jobs:
         run: |
           uv run --locked ruff check .
           uv run --locked ruff format --check .
+
+      - name: Lint Markdown
+        run: npx --yes markdownlint-cli2@0.23.2
 
       - name: Run non-E2E tests
         run: uv run --locked pytest -m "not e2e"

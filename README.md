@@ -54,6 +54,22 @@ uv run privy client --bash 'uname -a'
 | [Deployment](docs/DEPLOYMENT.md) | Build the wheel/CLI, run GCI, publish after merge, and download artifacts. |
 | [Contributing](contrib/README.md) | Bootstrap the development environment. |
 
+## Development checks
+
+Lint every Markdown file in the repository with the shared configuration:
+
+```bash
+npx --yes markdownlint-cli2@0.23.2
+```
+
+The development [bootstrapper](contrib/bootstrap-dev-env.sh) installs Node.js,
+npm, and npx when needed. CI and GCI provision Node.js explicitly and run the
+same pinned command. Add `--fix` to apply safe automatic fixes:
+
+```bash
+npx --yes markdownlint-cli2@0.23.2 --fix
+```
+
 ## Download the standalone CLI
 
 ```bash
