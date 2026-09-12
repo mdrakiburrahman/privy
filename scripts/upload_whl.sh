@@ -11,7 +11,9 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-VERSION=$(python3 -c "import re; print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', open('src/privy/__init__.py').read())[1])")
+source scripts/lib/release.sh
+
+VERSION="$(privy_version)"
 WHL_NAME="privy-${VERSION}-py3-none-any.whl"
 
 ACCOUNT_NAME="${PRIVY_STORAGE_ACCOUNT:-rakirahman}"

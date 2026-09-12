@@ -3,19 +3,13 @@
 ## Development checks
 
 ```bash
-uv sync
-uv run ruff check .
-uv run ruff format --check .
-uv run pytest -m 'not e2e'
+./scripts/check_ci.sh
 ```
 
-Real Relay tests use `.env`:
+Real Relay tests load the local `.env`:
 
 ```bash
-set -a
-source .env
-set +a
-uv run pytest -m e2e
+./scripts/run_gci.sh
 ```
 
 The E2E suite starts a local listener, communicates through the configured real Hybrid Connection,
@@ -23,16 +17,8 @@ and covers execution, long jobs, tokens, file transfer, dependency graphs, and t
 
 ## Build artifacts
 
-Wheel:
-
 ```bash
-uv build
-```
-
-Standalone static Linux x86_64 CLI:
-
-```bash
-./scripts/build_binary.sh
+./scripts/build_release.sh
 ```
 
 Outputs:
@@ -100,31 +86,19 @@ The repository is public. Secret-backed GCI intentionally accepts only branches 
 and fails fork PRs. Restrict repository write access to trusted contributors because same-repository
 PR workflows can execute code with the relay E2E secret.
 
-## Pull request CI
-
-`.github/workflows/ci.yml` is the non-secret PR check. It runs Ruff lint and format checks, the
-non-E2E unit suite, both artifact builds, artifact verification, and Actions artifact upload. It
-never receives `BASE64_ENV`.
-
-The workflow runs automatically for PRs targeting `main` and can be dispatched manually.
-
 ## Gated CI
 
-For a PR targeting `main`, GCI:
+`.github/workflows/gci.yml` runs two required jobs for PRs targeting `main`:
 
-1. Rejects fork-based PRs.
-2. Installs the locked Python/uv environment on `ubuntu-latest`.
-3. Runs Ruff lint and format checks.
-4. Runs non-E2E unit tests.
-5. Decodes the relay-only `gci` environment's `BASE64_ENV` without printing it and runs required
-   real Relay E2E tests.
-6. Builds the wheel and static CLI.
-7. Uploads both to the Actions run as review artifacts.
+1. `ci` runs `scripts/check_ci.sh`, builds both release artifacts with `scripts/build_release.sh`,
+   verifies them, and uploads them for review. It receives no secrets.
+2. `gci` waits for `ci`, rejects fork-based PRs, and runs `scripts/run_gci.sh` with the relay-only
+   `gci` environment's `BASE64_ENV`.
 
 PR builds never upload to Azure Storage.
 
-GCI runs are serialized because they share one Relay Hybrid Connection; concurrent listeners on that
-path would load-balance requests across different revisions.
+Only the Relay-backed `gci` jobs are serialized because they share one Hybrid Connection. Non-secret
+`ci` jobs remain parallel across PRs.
 
 `main` is configured to require up-to-date CI and GCI results plus a pull request. No approving
 review is required, and repository admins may bypass the rule.
@@ -133,14 +107,19 @@ review is required, and repository admins may bypass the rule.
 
 `.github/workflows/publish.yml` runs for every push to `main`. It:
 
-1. Decodes the `main`-restricted `production` environment's `BASE64_ENV`.
-2. Builds the wheel and CLI.
-3. Calls `scripts/upload_whl.sh`.
+1. Builds and verifies the wheel and CLI with `scripts/build_release.sh`.
+2. Runs `scripts/publish_release.sh` with the `main`-restricted `production` environment's
+   `BASE64_ENV`.
 
 It does not rerun Ruff, pytest, or E2E after merge. GCI is the test gate.
 
 Publishing has no arbitrary-ref manual dispatch. Production storage credentials are available only
 to the workflow triggered from `main`.
+
+Every workflow `run` step invokes a checked-in script. The same scripts run locally, and environment
+wrappers accept `.env` locally or decoded `BASE64_ENV` in Actions. Use `--check` with
+`scripts/run_gci.sh` or `scripts/publish_release.sh` to validate configuration without executing E2E
+tests or uploading artifacts.
 
 Default upload destinations:
 

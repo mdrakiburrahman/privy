@@ -19,6 +19,7 @@ command -v pip &>/dev/null || PACKAGES="$PACKAGES python3-pip"
 command -v curl &>/dev/null || PACKAGES="$PACKAGES curl"
 command -v gh &>/dev/null || PACKAGES="$PACKAGES gh"
 command -v jq &>/dev/null || PACKAGES="$PACKAGES jq"
+command -v file &>/dev/null || PACKAGES="$PACKAGES file"
 
 [ -n "$PACKAGES" ] && sudo apt-get update -qq && sudo apt-get install -yqq $PACKAGES
 

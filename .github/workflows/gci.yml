@@ -9,29 +9,18 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  # All runs share one Hybrid Connection, whose listeners would otherwise
-  # load-balance requests between different revisions.
-  group: privy-gci-relay
-  queue: max
-
 env:
   UV_PYTHON: "3.12"
 
 jobs:
-  gci:
+  ci:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    environment: gci
+    timeout-minutes: 60
+    concurrency:
+      group: ci-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
 
     steps:
-      - name: Reject fork pull requests
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-        shell: bash
-        run: |
-          echo "::error::GCI requires repository secrets and only runs for pull-request branches in ${GITHUB_REPOSITORY}. Fork pull requests are not eligible."
-          exit 1
-
       - name: Check out repository
         uses: actions/checkout@v4
         with:
@@ -53,137 +42,11 @@ jobs:
           version: "0.12.13"
           enable-cache: true
 
-      - name: Install locked dependencies
-        run: uv sync --locked --group dev --group binary
+      - name: Check source
+        run: ./scripts/check_ci.sh
 
-      - name: Check lint and formatting
-        run: |
-          uv run --locked ruff check .
-          uv run --locked ruff format --check .
-
-      - name: Lint Markdown
-        run: ./scripts/check_markdown.sh
-
-      - name: Run non-E2E tests
-        run: uv run --locked pytest -m "not e2e"
-
-      - name: Load required E2E environment
-        env:
-          BASE64_ENV: ${{ secrets.BASE64_ENV }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ -z "${BASE64_ENV:-}" ]]; then
-            echo "::error::The gci environment's BASE64_ENV secret is missing or empty."
-            exit 1
-          fi
-
-          readonly env_file="${GITHUB_WORKSPACE}/.env"
-          readonly github_env_file="${GITHUB_ENV}"
-          trap 'rm -f -- "$env_file"' EXIT
-          umask 077
-
-          if ! printf '%s' "$BASE64_ENV" | base64 --decode > "$env_file"; then
-            echo "::error::BASE64_ENV is not valid base64."
-            exit 1
-          fi
-          unset BASE64_ENV
-          chmod 600 "$env_file"
-
-          set -a
-          if ! source "$env_file" >/dev/null 2>&1; then
-            set +x
-            set +a
-            echo "::error::Decoded BASE64_ENV could not be loaded."
-            exit 1
-          fi
-          set +x
-          set +a
-          set -euo pipefail
-
-          required=(
-            PRIVY_RELAY_NAMESPACE
-            PRIVY_RELAY_PATH
-            PRIVY_RELAY_KEYRULE
-            PRIVY_RELAY_KEY
-          )
-
-          for name in "${required[@]}"; do
-            if [[ ! -v "$name" ]]; then
-              echo "::error::${name} is missing from BASE64_ENV."
-              exit 1
-            fi
-
-            value="${!name}"
-            if [[ -z "$value" ]]; then
-              echo "::error::${name} is empty in BASE64_ENV."
-              exit 1
-            fi
-            if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
-              echo "::error::${name} must be a single-line value."
-              exit 1
-            fi
-
-            printf '::add-mask::%s\n' "$value"
-            printf '%s=%s\n' "$name" "$value" >> "$github_env_file"
-          done
-
-      - name: Run required E2E tests
-        env:
-          PRIVY_REQUIRE_E2E: "1"
-        run: uv run --locked pytest -m e2e
-
-      - name: Clear E2E credentials
-        if: ${{ always() }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -f -- "${GITHUB_WORKSPACE}/.env"
-          for name in \
-            PRIVY_RELAY_NAMESPACE \
-            PRIVY_RELAY_PATH \
-            PRIVY_RELAY_KEYRULE \
-            PRIVY_RELAY_KEY
-          do
-            printf '%s=\n' "$name" >> "$GITHUB_ENV"
-          done
-
-      - name: Build wheel
-        run: uv build
-
-      - name: Build static Linux x86_64 CLI
-        run: ./scripts/build_binary.sh
-
-      - name: Verify build artifacts
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-
-          wheels=(dist/privy-*.whl)
-          if (( ${#wheels[@]} != 1 )); then
-            echo "::error::Expected exactly one wheel in dist, found ${#wheels[@]}."
-            exit 1
-          fi
-          if [[ ! -s "${wheels[0]}" ]]; then
-            echo "::error::Wheel is missing or empty."
-            exit 1
-          fi
-          if [[ ! -x dist/privy || ! -s dist/privy ]]; then
-            echo "::error::Static CLI is missing, empty, or not executable."
-            exit 1
-          fi
-
-          binary_info="$(file dist/privy)"
-          if [[ "$binary_info" != *"ELF 64-bit"* || "$binary_info" != *"x86-64"* ]]; then
-            echo "::error::CLI is not a Linux x86_64 ELF binary."
-            exit 1
-          fi
-          if [[ "$binary_info" != *"statically linked"* ]]; then
-            echo "::error::CLI is not statically linked."
-            exit 1
-          fi
+      - name: Build release artifacts
+        run: ./scripts/build_release.sh
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
@@ -200,3 +63,38 @@ jobs:
           path: dist/privy
           if-no-files-found: error
           retention-days: 30
+
+  gci:
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: gci
+    concurrency:
+      group: privy-gci-relay
+      queue: max
+
+    steps:
+      - name: Check out trusted revision
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && github.event.pull_request.base.sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.13"
+          enable-cache: true
+
+      - name: Run required Relay E2E tests
+        env:
+          BASE64_ENV: ${{ secrets.BASE64_ENV }}
+          GCI_EVENT_NAME: ${{ github.event_name }}
+          GCI_REPOSITORY: ${{ github.repository }}
+          GCI_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: ./scripts/run_gci.sh

@@ -27,7 +27,7 @@ if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
 fi
 
 echo ">> syncing binary build dependencies"
-uv sync --group binary
+uv sync --locked --group binary
 
 echo ">> building $BIN"
 uv run --group binary pyinstaller --clean --noconfirm privy.spec
