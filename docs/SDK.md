@@ -36,10 +36,11 @@ client = RelayClient(
 )
 ```
 
-## Execute Python or Bash
+## Execute Python, Bash, or PowerShell
 
 ```python
 bash = client.run_bash("uname -a", timeout_s=30)
+powershell = client.run_powershell("Get-ComputerInfo", timeout_s=30)
 python = client.run_python(
     "print(spark.version)",
     mode="inprocess",
@@ -85,7 +86,7 @@ from privy import CommandSpec
 batch = client.run_many(
     [
         CommandSpec(id="one", kind="bash", code="./one.sh"),
-        CommandSpec(id="two", kind="bash", code="./two.sh"),
+        CommandSpec(id="two", kind="powershell", code=".\\two.ps1"),
         CommandSpec(
             id="three",
             kind="python",

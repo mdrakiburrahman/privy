@@ -1,7 +1,7 @@
 [project]
 name = "privy"
 dynamic = ["version"]
-description = "Livy-style remote Python/bash execution over Azure Relay Hybrid Connections."
+description = "Livy-style remote Python, Bash, and PowerShell execution over Azure Relay."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
@@ -29,7 +29,7 @@ dev = [
 ]
 binary = [
     "pyinstaller>=6",
-    "staticx>=0.14",
+    "staticx>=0.14; sys_platform == 'linux'",
 ]
 
 [build-system]

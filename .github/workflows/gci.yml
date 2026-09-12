@@ -64,14 +64,47 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  gci:
+  windows-ci:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.13"
+          enable-cache: true
+
+      - name: Check source and build Windows CLI
+        shell: pwsh
+        run: .\scripts\check_windows.ps1
+
+      - name: Upload Windows CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: privy-windows-x86_64-${{ github.sha }}
+          path: dist/privy.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  gci-linux:
     needs: ci
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: gci
     concurrency:
       group: privy-gci-relay
-      queue: max
 
     steps:
       - name: Check out trusted revision
@@ -98,3 +131,53 @@ jobs:
           GCI_REPOSITORY: ${{ github.repository }}
           GCI_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: ./scripts/run_gci.sh
+
+  gci-windows:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    needs:
+      - windows-ci
+      - gci-linux
+    runs-on: windows-latest
+    timeout-minutes: 15
+    environment: gci
+    concurrency:
+      group: privy-gci-relay
+
+    steps:
+      - name: Check out trusted revision
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && github.event.pull_request.base.sha || github.sha }}
+
+      - name: Download Windows CLI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: privy-windows-x86_64-${{ github.sha }}
+          path: dist
+
+      - name: Run required Windows binary Relay test
+        shell: pwsh
+        env:
+          BASE64_ENV: ${{ secrets.BASE64_ENV }}
+        run: .\scripts\test_windows_binary_relay.ps1
+
+  gci:
+    if: ${{ always() }}
+    needs:
+      - gci-linux
+      - gci-windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify platform GCI results
+        env:
+          LINUX_GCI_RESULT: ${{ needs.gci-linux.result }}
+          WINDOWS_GCI_RESULT: ${{ needs.gci-windows.result }}
+        run: ./scripts/check_gci_results.sh

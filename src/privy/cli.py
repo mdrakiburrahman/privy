@@ -359,10 +359,19 @@ def _read_text(path: str, *, purpose: str) -> str:
 def _read_code(args: argparse.Namespace) -> tuple[str, str]:
     if args.bash is not None:
         return "bash", args.bash
+    if args.powershell is not None:
+        return "powershell", args.powershell
     if args.python is not None:
         return "python", args.python
-    kind = "bash" if args.file_kind == "bash" else "python"
-    return kind, _read_text(args.file, purpose="code file")
+    return args.file_kind, _read_text(args.file, purpose="code file")
+
+
+def _write_bytes(stream: Any, data: bytes) -> None:
+    buffer = getattr(stream, "buffer", None)
+    if buffer is not None:
+        buffer.write(data)
+    else:
+        stream.write(data.decode("utf-8", "replace"))
 
 
 def _emit(result: ExecResult, as_json: bool) -> int:
@@ -381,12 +390,12 @@ def _emit(result: ExecResult, as_json: bool) -> int:
         )
         sys.stdout.write("\n")
     else:
-        if result.stdout:
-            sys.stdout.write(result.stdout)
-        if result.stderr:
-            sys.stderr.write(result.stderr)
+        if result.stdout_bytes:
+            _write_bytes(sys.stdout, result.stdout_bytes)
+        if result.stderr_bytes:
+            _write_bytes(sys.stderr, result.stderr_bytes)
         if result.error:
-            sys.stderr.write(f"privy: {result.error}\n")
+            _write_bytes(sys.stderr, f"privy: {result.error}\n".encode())
     sys.stdout.flush()
     sys.stderr.flush()
     if result.timed_out:
@@ -403,17 +412,21 @@ def _emit_batch(result: BatchResult, as_json: bool) -> int:
             details = ""
             if outcome.result is not None:
                 details = f" exit={outcome.result.exit_code} duration={outcome.result.duration_ms}ms"
-            sys.stdout.write(f"[{outcome.state.upper()}] {outcome.id}{details}\n")
-            if outcome.result is not None and outcome.result.stdout:
-                sys.stdout.write(outcome.result.stdout)
-                if not outcome.result.stdout.endswith("\n"):
-                    sys.stdout.write("\n")
-            if outcome.result is not None and outcome.result.stderr:
-                sys.stderr.write(f"[{outcome.id} stderr]\n{outcome.result.stderr}")
-                if not outcome.result.stderr.endswith("\n"):
-                    sys.stderr.write("\n")
+            _write_bytes(
+                sys.stdout,
+                f"[{outcome.state.upper()}] {outcome.id}{details}\n".encode(),
+            )
+            if outcome.result is not None and outcome.result.stdout_bytes:
+                _write_bytes(sys.stdout, outcome.result.stdout_bytes)
+                if not outcome.result.stdout_bytes.endswith(b"\n"):
+                    _write_bytes(sys.stdout, b"\n")
+            if outcome.result is not None and outcome.result.stderr_bytes:
+                _write_bytes(sys.stderr, f"[{outcome.id} stderr]\n".encode())
+                _write_bytes(sys.stderr, outcome.result.stderr_bytes)
+                if not outcome.result.stderr_bytes.endswith(b"\n"):
+                    _write_bytes(sys.stderr, b"\n")
             if outcome.error and (outcome.result is None or outcome.error != outcome.result.error):
-                sys.stderr.write(f"[{outcome.id}] {outcome.error}\n")
+                _write_bytes(sys.stderr, f"[{outcome.id}] {outcome.error}\n".encode())
     sys.stdout.flush()
     sys.stderr.flush()
     return result.exit_code
@@ -449,9 +462,12 @@ def _progress_reporter(label: str):
 def build_parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(
         prog="privy",
-        description="Remote Python/bash execution, file transfer, and HTTP proxying over Azure Relay.",
+        description=(
+            "Remote Python, Bash, and PowerShell execution, file transfer, "
+            "and HTTP proxying over Azure Relay."
+        ),
         epilog=f"""Execution behavior:
-  --timeout-s applies to both Python and Bash. Requests with a timeout above
+  --timeout-s applies to Python, Bash, and PowerShell. Requests with a timeout above
   {RELAY_RESPONSE_LIMIT_S:g}s automatically use submit + long-poll so they can outlive Azure
   Relay's response deadline; the CLI still waits for and emits the final result.
   --async-job forces that path and --no-async-job disables it. The Python SDK
@@ -466,6 +482,7 @@ Credential behavior:
 Examples:
   privy server --token "$PRIVY_RELAY_TOKEN"
   privy client --bash "uname -a" --timeout-s 30
+  privy client --powershell "Get-ComputerInfo" --timeout-s 30
   privy client --batch commands.json --json
   privy file upload ./model.pkl /tmp/model.pkl --overwrite
   privy token mint --rights send --ttl 30m
@@ -526,6 +543,7 @@ each command's mode/timeout and may set max_parallel (default: 32).""",
     "max_parallel": 32,
     "commands": [
       {"id": "extract", "kind": "bash", "code": "./extract.sh"},
+      {"id": "inspect", "kind": "powershell", "code": "Get-ComputerInfo"},
       {"id": "load", "kind": "python", "code": "load()", "mode": "inprocess",
        "timeout_s": 1200, "depends_on": ["extract"]}
     ]
@@ -535,12 +553,13 @@ each command's mode/timeout and may set max_parallel (default: 32).""",
     _add_relay_args(client)
     code = client.add_mutually_exclusive_group(required=True)
     code.add_argument("--bash", metavar="CODE", help="Bash code to execute remotely")
+    code.add_argument("--powershell", metavar="CODE", help="PowerShell code to execute remotely")
     code.add_argument("--python", metavar="CODE", help="Python code to execute remotely")
     code.add_argument("--file", metavar="PATH", help="read code from PATH ('-' for stdin)")
     code.add_argument("--batch", metavar="PATH", help="read a JSON command DAG from PATH ('-' for stdin)")
     client.add_argument(
         "--file-kind",
-        choices=("python", "bash"),
+        choices=("python", "bash", "powershell"),
         default="python",
         help="how to interpret --file",
     )
@@ -555,7 +574,7 @@ each command's mode/timeout and may set max_parallel (default: 32).""",
         type=_positive_float,
         default=DEFAULT_TIMEOUT_S,
         help=(
-            "remote execution timeout for --bash/--python/--file; values above "
+            "remote execution timeout for --bash/--powershell/--python/--file; values above "
             f"{RELAY_RESPONSE_LIMIT_S:g}s automatically use submit + long-poll"
         ),
     )
@@ -723,6 +742,8 @@ def _cmd_client(args: argparse.Namespace) -> int:
         raise CliError("--mode inprocess is only valid for Python code")
     if kind == "bash":
         result = client.run_bash(code, timeout_s=args.timeout_s, async_job=args.async_job)
+    elif kind == "powershell":
+        result = client.run_powershell(code, timeout_s=args.timeout_s, async_job=args.async_job)
     else:
         result = client.run_python(
             code,

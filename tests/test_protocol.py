@@ -1,3 +1,7 @@
+import json
+
+import pytest
+
 from privy.protocol import (
     MAX_POLL_WAIT_S,
     ExecRequest,
@@ -18,14 +22,20 @@ def test_exec_request_roundtrip():
     assert parsed == req
 
 
-def test_exec_request_rejects_inprocess_bash():
-    bad = '{"kind":"bash","code":"echo","mode":"inprocess"}'
+def test_exec_request_roundtrips_powershell():
+    req = ExecRequest(kind="powershell", code="Write-Output 1", timeout_s=10)
+    assert ExecRequest.from_json(req.to_json()) == req
+
+
+@pytest.mark.parametrize("kind", ["bash", "powershell"])
+def test_exec_request_rejects_inprocess_shells(kind):
+    bad = json.dumps({"kind": kind, "code": "echo", "mode": "inprocess"})
     try:
         ExecRequest.from_json(bad)
     except ValueError:
         pass
     else:  # pragma: no cover
-        raise AssertionError("should have rejected inprocess bash")
+        raise AssertionError(f"should have rejected inprocess {kind}")
 
 
 def test_exec_response_from_output_decodes():

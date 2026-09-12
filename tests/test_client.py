@@ -32,6 +32,7 @@ def _token() -> str:
 def test_client_resolves_token_provider_for_every_request(monkeypatch):
     monkeypatch.setattr(_relay.time, "time", lambda: 1_800_000_000)
     calls = 0
+    kinds = []
     urls = []
 
     def provider():
@@ -41,6 +42,7 @@ def test_client_resolves_token_provider_for_every_request(monkeypatch):
 
     def post(url, **kwargs):
         urls.append(url)
+        kinds.append(json.loads(kwargs["data"])["kind"])
         response = ExecResponse.from_output(
             exit_code=0,
             stdout=b"ok\n",
@@ -54,9 +56,11 @@ def test_client_resolves_token_provider_for_every_request(monkeypatch):
 
     assert client.run_bash("true", timeout_s=1).ok
     assert client.run_python("print(1)", timeout_s=1).ok
+    assert client.run_powershell("Write-Output 1", timeout_s=1).ok
 
-    assert calls == 2
+    assert calls == 3
     assert all("sb-hc-token=" in url for url in urls)
+    assert kinds == ["bash", "python", "powershell"]
 
 
 def test_client_redacts_token_from_transport_errors(monkeypatch):

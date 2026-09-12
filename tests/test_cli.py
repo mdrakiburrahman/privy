@@ -1,3 +1,4 @@
+import io
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ from privy.cli import (
     TOKEN_EXPIRED_EXIT_CODE,
     CliError,
     _configure_logging,
+    _emit,
     _guard_packaged_server,
     _reexec_server,
     _RelayRedactionFilter,
@@ -37,6 +39,25 @@ def _result(**overrides):
     return ExecResult(**values)
 
 
+def test_emit_writes_remote_bytes_without_windows_text_translation(monkeypatch):
+    stdout_bytes = io.BytesIO()
+    stderr_bytes = io.BytesIO()
+    stdout = io.TextIOWrapper(stdout_bytes, encoding="ascii", newline="\r\n")
+    stderr = io.TextIOWrapper(stderr_bytes, encoding="ascii", newline="\r\n")
+    monkeypatch.setattr("sys.stdout", stdout)
+    monkeypatch.setattr("sys.stderr", stderr)
+    result = _result(
+        stdout="café 世界\r\n",
+        stderr="échec\r\n",
+        stdout_bytes="café 世界\r\n".encode(),
+        stderr_bytes="échec\r\n".encode(),
+    )
+
+    assert _emit(result, as_json=False) == 0
+    assert stdout_bytes.getvalue() == "café 世界\r\n".encode()
+    assert stderr_bytes.getvalue() == "échec\r\n".encode()
+
+
 class FakeClient:
     instances = []
 
@@ -52,6 +73,10 @@ class FakeClient:
     def run_python(self, code, **kwargs):
         self.calls.append(("python", code, kwargs))
         return _result(stdout="python\n", stdout_bytes=b"python\n")
+
+    def run_powershell(self, code, **kwargs):
+        self.calls.append(("powershell", code, kwargs))
+        return _result(stdout="powershell\n", stdout_bytes=b"powershell\n")
 
     def run_many(self, commands, *, max_parallel):
         self.calls.append(("batch", tuple(commands), {"max_parallel": max_parallel}))
@@ -101,6 +126,7 @@ def test_top_level_help_recursively_exposes_every_command():
         "--timeout-s",
         "--async-job",
         "--batch",
+        "--powershell",
         "--chunk-size",
         "--token",
         "--ttl-seconds",
@@ -111,8 +137,11 @@ def test_top_level_help_recursively_exposes_every_command():
     assert "RelayClient.submit(), poll(), and cancel()" in help_text
 
 
-@pytest.mark.parametrize(("flag", "method"), [("--bash", "bash"), ("--python", "python")])
-def test_cli_passes_timeout_to_bash_and_python(monkeypatch, capsys, relay_args, flag, method):
+@pytest.mark.parametrize(
+    ("flag", "method"),
+    [("--bash", "bash"), ("--python", "python"), ("--powershell", "powershell")],
+)
+def test_cli_passes_timeout_to_execution_target(monkeypatch, capsys, relay_args, flag, method):
     FakeClient.instances.clear()
     monkeypatch.setattr("privy.cli.RelayClient", FakeClient)
 
@@ -122,6 +151,31 @@ def test_cli_passes_timeout_to_bash_and_python(monkeypatch, capsys, relay_args, 
     assert call[0] == method
     assert call[2]["timeout_s"] == 42
     assert call[2]["async_job"] is None
+    capsys.readouterr()
+
+
+def test_cli_dispatches_powershell_file(monkeypatch, tmp_path, capsys, relay_args):
+    FakeClient.instances.clear()
+    monkeypatch.setattr("privy.cli.RelayClient", FakeClient)
+    script = tmp_path / "script.ps1"
+    script.write_text("Write-Output 42", encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "client",
+                *relay_args,
+                "--file",
+                str(script),
+                "--file-kind",
+                "powershell",
+                "--timeout-s",
+                "1",
+            ]
+        )
+        == 0
+    )
+    assert FakeClient.instances[-1].calls[-1][:2] == ("powershell", "Write-Output 42")
     capsys.readouterr()
 
 
@@ -339,6 +393,8 @@ def test_packaged_server_reexec_enters_private_proc_namespace(monkeypatch):
         verbose_sub=0,
     )
     monkeypatch.setattr("privy.cli.sys.frozen", True, raising=False)
+    monkeypatch.setattr("privy.cli.sys.platform", "linux")
+    monkeypatch.setattr("privy.cli.os.geteuid", lambda: 1000, raising=False)
     monkeypatch.setattr("privy.cli.shutil.which", lambda command: "/usr/bin/unshare")
 
     def fake_execve(executable, argv, environment):
@@ -376,7 +432,8 @@ def test_packaged_server_refuses_root(monkeypatch):
         verbose_sub=0,
     )
     monkeypatch.setattr("privy.cli.sys.frozen", True, raising=False)
-    monkeypatch.setattr("privy.cli.os.geteuid", lambda: 0)
+    monkeypatch.setattr("privy.cli.sys.platform", "linux")
+    monkeypatch.setattr("privy.cli.os.geteuid", lambda: 0, raising=False)
 
     with pytest.raises(CliError, match="refuses to run as root"):
         _guard_packaged_server(args)
@@ -396,7 +453,8 @@ def test_packaged_server_refuses_root(monkeypatch):
 
 def test_packaged_server_rejects_direct_credential_descriptor(monkeypatch):
     monkeypatch.setattr("privy.cli.sys.frozen", True, raising=False)
-    monkeypatch.setattr("privy.cli.os.geteuid", lambda: 1000)
+    monkeypatch.setattr("privy.cli.sys.platform", "linux")
+    monkeypatch.setattr("privy.cli.os.geteuid", lambda: 1000, raising=False)
     monkeypatch.setattr("privy.cli.os.getpid", lambda: 123)
 
     with pytest.raises(CliError, match="requires private PID isolation"):

@@ -157,6 +157,18 @@ class RelayClient:
             async_job=async_job,
         )
 
+    def run_powershell(
+        self,
+        code: str,
+        *,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
+        async_job: bool | None = None,
+    ) -> ExecResult:
+        return self.send(
+            ExecRequest(kind="powershell", code=code, mode="subprocess", timeout_s=timeout_s),
+            async_job=async_job,
+        )
+
     def upload_file(
         self,
         local_path: str | os.PathLike[str],

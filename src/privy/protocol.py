@@ -11,7 +11,7 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
-Kind = Literal["python", "bash"]
+Kind = Literal["python", "bash", "powershell"]
 Mode = Literal["subprocess", "inprocess"]
 Action = Literal["exec", "submit", "poll", "cancel"]
 JobState = Literal["running", "done", "cancelled", "missing"]
@@ -70,7 +70,7 @@ class ExecRequest:
         if action not in ("exec", "submit", "poll", "cancel"):
             raise ValueError(f"invalid action: {action!r}")
         kind = obj.get("kind")
-        if kind not in ("python", "bash"):
+        if kind not in ("python", "bash", "powershell"):
             raise ValueError(f"invalid kind: {kind!r}")
         mode = obj.get("mode", "subprocess")
         if mode not in ("subprocess", "inprocess"):

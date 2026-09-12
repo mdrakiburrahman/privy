@@ -305,7 +305,7 @@ dev = [
 [package.dev-dependencies]
 binary = [
     { name = "pyinstaller" },
-    { name = "staticx" },
+    { name = "staticx", marker = "sys_platform == 'linux'" },
 ]
 dev = [
     { name = "build" },
@@ -327,7 +327,7 @@ provides-extras = ["dev"]
 [package.metadata.requires-dev]
 binary = [
     { name = "pyinstaller", specifier = ">=6" },
-    { name = "staticx", specifier = ">=0.14" },
+    { name = "staticx", marker = "sys_platform == 'linux'", specifier = ">=0.14" },
 ]
 dev = [
     { name = "build", specifier = ">=1.2" },

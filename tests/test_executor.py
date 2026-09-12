@@ -1,14 +1,28 @@
+import ctypes
+import os
+import shutil
 import time
 
-from privy.executor import _child_env, cancel_job, execute, poll_job
+import pytest
+
+from privy.executor import (
+    _JOBS,
+    _JOBS_LOCK,
+    _child_env,
+    _InprocessRun,
+    _Job,
+    cancel_job,
+    execute,
+    poll_job,
+)
 from privy.protocol import ExecRequest
 
 
 def test_python_subprocess_ok():
     r = execute(ExecRequest(kind="python", code="print('hello'); import sys; sys.stderr.write('err\\n')"))
     assert r.exit_code == 0
-    assert r.stdout == b"hello\n"
-    assert r.stderr == b"err\n"
+    assert r.stdout == f"hello{os.linesep}".encode()
+    assert r.stderr == f"err{os.linesep}".encode()
     assert not r.timed_out
 
 
@@ -36,6 +50,126 @@ def test_bash_subprocess_nonzero_exit_preserves_stdout():
     assert r.stdout == b"hi\n"
 
 
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None and shutil.which("powershell") is None,
+    reason="PowerShell is not installed",
+)
+def test_powershell_subprocess_ok():
+    r = execute(
+        ExecRequest(
+            kind="powershell",
+            code="Write-Output 'hello'; [Console]::Error.WriteLine('err')",
+        )
+    )
+    assert r.exit_code == 0
+    assert r.stdout == f"hello{os.linesep}".encode()
+    assert r.stderr == f"err{os.linesep}".encode()
+
+
+@pytest.mark.skipif(
+    shutil.which("powershell.exe") is None,
+    reason="Windows PowerShell is not installed",
+)
+def test_windows_powershell_preserves_unicode_code_and_output(monkeypatch):
+    monkeypatch.setattr(
+        "privy.executor._powershell_executable",
+        lambda: shutil.which("powershell.exe"),
+    )
+
+    r = execute(ExecRequest(kind="powershell", code="Write-Output 'café 世界'"))
+
+    assert r.exit_code == 0
+    assert r.stdout == f"café 世界{os.linesep}".encode()
+
+
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None and shutil.which("powershell") is None,
+    reason="PowerShell is not installed",
+)
+def test_powershell_propagates_native_command_exit_code():
+    code = "& (Get-Process -Id $PID).Path -NoLogo -NoProfile -NonInteractive -Command 'exit 7'"
+
+    r = execute(ExecRequest(kind="powershell", code=code))
+
+    assert r.exit_code == 7
+
+
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None and shutil.which("powershell") is None,
+    reason="PowerShell is not installed",
+)
+def test_powershell_reports_nonterminating_cmdlet_error():
+    r = execute(
+        ExecRequest(
+            kind="powershell",
+            code="Get-Item '__definitely_missing_privy_path__'",
+        )
+    )
+
+    assert r.exit_code == 1
+    assert r.stderr
+
+
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None and shutil.which("powershell") is None,
+    reason="PowerShell is not installed",
+)
+def test_powershell_subprocess_accepts_code_over_windows_command_line_limit():
+    code = "Write-Output 'ok'\n# " + ("x" * 40_000)
+
+    r = execute(ExecRequest(kind="powershell", code=code))
+
+    assert r.exit_code == 0
+    assert r.stdout == f"ok{os.linesep}".encode()
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or (shutil.which("pwsh") is None and shutil.which("powershell") is None),
+    reason="requires PowerShell on Windows",
+)
+def test_powershell_timeout_terminates_descendant_process():
+    code = """
+$executable = (Get-Process -Id $PID).Path
+$child = Start-Process -FilePath $executable `
+    -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' `
+    -PassThru
+Write-Output $child.Id
+Start-Sleep -Seconds 30
+"""
+
+    r = execute(ExecRequest(kind="powershell", code=code, timeout_s=2))
+
+    assert r.timed_out
+    child_pid = int(r.stdout.strip())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and _windows_process_is_running(child_pid):
+        time.sleep(0.1)
+    assert not _windows_process_is_running(child_pid)
+
+
+def test_powershell_subprocess_reports_missing_shell(monkeypatch):
+    monkeypatch.setattr("privy.executor.shutil.which", lambda command: None)
+
+    r = execute(ExecRequest(kind="powershell", code="Write-Output 'hello'"))
+
+    assert r.exit_code == 127
+    assert r.error == "not_found"
+    assert b"PowerShell" in r.stderr
+
+
+def _windows_process_is_running(process_id):
+    process = ctypes.windll.kernel32.OpenProcess(0x1000, False, process_id)
+    if not process:
+        return False
+    try:
+        exit_code = ctypes.c_ulong()
+        if not ctypes.windll.kernel32.GetExitCodeProcess(process, ctypes.byref(exit_code)):
+            raise ctypes.WinError()
+        return exit_code.value == 259
+    finally:
+        ctypes.windll.kernel32.CloseHandle(process)
+
+
 def test_python_subprocess_timeout():
     r = execute(ExecRequest(kind="python", code="import time; time.sleep(5)", timeout_s=0.5))
     assert r.timed_out is True
@@ -45,7 +179,7 @@ def test_python_subprocess_timeout():
 def test_inprocess_python_ok():
     r = execute(ExecRequest(kind="python", code="print('via-exec')", mode="inprocess"))
     assert r.exit_code == 0
-    assert r.stdout == b"via-exec\n"
+    assert r.stdout == f"via-exec{os.linesep}".encode()
 
 
 def test_inprocess_python_exception():
@@ -58,7 +192,7 @@ def test_inprocess_python_shares_globals_across_calls():
     execute(ExecRequest(kind="python", code="PRIVY_SHARED = 42", mode="inprocess"))
     r = execute(ExecRequest(kind="python", code="print(PRIVY_SHARED)", mode="inprocess"))
     assert r.exit_code == 0
-    assert r.stdout == b"42\n"
+    assert r.stdout == f"42{os.linesep}".encode()
 
 
 def test_inprocess_rejects_bash():
@@ -119,7 +253,7 @@ def test_submit_returns_job_id_immediately():
     final = _drain(resp.job_id)
     assert final.state == "done"
     assert final.exit_code == 0
-    assert final.stdout == b"late\n"
+    assert final.stdout == f"late{os.linesep}".encode()
 
 
 def test_poll_long_polls_until_done():
@@ -129,7 +263,7 @@ def test_poll_long_polls_until_done():
     # A single generous poll should return the finished result, not "running".
     final = poll_job(resp.job_id or "", wait_s=10.0)
     assert final.state == "done"
-    assert final.stdout == b"ok\n"
+    assert final.stdout == f"ok{os.linesep}".encode()
 
 
 def test_poll_returns_running_before_completion():
@@ -151,7 +285,7 @@ def test_inprocess_job_shares_globals():
     )
     assert _drain(submitted.job_id or "").state == "done"
     r = execute(ExecRequest(kind="python", code="print(PRIVY_JOB_SHARED)", mode="inprocess"))
-    assert r.stdout == b"7\n"
+    assert r.stdout == f"7{os.linesep}".encode()
 
 
 def test_job_error_is_reported():
@@ -177,6 +311,65 @@ def test_cancel_job():
     assert poll_job(submitted.job_id or "", wait_s=0.1).state == "missing"
 
 
+def test_job_cancelled_before_start_does_not_execute(monkeypatch):
+    called = False
+
+    def fake_run(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("cancelled job must not execute")
+
+    monkeypatch.setattr("privy.executor._run_subprocess", fake_run)
+    job = _Job(ExecRequest(kind="python", code="print('should not run')"))
+    worker = job._thread
+
+    job.cancel()
+    job.start()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert not called
+
+
+def test_job_adoption_after_cancellation_terminates_process(monkeypatch):
+    terminated = []
+    monkeypatch.setattr("privy.executor._terminate_process_tree", terminated.append)
+    job = _Job(ExecRequest(kind="python", code="print('should not run')"))
+    process = object()
+
+    job.cancel()
+    job._adopt_proc(process)
+
+    assert terminated == [process]
+
+
+def test_inprocess_run_interrupted_before_start_does_not_execute(tmp_path):
+    marker = tmp_path / "executed"
+    run = _InprocessRun(f"open({str(marker)!r}, 'w').close()")
+
+    run.interrupt()
+
+    assert run.start() is False
+    assert not marker.exists()
+
+
+def test_completed_job_releases_execution_resources():
+    submitted = execute(ExecRequest(kind="python", code="print('done')", action="submit", timeout_s=1))
+    assert submitted.job_id
+    deadline = time.monotonic() + 5
+    while poll_job(submitted.job_id, wait_s=0.1).state == "running":
+        assert time.monotonic() < deadline
+
+    with _JOBS_LOCK:
+        job = _JOBS[submitted.job_id]
+    assert job._proc is None
+    assert job._run is None
+    assert job._thread is None
+    assert job.done is None
+
+    cancel_job(submitted.job_id)
+
+
 def test_concurrent_inprocess_output_is_not_interleaved():
     """Two overlapping inprocess runs must each get only their own stdout."""
     slow = execute(
@@ -188,10 +381,10 @@ def test_concurrent_inprocess_output_is_not_interleaved():
         )
     )
     fast = execute(ExecRequest(kind="python", code="print('fast')", mode="inprocess"))
-    assert fast.stdout == b"fast\n"
+    assert fast.stdout == f"fast{os.linesep}".encode()
 
     final = _drain(slow.job_id or "")
-    assert final.stdout == b"slow\n" * 5
+    assert final.stdout == f"slow{os.linesep}".encode() * 5
 
 
 def test_concurrent_inprocess_runs_actually_overlap():
