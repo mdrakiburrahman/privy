@@ -52,7 +52,7 @@ jobs:
           uv run --locked ruff format --check .
 
       - name: Lint Markdown
-        run: npx --yes markdownlint-cli2@0.23.2
+        run: ./scripts/check_markdown.sh
 
       - name: Run non-E2E tests
         run: uv run --locked pytest -m "not e2e"

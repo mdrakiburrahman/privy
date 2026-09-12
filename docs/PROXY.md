@@ -29,7 +29,8 @@ RelayServer(
 privy proxy --local-port 3000
 ```
 
-Open `http://127.0.0.1:3000`. The local server serializes each browser request, posts it through Azure Relay, and returns the remote HTTP status, headers, and body.
+Open `http://127.0.0.1:3000`. The local server serializes each browser request, posts it through
+Azure Relay, and returns the remote HTTP status, headers, and body.
 
 Python:
 
@@ -54,4 +55,5 @@ ProxyClientServer(
 - Relay transport failures return a local `502`.
 - Token providers are resolved for every proxied request.
 
-The local proxy binds to loopback only. It does not add application authentication to the remote service; protect the Relay credentials and do not expose the local port beyond trusted callers.
+The local proxy binds to loopback only. It does not add application authentication to the remote
+service; protect the Relay credentials and do not expose the local port beyond trusted callers.

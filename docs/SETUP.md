@@ -42,7 +42,8 @@ az relay hyco authorization-rule create \
   --rights Send
 ```
 
-Use a Listen-only rule on the server and a Send-only rule on clients. A compromised consumer can then send work but cannot register a rogue listener.
+Use a Listen-only rule on the server and a Send-only rule on clients. A compromised consumer can
+then send work but cannot register a rogue listener.
 
 ## Use signing keys directly
 
@@ -74,7 +75,8 @@ source .env
 set +a
 ```
 
-Signing keys are long-lived credentials. Prefer the broker flow in [Authentication](AUTHENTICATION.md) for remote or shared machines.
+Signing keys are long-lived credentials. Prefer the broker flow in
+[Authentication](AUTHENTICATION.md) for remote or shared machines.
 
 ## Use a pre-minted token
 
@@ -86,9 +88,12 @@ export PRIVY_RELAY_PATH="$HC"
 export PRIVY_RELAY_TOKEN='SharedAccessSignature ...'
 ```
 
-The Python constructors accept the same shape through `token=...`. A token and `keyrule`/`key` are mutually exclusive.
+The Python constructors accept the same shape through `token=...`. A token and `keyrule`/`key` are
+mutually exclusive.
 
-Both roles support tokens: give the listener a Listen-rule token and each consumer a Send-rule token. See [Authentication](AUTHENTICATION.md) for direct generation from an Entra-authenticated Azure CLI key lookup and for an Entra JWT token-broker exchange.
+Both roles support tokens: give the listener a Listen-rule token and each consumer a Send-rule
+token. See [Authentication](AUTHENTICATION.md) for direct generation from an Entra-authenticated
+Azure CLI key lookup and for an Entra JWT token-broker exchange.
 
 ## Next steps
 

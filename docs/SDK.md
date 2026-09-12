@@ -49,9 +49,11 @@ python = client.run_python(
 print(python.exit_code, python.stdout, python.stderr)
 ```
 
-`ExecResult` includes decoded and raw output, duration, timeout/error fields, and a `job_id` when the long-job path was used. `ok` is true only for exit code zero without timeout.
+`ExecResult` includes decoded and raw output, duration, timeout/error fields, and a `job_id` when
+the long-job path was used. `ok` is true only for exit code zero without timeout.
 
-Requests with a timeout above 55 seconds automatically use submit plus long-poll while preserving the same final result shape. Override with `async_job=True` or `False`.
+Requests with a timeout above 55 seconds automatically use submit plus long-poll while preserving
+the same final result shape. Override with `async_job=True` or `False`.
 
 ## Drive jobs directly
 
@@ -99,7 +101,8 @@ for outcome in batch.outcomes:
     print(outcome.id, outcome.state, outcome.result)
 ```
 
-The client rejects duplicate IDs, missing dependencies, cycles, invalid modes, and invalid limits before submission. Failed commands skip transitive dependents while independent branches continue.
+The client rejects duplicate IDs, missing dependencies, cycles, invalid modes, and invalid limits
+before submission. Failed commands skip transitive dependents while independent branches continue.
 
 ## Transfer files
 
@@ -118,7 +121,8 @@ downloaded = client.download_file(
 )
 ```
 
-Both methods resume matching partial files and return `TransferResult` with direction, paths, byte count, SHA-256, transfer ID, and resume offset.
+Both methods resume matching partial files and return `TransferResult` with direction, paths, byte
+count, SHA-256, transfer ID, and resume offset.
 
 ## Send a raw execution request
 
@@ -130,4 +134,5 @@ result = client.send(
 )
 ```
 
-Wire execution requests remain backward-compatible: missing action fields default to synchronous `exec`.
+Wire execution requests remain backward-compatible: missing action fields default to synchronous
+`exec`.

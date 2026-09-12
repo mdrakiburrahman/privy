@@ -1,12 +1,10 @@
 # Pull request
 
-Thank you for contributing. Please complete the sections below so reviewers
-can understand and verify the change.
+Thank you for contributing. Please complete the sections below so reviewers can understand and
+verify the change.
 
-Use a
-[Conventional Commit](https://www.conventionalcommits.org/en/v1.0.0/)
-PR title, such as `feat: add token authentication` or
-`fix(cli): preserve command timeouts`.
+Use a [Conventional Commit](https://www.conventionalcommits.org/en/v1.0.0/) PR title, such as
+`feat: add token authentication` or `fix(cli): preserve command timeouts`.
 
 ## Why
 
