@@ -23,6 +23,7 @@ if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
   fi
   export UV_PYTHON=/usr/bin/python3
   export UV_PROJECT_ENVIRONMENT="${RUNNER_TEMP:?}/privy-binary-venv"
+  unset LD_LIBRARY_PATH
 fi
 
 echo ">> syncing binary build dependencies"
