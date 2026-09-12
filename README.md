@@ -73,19 +73,36 @@ examples in one deterministic plain-text document.
 Linux:
 
 ```bash
-curl -fsSL https://rakirahman.blob.core.windows.net/public/bins/privy-linux-x86_64 -o privy
-chmod +x privy
-./privy --help
+export PRIVY_RELAY_NAMESPACE=my-relay
+export PRIVY_RELAY_PATH=my-path
+export PRIVY_RELAY_KEYRULE=all
+export PRIVY_RELAY_KEY=...
+
+mkdir -p .temp
+cd .temp
+curl -fsSL https://rakirahman.blob.core.windows.net/public/bins/privy-linux-x86_64 -o privy && chmod +x privy
+./privy server -v
 ```
 
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest `
-  -Uri "https://rakirahman.blob.core.windows.net/public/bins/privy-windows-x86_64.exe" `
-  -OutFile "privy.exe"
-Unblock-File -LiteralPath ".\privy.exe"
-.\privy.exe --help
+$env:PRIVY_RELAY_NAMESPACE = "my-relay"
+$env:PRIVY_RELAY_PATH = "my-path"
+$env:PRIVY_RELAY_KEYRULE = "all"
+$env:PRIVY_RELAY_KEY = "..."
+
+$work = "C:\.temp\privy"
+New-Item -ItemType Directory -Force $work | Out-Null
+
+$env:TEMP = $work
+$env:TMP = $work
+
+$exe = "$work\privy.exe"
+Invoke-WebRequest "https://rakirahman.blob.core.windows.net/public/bins/privy-windows-x86_64.exe" -OutFile $exe
+Unblock-File $exe
+
+& $exe client --bash "uname -a"
 ```
 
 See [INSTALL.md](INSTALL.md) for PATH setup, the unsigned Windows binary policy, package-feed
