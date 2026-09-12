@@ -266,6 +266,35 @@ def _python_executable() -> str:
     return sys.executable
 
 
+def _bash_executable() -> str:
+    if os.name == "nt":
+        roots = []
+        configured_root = os.environ.get("GIT_INSTALL_ROOT")
+        if configured_root:
+            roots.append(configured_root)
+
+        git = shutil.which("git")
+        if git:
+            git_parent = os.path.dirname(git)
+            if os.path.basename(git_parent).lower() in ("bin", "cmd"):
+                roots.append(os.path.dirname(git_parent))
+
+        program_files = os.environ.get("ProgramFiles")
+        if program_files:
+            roots.append(os.path.join(program_files, "Git"))
+
+        for root in dict.fromkeys(roots):
+            for relative_path in (("bin", "bash.exe"), ("usr", "bin", "bash.exe")):
+                candidate = os.path.join(root, *relative_path)
+                if os.path.isfile(candidate):
+                    return candidate
+
+    found = shutil.which("bash")
+    if not found:
+        raise FileNotFoundError("Bash is not installed or is not on PATH")
+    return found
+
+
 def _powershell_executable() -> str:
     found = shutil.which("pwsh") or shutil.which("powershell") or shutil.which("powershell.exe")
     if not found:
@@ -332,7 +361,7 @@ def _run_subprocess(
         if kind == "python":
             argv = [_python_executable(), "-u", "-c", code]
         elif kind == "bash":
-            argv = ["bash", "-lc", code]
+            argv = [_bash_executable(), "-lc", code]
         elif kind == "powershell":
             argv = [
                 _powershell_executable(),
