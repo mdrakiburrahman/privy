@@ -13,6 +13,18 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 BIN="dist/privy"
 
+# actions/setup-python embeds absolute RUNPATH entries that StaticX rejects.
+# Build the binary with Ubuntu's system Python in an isolated uv environment;
+# the workflow's pinned setup-python interpreter remains in use elsewhere.
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  if [[ ! -x /usr/bin/python3 ]]; then
+    echo "GitHub runner has no system Python at /usr/bin/python3" >&2
+    exit 1
+  fi
+  export UV_PYTHON=/usr/bin/python3
+  export UV_PROJECT_ENVIRONMENT="${RUNNER_TEMP:?}/privy-binary-venv"
+fi
+
 echo ">> syncing binary build dependencies"
 uv sync --group binary
 
