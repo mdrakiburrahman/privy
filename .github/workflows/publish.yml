@@ -1,0 +1,47 @@
+name: Publish
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-main
+  cancel-in-progress: false
+
+env:
+  UV_PYTHON: "3.12"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.13"
+          enable-cache: true
+
+      - name: Build release artifacts
+        run: ./scripts/build_release.sh
+
+      - name: Publish release artifacts
+        env:
+          BASE64_ENV: ${{ secrets.BASE64_ENV }}
+        run: ./scripts/publish_release.sh

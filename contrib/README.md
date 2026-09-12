@@ -1,5 +1,8 @@
 # Contributing
 
+For build, test, packaging, GCI, and publishing commands, see the
+[deployment guide](../docs/DEPLOYMENT.md).
+
 ## How to use, on a Windows machine by installing WSL
 
 1. Windows pre-reqs
@@ -19,8 +22,9 @@
 
 1. Clone the repo, and open VSCode in it:
 
-    > ⚠️ Important: We use WSL in `~/` because Linux > Windows drive commits via `/mnt/c` is extremely slow for Spark I/O.
-    > You can technically run the Devcontainer using Windows Docker Desktop, but the I/O experience is slow and poor.
+   > ⚠️ Important: We use WSL in `~/` because Linux > Windows drive commits via `/mnt/c` is
+   > extremely slow for Spark I/O. You can technically run the Devcontainer using Windows Docker
+   > Desktop, but the I/O experience is slow and poor.
 
    ```bash
    cd ~/
@@ -28,7 +32,7 @@
    read -p "Enter your name (e.g. 'FirstName LastName'): " user_name
    read -p "Enter your GitHub email (e.g. 'your-email@blah.com'): " user_email
    read -p "Enter the branch to switch to: (e.g. 'main') " branch_name
-    
+
    git clone https://github.com/mdrakiburrahman/privy.git
 
    git config --global user.name "$user_name"
@@ -48,10 +52,10 @@
 
 1. Install recommended developer tooling (optional):
 
-  ```bash
-  curl -fsSL https://gh.io/copilot-install | bash
-  $HOME/.local/bin/copilot --yolo
-  ```
+```bash
+curl -fsSL https://gh.io/copilot-install | bash
+$HOME/.local/bin/copilot --yolo
+```
 
 1. Login to github:
 
@@ -59,7 +63,8 @@
    gh auth login
    ```
 
-1. If `uv` (or other tools installed by the bootstrapper) isn't found in a shell that was already open before running step 4, reload your shell config to pick up the updated `PATH`:
+1. If `uv` (or other tools installed by the bootstrapper) isn't found in a shell that was already
+   open before running step 4, reload your shell config to pick up the updated `PATH`:
 
    ```bash
    source ~/.bashrc

@@ -1,6 +1,6 @@
 import time
 
-from privy.executor import cancel_job, execute, poll_job
+from privy.executor import _child_env, cancel_job, execute, poll_job
 from privy.protocol import ExecRequest
 
 
@@ -72,6 +72,25 @@ def test_non_utf8_stdout_is_preserved():
     r = execute(ExecRequest(kind="python", code=code))
     assert r.exit_code == 0
     assert r.stdout == bytes([0xFF, 0xFE, 0x00, 0x41])
+
+
+def test_child_environment_removes_listener_and_storage_secrets(monkeypatch):
+    secrets = {
+        "PRIVY_RELAY_TOKEN": "listen-token",
+        "PRIVY_RELAY_KEY": "relay-key",
+        "PRIVY_RELAY_SEND_KEY": "send-key",
+        "PRIVY_RELAY_LISTEN_KEY": "listen-key",
+        "BASE64_ENV": "encoded-env",
+        "STORAGE_KEY": "storage-key",
+    }
+    for name, value in secrets.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("PRIVY_RELAY_NAMESPACE", "safe-namespace")
+
+    child = _child_env()
+
+    assert not secrets.keys() & child.keys()
+    assert child["PRIVY_RELAY_NAMESPACE"] == "safe-namespace"
 
 
 # ---- async jobs ------------------------------------------------------------

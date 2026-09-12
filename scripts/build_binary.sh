@@ -13,8 +13,21 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 BIN="dist/privy"
 
+# actions/setup-python embeds absolute RUNPATH entries that StaticX rejects.
+# Build the binary with Ubuntu's system Python in an isolated uv environment;
+# the workflow's pinned setup-python interpreter remains in use elsewhere.
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  if [[ ! -x /usr/bin/python3 ]]; then
+    echo "GitHub runner has no system Python at /usr/bin/python3" >&2
+    exit 1
+  fi
+  export UV_PYTHON=/usr/bin/python3
+  export UV_PROJECT_ENVIRONMENT="${RUNNER_TEMP:?}/privy-binary-venv"
+  unset LD_LIBRARY_PATH
+fi
+
 echo ">> syncing binary build dependencies"
-uv sync --group binary
+uv sync --locked --group binary
 
 echo ">> building $BIN"
 uv run --group binary pyinstaller --clean --noconfirm privy.spec
@@ -53,6 +66,8 @@ echo ">> smoke test"
 "./$BIN" client --help >/dev/null
 "./$BIN" server --help >/dev/null
 "./$BIN" proxy --help >/dev/null
+"./$BIN" file --help >/dev/null
+"./$BIN" token --help >/dev/null
 if file "$BIN" | grep -q "statically linked"; then
   echo "   statically linked — portable across glibc versions"
 else
