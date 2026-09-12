@@ -8,6 +8,11 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
 Push-Location $repoRoot
 try {
+    $gitBashDirectory = Join-Path $env:ProgramFiles "Git\bin"
+    if (Test-Path -LiteralPath (Join-Path $gitBashDirectory "bash.exe") -PathType Leaf) {
+        $env:PATH = "$gitBashDirectory;$env:PATH"
+    }
+
     if (-not $SkipSync) {
         & uv sync --locked --group dev --group binary
         if ($LASTEXITCODE -ne 0) {

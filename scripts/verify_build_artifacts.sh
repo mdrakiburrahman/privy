@@ -5,8 +5,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source scripts/lib/release.sh
 
 VERSION="$(privy_version)"
-WHEEL="dist/privy-${VERSION}-py3-none-any.whl"
-BINARY="dist/privy"
+WHEEL="${PRIVY_WHL_PATH:-dist/privy-${VERSION}-py3-none-any.whl}"
+BINARY="${PRIVY_BIN_PATH:-dist/privy}"
 
 if [[ ! -s "$WHEEL" ]]; then
   echo "Expected wheel is missing or empty: $WHEEL" >&2

@@ -62,7 +62,14 @@ _POWERSHELL_STDIN_BOOTSTRAP = (
     "$stream=[Console]::OpenStandardInput();"
     "$memory=[IO.MemoryStream]::new();"
     "$stream.CopyTo($memory);"
-    "& ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString($memory.ToArray())))"
+    "$source=[Text.Encoding]::UTF8.GetString($memory.ToArray());"
+    "$source += [Environment]::NewLine + "
+    "'$privySuccess=$?;$privyExitCode=$LASTEXITCODE;"
+    "if (-not $privySuccess) {"
+    "if ($null -ne $privyExitCode -and $privyExitCode -ne 0) { exit $privyExitCode };"
+    "exit 1"
+    "}';"
+    "& ([ScriptBlock]::Create($source))"
 )
 _WINDOWS_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_CLOSE = 0x00002000
@@ -484,17 +491,27 @@ class _InprocessRun:
         self._stderr_text = io.TextIOWrapper(self._stderr_buf, encoding="utf-8", write_through=True)
         self.exit_code = 0
         self.error: str | None = None
+        self._state_lock = threading.Lock()
+        self._cancel_requested = False
         self.thread = threading.Thread(target=self._target, name="privy-inprocess", daemon=True)
 
-    def start(self) -> None:
-        self.thread.start()
+    def start(self) -> bool:
+        with self._state_lock:
+            if self._cancel_requested:
+                return False
+            self.thread.start()
+            return True
 
     def join(self, timeout: float | None) -> bool:
         self.thread.join(timeout=timeout)
         return not self.thread.is_alive()
 
     def interrupt(self) -> None:
-        _try_async_raise(self.thread, KeyboardInterrupt)
+        with self._state_lock:
+            self._cancel_requested = True
+            started = self.thread.ident is not None
+        if started:
+            _try_async_raise(self.thread, KeyboardInterrupt)
 
     def output(self) -> tuple[bytes, bytes]:
         return self._stdout_buf.getvalue(), self._stderr_buf.getvalue()
@@ -561,7 +578,14 @@ def _run_inprocess_python(
             duration_ms=int((time.monotonic() - start) * 1000),
             error="cancelled",
         )
-    run.start()
+    if not run.start():
+        return ExecResponse.from_output(
+            exit_code=130,
+            stdout=b"",
+            stderr=b"",
+            duration_ms=int((time.monotonic() - start) * 1000),
+            error="cancelled",
+        )
 
     finished = run.join(timeout=timeout_s)
     timed_out = not finished

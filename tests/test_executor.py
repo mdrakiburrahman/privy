@@ -9,6 +9,7 @@ from privy.executor import (
     _JOBS,
     _JOBS_LOCK,
     _child_env,
+    _InprocessRun,
     _Job,
     cancel_job,
     execute,
@@ -79,6 +80,34 @@ def test_windows_powershell_preserves_unicode_code_and_output(monkeypatch):
 
     assert r.exit_code == 0
     assert r.stdout == f"café 世界{os.linesep}".encode()
+
+
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None and shutil.which("powershell") is None,
+    reason="PowerShell is not installed",
+)
+def test_powershell_propagates_native_command_exit_code():
+    code = "& (Get-Process -Id $PID).Path -NoLogo -NoProfile -NonInteractive -Command 'exit 7'"
+
+    r = execute(ExecRequest(kind="powershell", code=code))
+
+    assert r.exit_code == 7
+
+
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None and shutil.which("powershell") is None,
+    reason="PowerShell is not installed",
+)
+def test_powershell_reports_nonterminating_cmdlet_error():
+    r = execute(
+        ExecRequest(
+            kind="powershell",
+            code="Get-Item '__definitely_missing_privy_path__'",
+        )
+    )
+
+    assert r.exit_code == 1
+    assert r.stderr
 
 
 @pytest.mark.skipif(
@@ -312,6 +341,16 @@ def test_job_adoption_after_cancellation_terminates_process(monkeypatch):
     job._adopt_proc(process)
 
     assert terminated == [process]
+
+
+def test_inprocess_run_interrupted_before_start_does_not_execute(tmp_path):
+    marker = tmp_path / "executed"
+    run = _InprocessRun(f"open({str(marker)!r}, 'w').close()")
+
+    run.interrupt()
+
+    assert run.start() is False
+    assert not marker.exists()
 
 
 def test_completed_job_releases_execution_resources():

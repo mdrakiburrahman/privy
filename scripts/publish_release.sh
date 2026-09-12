@@ -13,11 +13,6 @@ case "${1:-}" in
     ;;
 esac
 
-LINUX_BINARY="${PRIVY_BIN_PATH:-dist/privy}"
-if [[ -s "$LINUX_BINARY" && ! -x "$LINUX_BINARY" ]]; then
-  chmod +x "$LINUX_BINARY"
-fi
-./scripts/verify_publish_artifacts.sh
 load_project_environment "Publishing"
 
 export PRIVY_STORAGE_ACCOUNT="${PRIVY_STORAGE_ACCOUNT:-rakirahman}"
@@ -30,6 +25,12 @@ validate_optional_environment_values \
   PRIVY_BIN_BLOB_PREFIX \
   PRIVY_WINDOWS_BIN_PATH
 mask_environment_values STORAGE_KEY
+
+LINUX_BINARY="${PRIVY_BIN_PATH:-dist/privy}"
+if [[ -s "$LINUX_BINARY" && ! -x "$LINUX_BINARY" ]]; then
+  chmod +x "$LINUX_BINARY"
+fi
+./scripts/verify_publish_artifacts.sh
 
 unset \
   PRIVY_RELAY_TOKEN \
