@@ -352,6 +352,7 @@ def test_inprocess_run_interrupted_before_start_does_not_execute(tmp_path):
     run.interrupt()
 
     assert run.start() is False
+    assert run.completed
     assert not marker.exists()
 
 
@@ -408,6 +409,19 @@ def test_completed_inprocess_run_cannot_be_interrupted(monkeypatch):
     assert calls == []
 
 
+def test_inprocess_join_uses_target_completion_not_thread_liveness(monkeypatch):
+    run = _InprocessRun("pass")
+    monkeypatch.setattr(run._completed, "wait", lambda timeout=None: False)
+    monkeypatch.setattr(
+        run.thread,
+        "join",
+        lambda timeout=None: (_ for _ in ()).throw(AssertionError("must not call Thread.join")),
+    )
+    monkeypatch.setattr(run.thread, "is_alive", lambda: False)
+
+    assert run.join(timeout=0.01) is False
+
+
 def test_job_base_exception_terminalizes_as_failure(monkeypatch):
     def interrupt_supervisor(*args, **kwargs):
         raise KeyboardInterrupt
@@ -423,17 +437,54 @@ def test_job_base_exception_terminalizes_as_failure(monkeypatch):
     assert b"KeyboardInterrupt" in final.stderr
 
 
-def test_poll_terminalizes_dead_supervisor_without_response():
+def test_interrupted_supervisor_retains_ambiguous_worker_until_target_completion(monkeypatch):
+    released = threading.Event()
+
+    class AmbiguousRun:
+        @property
+        def completed(self):
+            return released.is_set()
+
+        def join(self, timeout=None):
+            return released.wait(timeout)
+
+        def interrupt(self):
+            return True
+
+    run = AmbiguousRun()
+
+    def interrupted_join(code, timeout_s, start, on_run):
+        assert on_run(run)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("privy.executor._run_inprocess_python", interrupted_join)
+    job = _Job(ExecRequest(kind="python", code="pass", mode="inprocess"))
+    with _JOBS_LOCK:
+        _JOBS[job.id] = job
+    job.start()
+
+    final = poll_job(job.id, wait_s=2)
+
+    assert final.state == "done"
+    assert final.error == "KeyboardInterrupt"
+    assert job._run is run
+    assert job.finished_at is None
+
+    released.set()
+    deadline = time.monotonic() + 2
+    while job.finished_at is None:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert job._run is None
+
+
+def test_poll_terminalizes_completed_supervisor_without_response():
     job = _Job(ExecRequest(kind="python", code="pass"))
-    worker = job._thread
-    assert worker is not None
-    worker.start()
-    worker.join(timeout=2)
     with job._lock:
         job.response = None
         job.finished_at = None
         job.done = threading.Event()
-        job._thread = worker
+    job._supervisor_completed.set()
     with _JOBS_LOCK:
         _JOBS[job.id] = job
 

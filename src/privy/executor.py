@@ -524,18 +524,24 @@ class _InprocessRun:
         self._cancel_requested = False
         self._finished = False
         self._interruptible = False
+        self._completed = threading.Event()
         self.thread = threading.Thread(target=self._target, name="privy-inprocess", daemon=True)
 
     def start(self) -> bool:
         with self._state_lock:
             if self._cancel_requested:
+                self._finished = True
+                self._completed.set()
                 return False
             self.thread.start()
             return True
 
     def join(self, timeout: float | None) -> bool:
-        self.thread.join(timeout=timeout)
-        return not self.thread.is_alive()
+        return self._completed.wait(timeout=timeout)
+
+    @property
+    def completed(self) -> bool:
+        return self._completed.is_set()
 
     def interrupt(self) -> bool:
         with self._state_lock:
@@ -544,7 +550,7 @@ class _InprocessRun:
                 return False
             if not self._interruptible:
                 return True
-            _try_async_raise(self.thread, KeyboardInterrupt)
+            _try_async_raise(self.thread, KeyboardInterrupt, known_active=True)
             return True
 
     def output(self) -> tuple[bytes, bytes]:
@@ -579,10 +585,13 @@ class _InprocessRun:
                 with self._state_lock:
                     self._interruptible = False
                     self._finished = True
-                self._stdout_text.flush()
-                self._stderr_text.flush()
-                out_router.unregister()
-                err_router.unregister()
+                try:
+                    self._stdout_text.flush()
+                    self._stderr_text.flush()
+                finally:
+                    out_router.unregister()
+                    err_router.unregister()
+                    self._completed.set()
 
 
 class _NullLock:
@@ -614,6 +623,8 @@ def _run_inprocess_python(
     """
     run = _InprocessRun(code)
     if on_run is not None and not on_run(run):
+        run.interrupt()
+        run.start()
         return ExecResponse.from_output(
             exit_code=130,
             stdout=b"",
@@ -649,8 +660,13 @@ def _run_inprocess_python(
     )
 
 
-def _try_async_raise(thread: threading.Thread, exc_type: type[BaseException]) -> None:
-    if not thread.is_alive():
+def _try_async_raise(
+    thread: threading.Thread,
+    exc_type: type[BaseException],
+    *,
+    known_active: bool = False,
+) -> None:
+    if not known_active and not thread.is_alive():
         return
     tid = thread.ident
     if tid is None:
@@ -685,6 +701,7 @@ class _Job:
         self._run: _InprocessRun | None = None
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
+        self._supervisor_completed = threading.Event()
         self._thread: threading.Thread | None = threading.Thread(
             target=self._target,
             name=f"privy-job-{self.id[:8]}",
@@ -741,27 +758,69 @@ class _Job:
                     duration_ms=int((time.monotonic() - start) * 1000),
                     error="supervisor_terminated",
                 )
-            self._finish(resp)
+            try:
+                self._finish(resp)
+            finally:
+                self._supervisor_completed.set()
 
     def _finish(self, resp: ExecResponse) -> None:
+        retained_run: _InprocessRun | None = None
+        retained_proc: subprocess.Popen | None = None
         with self._lock:
             if self.response is not None:
                 return
             self.response = resp
-            self.finished_at = time.monotonic()
-            self._run = None
-            self._proc = None
+            if self._run is not None and not self._run.completed:
+                retained_run = self._run
+            else:
+                self._run = None
+            if self._proc is not None and self._proc.poll() is None:
+                retained_proc = self._proc
+            else:
+                self._proc = None
+            if retained_run is None and retained_proc is None:
+                self.finished_at = time.monotonic()
             self._thread = None
             done = self.done
             self.done = None
         if done is not None:
             done.set()
+        if retained_run is not None or retained_proc is not None:
+            threading.Thread(
+                target=self._await_retained_resources,
+                args=(retained_run, retained_proc),
+                name=f"privy-job-reaper-{self.id[:8]}",
+                daemon=True,
+            ).start()
         _reap_jobs()
 
-    def _terminalize_dead_supervisor(self) -> None:
+    def _await_retained_resources(
+        self,
+        run: _InprocessRun | None,
+        proc: subprocess.Popen | None,
+    ) -> None:
+        run_completed = run is None or run.join(timeout=None)
+        proc_completed = proc is None
+        if proc is not None:
+            try:
+                proc.wait()
+                proc_completed = True
+            except Exception:  # pragma: no cover - retain an unverified process handle
+                pass
         with self._lock:
-            thread = self._thread
-            if self.response is not None or thread is None or thread.is_alive():
+            if run_completed and self._run is run:
+                self._run = None
+            if proc_completed and self._proc is proc:
+                self._proc = None
+            if self._run is None and self._proc is None:
+                self.finished_at = time.monotonic()
+        _reap_jobs()
+
+    def _terminalize_completed_supervisor(self) -> None:
+        if not self._supervisor_completed.is_set():
+            return
+        with self._lock:
+            if self.response is not None:
                 return
         self._finish(
             ExecResponse.from_output(
@@ -800,7 +859,7 @@ class _Job:
                     return False
                 self.cancelled = True
                 terminate_proc = self._proc
-            elif self._thread is not None and (self._thread.ident is None or self._thread.is_alive()):
+            elif not self._supervisor_completed.is_set():
                 self.cancelled = True
                 return True
             else:
@@ -876,11 +935,11 @@ def poll_job(job_id: str, wait_s: float = DEFAULT_POLL_WAIT_S) -> ExecResponse:
             state="missing",
         )
 
-    job._terminalize_dead_supervisor()
+    job._terminalize_completed_supervisor()
     done = job.done
     if done is not None:
         done.wait(timeout=max(0.0, min(wait_s, MAX_POLL_WAIT_S)))
-    job._terminalize_dead_supervisor()
+    job._terminalize_completed_supervisor()
     if job.response is None:
         return ExecResponse.from_output(
             exit_code=0,
