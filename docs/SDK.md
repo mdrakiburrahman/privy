@@ -105,6 +105,35 @@ for outcome in batch.outcomes:
 The client rejects duplicate IDs, missing dependencies, cycles, invalid modes, and invalid limits
 before submission. Failed commands skip transitive dependents while independent branches continue.
 
+### Observe terminal commands
+
+Both `RelayClient.run_many()` and `privy.batch.run_many()` accept the optional keyword
+`on_command_complete: Callable[[CommandOutcome], None] | None = None`. Each native terminal outcome
+is delivered once, including failed, skipped, remotely cancelled, and ambiguous transport/deadline
+outcomes. Notifications run synchronously on the scheduler's calling thread, outside poll workers
+and their locks. Keep callbacks small and local; do not extract remote logs or mutate outcomes there.
+Use a separate observer for expensive work. With `None`, execution and final result semantics are
+unchanged and no side-channel IO occurs.
+
+If a callback raises an `Exception`, the scheduler stops new submissions but drains already-active
+jobs with its normal polls, retries, and deadlines. Native successes, failures, and dependency skips
+remain intact; never-submitted commands become `cancelled` / `batch_callback_failed`. Notifications
+are still attempted once for the remaining terminal outcomes, not retried. After draining,
+`privy.BatchCallbackError` is raised with:
+
+- `result`: the complete ordered native `BatchResult`, not a replacement execution error;
+- `failures`: tuples of `(command_id, original_exception)`, also retaining the first exception as
+  `__cause__`.
+
+For `KeyboardInterrupt` or another escaping `BaseException`, native best-effort cancellation and
+the original exception type are preserved. When a callback is enabled, the exception also carries
+`batch_result` and `batch_callback_failures`; callback errors during cleanup do not replace the
+original interruption. Cancellation does not confirm that an ambiguous remote worker has stopped.
+Transport/deadline failures retain their original job IDs and are not automatically resubmitted.
+
+For a ready-made private local sink, use the CLI's
+[`--results-dir` contract](CLI.md#live-terminal-artifacts-opt-in).
+
 ## Transfer files
 
 ```python

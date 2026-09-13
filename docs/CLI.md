@@ -130,6 +130,64 @@ JSON output preserves manifest order and includes each command's state, result, 
 causes. Any failed or skipped command makes the aggregate exit code non-zero. Invalid manifests are
 usage errors.
 
+### Live terminal artifacts (opt-in)
+
+```bash
+privy client --batch pipeline.json --json --results-dir ./attempt-001
+```
+
+`--results-dir` publishes each terminal command while other commands are still running, using the
+same native scheduler. It adds no output to stdout: the final batch JSON (or text output without
+`--json`) is unchanged. Without this flag there is no artifact writer or additional filesystem IO.
+This is a local result side channel, not SQL logging, remote log extraction, or another scheduler.
+
+Use a **new directory for every invocation**. Its parent must already exist. Existing destinations,
+`..` path components, and symlinks in the output path are refused before commands are submitted.
+The option requires a POSIX client filesystem supporting directory descriptors, no-follow opens,
+hard links, and file/directory `fsync`; unsupported filesystems fail preflight, not silently downgrade.
+Directories are mode `0700` and files `0600`. Files are serialized and synced before being atomically
+published without overwriting any existing name.
+
+The version-1 contract is:
+
+- **`batch.json`**, published before submission:
+  `{schema: "privy.batch.results", version: 1, batch_id, manifest, commands}`.
+  `batch_id` is one UUID hex string for this invocation.
+  `manifest` contains `source` (the supplied manifest path or `"-"`), `sha256` (the input bytes;
+  UTF-8 text when stdin has no binary stream), and effective `max_parallel`.
+  `commands` preserves original manifest order as
+  `[{index: 0, id: "<original ID>", file: "command-000001.json"}, ...]`.
+- **`command-000001.json`**, etc., published once per terminal command:
+  `{schema: "privy.batch.command", version: 1, batch_id, index: 0, outcome}`.
+  `outcome` is the complete, unmodified native `CommandOutcome.to_dict()` representation, including
+  nested `result.stdout`, `result.stderr`, native errors/job IDs, and skip causes. Like final batch
+  JSON, it omits binary `stdout_bytes`/`stderr_bytes`. Indexes are zero-based; filenames are numbered
+  from one with at least six digits. Command IDs are data, never paths: consumers must use the map
+  in `batch.json` and check each file's `batch_id`, `index`, and `outcome.id`.
+- **`complete.json`**, published after the scheduler finishes:
+  `{schema: "privy.batch.complete", version: 1, batch_id, state, command_count, artifact_count,
+  missing_command_ids, errors, result}`.
+  `state` is `"complete"`, `"error"`, or `"interrupted"`. `artifact_count` counts successfully
+  published command files; `missing_command_ids` lists IDs without confirmed publication.
+  `errors` is `[{command_id: "<ID or null>", error: "<message>"}, ...]` (the global ID is JSON
+  `null`, not a string). `result` is the native final batch JSON, or `null` if unavailable.
+
+`state: "complete"` means artifact delivery completed, **not** that every command succeeded.
+Check the native results and CLI exit code as well. A missing end marker is never proof of completion.
+Hidden `.pending-*` files, if left by process termination or an IO failure, are not completion records.
+
+A terminal-artifact IO failure stops new submissions and drains already-active jobs using native
+polling/retry/deadline handling. Their real SQL/command results are retained; unsubmitted work becomes
+`cancelled` with `error: "batch_callback_failed"`. The CLI still emits the original-shaped final
+response, reports delivery failures on stderr, and exits `1` even if every executed command succeeded.
+The end marker records the error when it can be written; a failure to write that marker also exits
+`1` without suppressing the native final stdout. Preflight errors exit `2` without execution.
+
+`Ctrl-C` keeps native best-effort cancellation and exit `130`; available terminal outcomes and an
+`interrupted` end marker are retained when possible. Cancellation is not proof a remote worker has
+stopped. Existing `poll_transport`/`poll_deadline` errors remain ambiguous and retain job IDs for
+reconciliation; neither artifact delivery nor a missing receipt automatically reruns remote work.
+
 ## Transfer files
 
 ```bash

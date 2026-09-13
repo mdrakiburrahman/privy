@@ -10,9 +10,11 @@ from privy._relay import (
 )
 from privy.batch import (
     DEFAULT_MAX_PARALLEL,
+    BatchCallbackError,
     BatchManifest,
     BatchResult,
     BatchValidationError,
+    CommandCompleteCallback,
     CommandOutcome,
     CommandSpec,
     parse_batch_manifest,
@@ -34,9 +36,11 @@ from privy.transfer import (
 __all__ = [
     "RELAY_RESPONSE_LIMIT_S",
     "DEFAULT_MAX_PARALLEL",
+    "BatchCallbackError",
     "BatchManifest",
     "BatchResult",
     "BatchValidationError",
+    "CommandCompleteCallback",
     "CommandOutcome",
     "CommandSpec",
     "ExecRequest",

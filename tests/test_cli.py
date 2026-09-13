@@ -1,13 +1,16 @@
+import hashlib
 import io
 import json
 import logging
 import os
+import threading
 from types import SimpleNamespace
 
 import pytest
 
 from privy import _relay
-from privy.batch import BatchResult, CommandOutcome
+from privy.batch import BatchCallbackError, BatchResult, CommandOutcome, run_many
+from privy.batch_results import BatchResultsError, BatchResultsWriter
 from privy.cli import (
     TOKEN_EXPIRED_EXIT_CODE,
     CliError,
@@ -78,12 +81,22 @@ class FakeClient:
         self.calls.append(("powershell", code, kwargs))
         return _result(stdout="powershell\n", stdout_bytes=b"powershell\n")
 
-    def run_many(self, commands, *, max_parallel):
-        self.calls.append(("batch", tuple(commands), {"max_parallel": max_parallel}))
-        return BatchResult(
-            outcomes=(CommandOutcome(id=commands[0].id, state="succeeded", result=_result()),),
+    def run_many(self, commands, *, max_parallel, on_command_complete=None):
+        options = {"max_parallel": max_parallel}
+        if on_command_complete is not None:
+            options["on_command_complete"] = on_command_complete
+        self.calls.append(("batch", tuple(commands), options))
+        result = BatchResult(
+            outcomes=tuple(
+                CommandOutcome(id=command.id, state="succeeded", result=_result())
+                for command in commands
+            ),
             duration_ms=1,
         )
+        if on_command_complete is not None:
+            for outcome in result.outcomes:
+                on_command_complete(outcome)
+        return result
 
     def upload_file(self, local, remote, **kwargs):
         self.calls.append(("upload", local, remote, kwargs))
@@ -204,6 +217,275 @@ def test_cli_batch_reads_json_from_stdin(monkeypatch, capsys, relay_args):
     assert call[0] == "batch"
     assert call[2]["max_parallel"] == 7
     assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+def test_cli_batch_without_results_flag_does_not_construct_sink_or_pass_hook(
+    monkeypatch, tmp_path, capsys, relay_args,
+):
+    FakeClient.instances.clear()
+    monkeypatch.setattr("privy.cli.RelayClient", FakeClient)
+
+    def forbidden_sink(*args, **kwargs):
+        pytest.fail("batch without --results-dir must not construct an artifact sink")
+
+    monkeypatch.setattr("privy.batch_results.BatchResultsWriter", forbidden_sink)
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"commands":[{"id":"one","kind":"bash","code":"true"}]}'))
+
+    assert main(["client", *relay_args, "--batch", "-", "--json"]) == 0
+
+    assert FakeClient.instances[-1].calls[-1][2] == {"max_parallel": 32}
+    assert list(tmp_path.iterdir()) == []
+    assert json.loads(capsys.readouterr().out) == BatchResult(
+        (CommandOutcome("one", "succeeded", _result()),), 1,
+    ).to_dict()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private results directories require POSIX")
+@pytest.mark.parametrize("as_json", [False, True])
+def test_cli_results_leave_final_output_unchanged(monkeypatch, tmp_path, capsys, relay_args, as_json):
+    FakeClient.instances.clear()
+    monkeypatch.setattr("privy.cli.RelayClient", FakeClient)
+    path = tmp_path / "manifest.json"
+    raw = b'{\r\n"max_parallel":7,"commands":[{"id":"one","kind":"bash","code":"true"}]\r\n}\r\n'
+    path.write_bytes(raw)
+    directory = tmp_path / "results"
+    arguments = ["client", *relay_args, "--batch", str(path)]
+    if as_json:
+        arguments.append("--json")
+    assert main(arguments) == 0
+    before = capsys.readouterr()
+
+    assert main([*arguments, "--results-dir", str(directory)]) == 0
+
+    after = capsys.readouterr()
+    assert after == before
+    metadata = json.loads((directory / "batch.json").read_text())
+    assert metadata["manifest"]["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert metadata["manifest"]["source"] == str(path)
+    assert metadata["manifest"]["max_parallel"] == 7
+    marker = json.loads((directory / "complete.json").read_text())
+    assert marker["state"] == "complete"
+    assert marker["artifact_count"] == 1
+    assert marker["result"] == BatchResult((CommandOutcome("one", "succeeded", _result()),), 1).to_dict()
+    if as_json:
+        assert marker["result"] == json.loads(after.out)
+
+
+def test_cli_results_flag_requires_batch_before_client_construction(monkeypatch, tmp_path, capsys, relay_args):
+    FakeClient.instances.clear()
+    monkeypatch.setattr("privy.cli.RelayClient", FakeClient)
+    directory = tmp_path / "results"
+
+    assert main(["client", *relay_args, "--python", "print(1)", "--results-dir", str(directory)]) == 2
+
+    assert FakeClient.instances == []
+    assert not directory.exists()
+    assert "--results-dir requires --batch" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"{",
+        b"\xff",
+        b"[]",
+        b'{"commands":[]}',
+        b'{"commands":[{"id":"one","kind":"bash","code":"unused","depends_on":["unknown"]}]}',
+        b'{"commands":[{"id":"one","kind":"bash","code":"unused","timeout_s":NaN}]}',
+        b'{"max_parallel":0,"commands":[{"id":"one","kind":"bash","code":"unused"}]}',
+        b'{"commands":[{"id":"one","kind":"bash","code":"unused"},{"id":"one","kind":"bash","code":"unused"}]}',
+        b'{"commands":[{"id":"a","kind":"bash","code":"unused","depends_on":["b"]},'
+        b'{"id":"b","kind":"bash","code":"unused","depends_on":["a"]}]}',
+    ],
+)
+def test_cli_results_reject_malformed_manifest_before_sink_or_execution(
+    monkeypatch, tmp_path, capsys, relay_args, raw,
+):
+    FakeClient.instances.clear()
+    monkeypatch.setattr("privy.cli.RelayClient", FakeClient)
+    path = tmp_path / "manifest.json"
+    path.write_bytes(raw)
+    directory = tmp_path / "results"
+
+    assert main(["client", *relay_args, "--batch", str(path), "--results-dir", str(directory)]) == 2
+
+    assert FakeClient.instances[-1].calls == []
+    assert not directory.exists()
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private results directories require POSIX")
+@pytest.mark.parametrize("failure", ["existing", "metadata", "async-option"])
+def test_cli_results_preflight_failure_never_runs_commands(
+    monkeypatch, tmp_path, capsys, relay_args, failure,
+):
+    FakeClient.instances.clear()
+    monkeypatch.setattr("privy.cli.RelayClient", FakeClient)
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"commands":[{"id":"one","kind":"bash","code":"unused"}]}'))
+    directory = tmp_path / "results"
+    arguments = ["client", *relay_args, "--batch", "-", "--results-dir", str(directory)]
+    if failure == "existing":
+        directory.mkdir()
+    elif failure == "metadata":
+        def cannot_publish(*args, **kwargs):
+            raise BatchResultsError("metadata disk unavailable")
+
+        monkeypatch.setattr(BatchResultsWriter, "_publish", cannot_publish)
+    else:
+        arguments.append("--async-job")
+
+    assert main(arguments) == 2
+
+    assert FakeClient.instances[-1].calls == []
+    assert not (directory / "command-000001.json").exists()
+    assert capsys.readouterr().out == ""
+
+
+class NativeBatchClient(FakeClient):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.fast_terminal = threading.Event()
+        self.submitted = []
+        self.active = set()
+        self.cancelled = []
+        self.notified = []
+        self.native_result = None
+
+    def submit(self, request):
+        self.submitted.append(request.code)
+        self.active.add(request.code)
+        return request.code
+
+    def poll(self, request, job_id, *, wait_s):
+        if job_id == "slow":
+            assert self.fast_terminal.wait(5)
+        self.active.remove(job_id)
+        return "done", _result(stdout=job_id, stdout_bytes=job_id.encode(), job_id=job_id)
+
+    def cancel(self, request, job_id):
+        self.cancelled.append(job_id)
+
+    def run_many(self, commands, *, max_parallel, on_command_complete=None):
+        def completed(outcome):
+            self.notified.append(outcome)
+            try:
+                if on_command_complete is not None:
+                    on_command_complete(outcome)
+            finally:
+                if outcome.id == "fast":
+                    self.fast_terminal.set()
+
+        try:
+            self.native_result = run_many(
+                self, commands, max_parallel=max_parallel, on_command_complete=completed,
+            )
+        except BatchCallbackError as exc:
+            self.native_result = exc.result
+            raise
+        return self.native_result
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private results directories require POSIX")
+@pytest.mark.parametrize("with_pending", [False, True])
+def test_cli_sink_failure_drains_jobs_and_keeps_native_final_json(
+    monkeypatch, tmp_path, capsys, relay_args, with_pending,
+):
+    FakeClient.instances.clear()
+    monkeypatch.setattr("privy.cli.RelayClient", NativeBatchClient)
+    ids = ["fast", "slow", "pending"] if with_pending else ["fast", "slow"]
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({
+        "max_parallel": 2,
+        "commands": [{"id": name, "kind": "bash", "code": name} for name in ids],
+    })))
+    directory = tmp_path / "results"
+    publish = BatchResultsWriter._publish
+
+    def fail_first_receipt(self, filename, value):
+        if filename == "command-000001.json":
+            raise BatchResultsError("terminal result disk unavailable")
+        return publish(self, filename, value)
+
+    monkeypatch.setattr(BatchResultsWriter, "_publish", fail_first_receipt)
+
+    assert main(["client", *relay_args, "--batch", "-", "--json", "--results-dir", str(directory)]) == 1
+
+    captured = capsys.readouterr()
+    client = FakeClient.instances[-1]
+    native = json.loads(captured.out)
+    assert native == client.native_result.to_dict()
+    assert native["commands"][0]["state"] == "succeeded"
+    assert native["commands"][1]["result"]["stdout"] == "slow"
+    assert native["ok"] is (not with_pending)
+    assert client.active == set()
+    assert client.cancelled == []
+    assert client.submitted == ["fast", "slow"]
+    assert len(client.notified) == len(ids)
+    assert "terminal result disk unavailable" in captured.err
+    marker = json.loads((directory / "complete.json").read_text())
+    assert marker["state"] == "error"
+    assert marker["result"] == native
+    assert marker["missing_command_ids"] == ["fast"]
+    assert marker["artifact_count"] == len(ids) - 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private results directories require POSIX")
+def test_cli_final_marker_failure_cannot_suppress_native_stdout(monkeypatch, tmp_path, capsys, relay_args):
+    monkeypatch.setattr("privy.cli.RelayClient", FakeClient)
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"commands":[{"id":"one","kind":"bash","code":"unused"}]}'))
+    directory = tmp_path / "results"
+    publish = BatchResultsWriter._publish
+
+    def fail_marker(self, filename, value):
+        if filename == "complete.json":
+            raise BatchResultsError("final marker disk unavailable")
+        return publish(self, filename, value)
+
+    monkeypatch.setattr(BatchResultsWriter, "_publish", fail_marker)
+
+    assert main(["client", *relay_args, "--batch", "-", "--json", "--results-dir", str(directory)]) == 1
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == BatchResult((CommandOutcome("one", "succeeded", _result()),), 1).to_dict()
+    assert "final marker disk unavailable" in captured.err
+    assert (directory / "command-000001.json").exists()
+    assert not (directory / "complete.json").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private results directories require POSIX")
+@pytest.mark.parametrize("sink_fails", [False, True])
+def test_cli_interruption_preserves_exit_and_terminal_artifacts(
+    monkeypatch, tmp_path, capsys, relay_args, sink_fails,
+):
+    class InterruptingClient(NativeBatchClient):
+        def poll(self, request, job_id, *, wait_s):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr("privy.cli.RelayClient", InterruptingClient)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({
+        "max_parallel": 1,
+        "commands": [{"id": name, "kind": "bash", "code": name} for name in ("one", "pending")],
+    })))
+    directory = tmp_path / "results"
+    if sink_fails:
+        publish = BatchResultsWriter._publish
+
+        def fail_receipts(self, filename, value):
+            if filename.startswith("command-"):
+                raise BatchResultsError("cancel receipt unavailable")
+            return publish(self, filename, value)
+
+        monkeypatch.setattr(BatchResultsWriter, "_publish", fail_receipts)
+
+    assert main(["client", *relay_args, "--batch", "-", "--json", "--results-dir", str(directory)]) == 130
+
+    captured = capsys.readouterr()
+    native = json.loads(captured.out)
+    assert [outcome["state"] for outcome in native["commands"]] == ["cancelled", "cancelled"]
+    assert FakeClient.instances[-1].cancelled == ["one"]
+    marker = json.loads((directory / "complete.json").read_text())
+    assert marker["state"] == "interrupted"
+    assert marker["result"] == native
+    assert marker["artifact_count"] == (0 if sink_fails else 2)
 
 
 def test_cli_timeout_uses_shell_conventional_exit_124(monkeypatch, capsys, relay_args):

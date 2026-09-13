@@ -21,6 +21,7 @@ from privy._relay import (
 from privy.batch import (
     DEFAULT_MAX_PARALLEL,
     BatchResult,
+    CommandCompleteCallback,
     CommandSpec,
 )
 from privy.batch import (
@@ -212,9 +213,19 @@ class RelayClient:
         commands: Iterable[CommandSpec],
         *,
         max_parallel: int = DEFAULT_MAX_PARALLEL,
+        on_command_complete: CommandCompleteCallback | None = None,
     ) -> BatchResult:
-        """Run commands according to their dependency graph."""
-        return run_command_batch(self, commands, max_parallel=max_parallel)
+        """Run a DAG with an optional once-per-terminal-outcome callback.
+
+        Callbacks run on this thread, outside poll workers. If one raises,
+        active jobs drain and ``BatchCallbackError.result`` preserves outcomes.
+        """
+        return run_command_batch(
+            self,
+            commands,
+            max_parallel=max_parallel,
+            on_command_complete=on_command_complete,
+        )
 
     def send(self, request: ExecRequest, *, async_job: bool | None = None) -> ExecResult:
         """Send an :class:`ExecRequest`, synchronously or as a background job.

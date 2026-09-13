@@ -7,7 +7,7 @@ import logging
 import math
 import time
 from collections import deque
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -161,6 +161,23 @@ class BatchResult:
         }
 
 
+CommandCompleteCallback = Callable[[CommandOutcome], None]
+
+
+class BatchCallbackError(RuntimeError):
+    """Completion delivery failed; ``result`` retains the native batch outcomes."""
+
+    def __init__(
+        self,
+        result: BatchResult,
+        failures: tuple[tuple[str, BaseException], ...],
+    ) -> None:
+        self.result = result
+        self.failures = failures
+        command_id, cause = failures[0]
+        super().__init__(f"command completion callback failed for {command_id!r}: {cause}")
+
+
 @dataclass(frozen=True)
 class BatchManifest:
     commands: tuple[CommandSpec, ...]
@@ -177,9 +194,9 @@ class _RunningCommand:
 
 def parse_batch_manifest(raw: str | bytes) -> BatchManifest:
     """Parse and validate the JSON representation accepted by the CLI."""
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8")
     try:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
         value = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise BatchValidationError(f"batch manifest is not valid JSON: {exc}") from exc
@@ -239,10 +256,18 @@ def run_many(
     commands: Iterable[CommandSpec],
     *,
     max_parallel: int = DEFAULT_MAX_PARALLEL,
+    on_command_complete: CommandCompleteCallback | None = None,
 ) -> BatchResult:
-    """Run a validated command DAG and return every terminal outcome."""
+    """Run a DAG, optionally delivering each terminal outcome on the caller thread.
+
+    Callback exceptions stop new submissions, but active jobs drain through the
+    native poll loop. ``BatchCallbackError.result`` retains every outcome.
+    Callbacks should do only small local work, not remote extraction.
+    """
     ordered = validate_commands(commands)
     max_parallel = _positive_int(max_parallel, "max_parallel")
+    if on_command_complete is not None and not callable(on_command_complete):
+        raise BatchValidationError("on_command_complete must be callable")
     started = time.monotonic()
     by_id = {command.id: command for command in ordered}
     dependents = _dependents(ordered)
@@ -251,6 +276,36 @@ def run_many(
     outcomes: dict[str, CommandOutcome] = {}
     running: dict[str, _RunningCommand] = {}
     polls: dict[Future[tuple[str | None, ExecResult]], str] = {}
+    notifications: deque[CommandOutcome] = deque()
+    callback_failures: list[tuple[str, BaseException]] = []
+
+    def record(outcome: CommandOutcome) -> None:
+        outcomes[outcome.id] = outcome
+        if on_command_complete is not None:
+            notifications.append(outcome)
+
+    def notify_terminal(*, interruptible: bool = True) -> None:
+        while notifications:
+            outcome = notifications.popleft()
+            assert on_command_complete is not None
+            try:
+                on_command_complete(outcome)
+            except BaseException as exc:
+                if interruptible and not isinstance(exc, Exception):
+                    raise
+                callback_failures.append((outcome.id, exc))
+                log.error("Command completion callback failed for %r: %s", outcome.id, exc)
+
+    def batch_result() -> BatchResult:
+        return BatchResult(
+            outcomes=tuple(outcomes[command.id] for command in ordered),
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+
+    def cancel_pending(error: str) -> None:
+        for command in ordered:
+            if command.id not in outcomes:
+                record(CommandOutcome(id=command.id, state="cancelled", error=error))
 
     def schedule_poll(command_id: str, *, delay_s: float = 0.0) -> None:
         active = running[command_id]
@@ -280,26 +335,29 @@ def run_many(
                 or outcomes.get(dependency, CommandOutcome(dependency, "pending")).state
                 in ("failed", "skipped", "cancelled")
             )
-            outcomes[command_id] = CommandOutcome(
-                id=command_id,
-                state="skipped",
-                error="dependency_failed",
-                skipped_due_to=causes or (failed_id,),
+            record(
+                CommandOutcome(
+                    id=command_id,
+                    state="skipped",
+                    error="dependency_failed",
+                    skipped_due_to=causes or (failed_id,),
+                )
             )
             queue.extend(dependents[command_id])
 
     def finish(command_id: str, outcome: CommandOutcome) -> None:
-        outcomes[command_id] = outcome
+        record(outcome)
         running.pop(command_id, None)
         if outcome.state != "succeeded":
             skip_descendants(command_id)
-            return
-        for dependent_id in dependents[command_id]:
-            if dependent_id in outcomes:
-                continue
-            remaining[dependent_id] -= 1
-            if remaining[dependent_id] == 0:
-                ready.append(dependent_id)
+        else:
+            for dependent_id in dependents[command_id]:
+                if dependent_id in outcomes:
+                    continue
+                remaining[dependent_id] -= 1
+                if remaining[dependent_id] == 0:
+                    ready.append(dependent_id)
+        notify_terminal()
 
     def cancel_running() -> None:
         for command_id, active in list(running.items()):
@@ -312,17 +370,19 @@ def run_many(
                     command_id,
                     exc,
                 )
-            outcomes[command_id] = CommandOutcome(
-                id=command_id,
-                state="cancelled",
-                error="batch_cancelled",
+            record(
+                CommandOutcome(
+                    id=command_id,
+                    state="cancelled",
+                    error="batch_cancelled",
+                )
             )
         running.clear()
 
     with ThreadPoolExecutor(max_workers=max_parallel, thread_name_prefix="privy-batch-poll") as pool:
         try:
-            while ready or running:
-                while ready and len(running) < max_parallel:
+            while (ready and not callback_failures) or running:
+                while ready and len(running) < max_parallel and not callback_failures:
                     command_id = ready.popleft()
                     if command_id in outcomes:
                         continue
@@ -419,16 +479,25 @@ def run_many(
                                 error=result.error or f"job ended in state {state!r}",
                             ),
                         )
-        except BaseException:
+            if callback_failures:
+                cancel_pending("batch_callback_failed")
+                notify_terminal()
+        except BaseException as exc:
             cancel_running()
             for future in polls:
                 future.cancel()
+            if on_command_complete is not None:
+                cancel_pending("batch_cancelled")
+                # Cleanup must reach every active job even if a callback also
+                # raises during interruption. Preserve the original exception.
+                notify_terminal(interruptible=False)
+                exc.batch_result = batch_result()
+                exc.batch_callback_failures = tuple(callback_failures)
             raise
 
-    return BatchResult(
-        outcomes=tuple(outcomes[command.id] for command in ordered),
-        duration_ms=int((time.monotonic() - started) * 1000),
-    )
+    if callback_failures:
+        raise BatchCallbackError(batch_result(), tuple(callback_failures)) from callback_failures[0][1]
+    return batch_result()
 
 
 def _transport_failure_result(

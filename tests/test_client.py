@@ -3,7 +3,7 @@ import json
 import pytest
 import requests
 
-from privy import _relay
+from privy import CommandSpec, _relay
 from privy.client import RelayClient
 from privy.protocol import ExecResponse
 from privy.proxy import ProxyClientServer
@@ -79,6 +79,23 @@ def test_client_redacts_token_from_transport_errors(monkeypatch):
     assert token not in str(exc.value)
     assert "sig%3D" not in str(exc.value)
     assert "sb-hc-token=<redacted>" in str(exc.value)
+
+
+def test_run_many_forwards_optional_terminal_callback(monkeypatch):
+    client = RelayClient(namespace="ns", path="path", keyrule="rule", key="key")
+    commands = [CommandSpec(id="one", kind="bash", code="unused")]
+    notified = []
+    callback = notified.append
+    returned = object()
+    calls = []
+
+    def run_batch(actual_client, actual_commands, **kwargs):
+        calls.append((actual_client, actual_commands, kwargs))
+        return returned
+
+    monkeypatch.setattr("privy.client.run_command_batch", run_batch)
+    assert client.run_many(commands, max_parallel=7, on_command_complete=callback) is returned
+    assert calls == [(client, commands, {"max_parallel": 7, "on_command_complete": callback})]
 
 
 def test_all_entry_points_accept_injected_tokens(monkeypatch):

@@ -12,7 +12,7 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from privy import __version__
 from privy._relay import (
@@ -23,12 +23,21 @@ from privy._relay import (
     create_sas_token,
     redact_relay_secrets,
 )
-from privy.batch import BatchResult, BatchValidationError, parse_batch_manifest
+from privy.batch import (
+    BatchCallbackError,
+    BatchManifest,
+    BatchResult,
+    BatchValidationError,
+    parse_batch_manifest,
+)
 from privy.client import RELAY_RESPONSE_LIMIT_S, ExecResult, RelayClient
 from privy.protocol import DEFAULT_TIMEOUT_S
 from privy.proxy import ProxyClientServer
 from privy.server import RelayServer
 from privy.transfer import DEFAULT_CHUNK_SIZE, TransferError, TransferResult
+
+if TYPE_CHECKING:
+    from privy.batch_results import BatchResultsWriter
 
 TOKEN_EXPIRED_EXIT_CODE = 3
 _SERVER_SECRET_ENV_VARS = (*RELAY_SECRET_ENV_VARS, "BASE64_ENV", "STORAGE_KEY")
@@ -573,6 +582,11 @@ each command's mode/timeout and may set max_parallel (default: 32).""",
     code.add_argument("--file", metavar="PATH", help="read code from PATH ('-' for stdin)")
     code.add_argument("--batch", metavar="PATH", help="read a JSON command DAG from PATH ('-' for stdin)")
     client.add_argument(
+        "--results-dir",
+        metavar="NEW_DIRECTORY",
+        help="with --batch, publish private terminal JSON artifacts in a new local directory",
+    )
+    client.add_argument(
         "--file-kind",
         choices=("python", "bash", "powershell"),
         default="python",
@@ -746,10 +760,22 @@ def _cmd_server(args: argparse.Namespace) -> int:
 
 
 def _cmd_client(args: argparse.Namespace) -> int:
+    if args.results_dir is not None and args.batch is None:
+        raise CliError("--results-dir requires --batch")
     client = RelayClient(**_resolve_relay(args))
     if args.batch is not None:
         if args.async_job is not None:
             raise CliError("--async-job/--no-async-job apply to single commands, not --batch")
+        if args.results_dir is not None:
+            if args.batch == "-":
+                raw = getattr(sys.stdin, "buffer", sys.stdin).read()
+            else:
+                try:
+                    raw = Path(args.batch).read_bytes()
+                except OSError as exc:
+                    raise CliError(f"cannot read batch manifest {args.batch}: {exc}") from exc
+            manifest = parse_batch_manifest(raw)
+            return _run_batch_with_results(client, args, manifest, raw)
         manifest = parse_batch_manifest(_read_text(args.batch, purpose="batch manifest"))
         return _emit_batch(
             client.run_many(manifest.commands, max_parallel=manifest.max_parallel),
@@ -771,6 +797,71 @@ def _cmd_client(args: argparse.Namespace) -> int:
             async_job=args.async_job,
         )
     return _emit(result, args.json)
+
+
+def _finish_batch_results(
+    writer: BatchResultsWriter,
+    result: BatchResult | None,
+    errors: list[tuple[str | None, str]],
+    *,
+    interrupted: bool = False,
+) -> bool:
+    from privy.batch_results import BatchResultsError
+
+    for command_id, error in errors:
+        print(f"privy: batch results failed [{command_id!r}]: {error}", file=sys.stderr)
+    try:
+        complete = writer.complete(result, errors=errors, interrupted=interrupted)
+    except BatchResultsError as exc:
+        print(f"privy: batch results failed: {exc}", file=sys.stderr)
+        return False
+    if not complete and not errors:
+        print("privy: batch results incomplete; see complete.json", file=sys.stderr)
+    return complete
+
+
+def _run_batch_with_results(
+    client: RelayClient,
+    args: argparse.Namespace,
+    manifest: BatchManifest,
+    raw: str | bytes,
+) -> int:
+    from privy.batch_results import BatchResultsError, BatchResultsWriter
+
+    try:
+        writer = BatchResultsWriter(
+            args.results_dir, manifest, source=args.batch, raw_manifest=raw,
+        )
+    except BatchResultsError as exc:
+        raise CliError(str(exc)) from exc
+    with writer:
+        errors: list[tuple[str | None, str]] = []
+        try:
+            result = client.run_many(
+                manifest.commands,
+                max_parallel=manifest.max_parallel,
+                on_command_complete=writer.write_outcome,
+            )
+        except BatchCallbackError as exc:
+            result = exc.result
+            errors = [(command_id, str(error)) for command_id, error in exc.failures]
+        except BaseException as exc:
+            result = getattr(exc, "batch_result", None)
+            if result is not None:
+                _emit_batch(result, args.json)
+            errors = [
+                (command_id, str(error))
+                for command_id, error in getattr(exc, "batch_callback_failures", ())
+            ]
+            errors.append((None, f"{type(exc).__name__}: {exc}"))
+            _finish_batch_results(writer, result, errors, interrupted=isinstance(exc, KeyboardInterrupt))
+            raise
+        # The side channel must never suppress the native final response,
+        # including when publishing complete.json itself fails.
+        exit_code = _emit_batch(result, args.json)
+        if not _finish_batch_results(writer, result, errors):
+            return 1
+        return exit_code
 
 
 def _cmd_proxy(args: argparse.Namespace) -> int:
