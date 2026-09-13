@@ -18,6 +18,9 @@ if TYPE_CHECKING:
     from privy.client import ExecResult, RelayClient
 
 DEFAULT_MAX_PARALLEL = 32
+POLL_RETRY_LIMIT = 3
+POLL_RETRY_BACKOFF_S = 0.25
+POLL_DEADLINE_GRACE_S = 60.0
 log = logging.getLogger("privy.batch")
 
 CommandState = Literal["pending", "running", "succeeded", "failed", "skipped", "cancelled"]
@@ -164,6 +167,14 @@ class BatchManifest:
     max_parallel: int = DEFAULT_MAX_PARALLEL
 
 
+@dataclass
+class _RunningCommand:
+    command: CommandSpec
+    job_id: str
+    deadline: float
+    poll_failures: int = 0
+
+
 def parse_batch_manifest(raw: str | bytes) -> BatchManifest:
     """Parse and validate the JSON representation accepted by the CLI."""
     if isinstance(raw, bytes):
@@ -238,8 +249,23 @@ def run_many(
     remaining = {command.id: len(command.depends_on) for command in ordered}
     ready = deque(command.id for command in ordered if not command.depends_on)
     outcomes: dict[str, CommandOutcome] = {}
-    running: dict[str, tuple[CommandSpec, str]] = {}
+    running: dict[str, _RunningCommand] = {}
     polls: dict[Future[tuple[str | None, ExecResult]], str] = {}
+
+    def schedule_poll(command_id: str, *, delay_s: float = 0.0) -> None:
+        active = running[command_id]
+
+        def poll() -> tuple[str | None, ExecResult]:
+            if delay_s:
+                time.sleep(delay_s)
+            return client.poll(
+                active.command.to_request(),
+                active.job_id,
+                wait_s=min(DEFAULT_POLL_WAIT_S, max(1.0, active.command.timeout_s)),
+            )
+
+        future = pool.submit(poll)
+        polls[future] = command_id
 
     def skip_descendants(failed_id: str) -> None:
         queue = deque(dependents[failed_id])
@@ -276,11 +302,16 @@ def run_many(
                 ready.append(dependent_id)
 
     def cancel_running() -> None:
-        for command_id, (command, job_id) in list(running.items()):
+        for command_id, active in list(running.items()):
             try:
-                client.cancel(command.to_request(), job_id)
+                client.cancel(active.command.to_request(), active.job_id)
             except Exception as exc:
-                log.warning("Failed to cancel job %s for command %s: %s", job_id, command_id, exc)
+                log.warning(
+                    "Failed to cancel job %s for command %s: %s",
+                    active.job_id,
+                    command_id,
+                    exc,
+                )
             outcomes[command_id] = CommandOutcome(
                 id=command_id,
                 state="cancelled",
@@ -308,14 +339,12 @@ def run_many(
                             ),
                         )
                         continue
-                    running[command_id] = (command, job_id)
-                    future = pool.submit(
-                        client.poll,
-                        command.to_request(),
-                        job_id,
-                        wait_s=min(DEFAULT_POLL_WAIT_S, max(1.0, command.timeout_s)),
+                    running[command_id] = _RunningCommand(
+                        command=command,
+                        job_id=job_id,
+                        deadline=time.monotonic() + command.timeout_s + POLL_DEADLINE_GRACE_S,
                     )
-                    polls[future] = command_id
+                    schedule_poll(command_id)
 
                 if not running:
                     continue
@@ -324,35 +353,55 @@ def run_many(
                     command_id = polls.pop(future)
                     if command_id not in running:
                         continue
-                    command, job_id = running[command_id]
+                    active = running[command_id]
                     try:
                         state, result = future.result()
                     except Exception as exc:
-                        try:
-                            client.cancel(command.to_request(), job_id)
-                        except Exception as cancel_exc:
-                            log.warning(
-                                "Failed to cancel job %s after poll failure: %s",
-                                job_id,
-                                cancel_exc,
+                        active.poll_failures += 1
+                        if active.poll_failures <= POLL_RETRY_LIMIT and time.monotonic() < active.deadline:
+                            schedule_poll(
+                                command_id,
+                                delay_s=min(
+                                    POLL_RETRY_BACKOFF_S * (2 ** (active.poll_failures - 1)),
+                                    max(0.0, active.deadline - time.monotonic()),
+                                ),
                             )
+                            continue
+                        error = f"poll failed for job {active.job_id}: {exc}"
                         finish(
                             command_id,
                             CommandOutcome(
                                 id=command_id,
                                 state="failed",
-                                error=f"poll failed: {exc}",
+                                result=_transport_failure_result(
+                                    active.job_id,
+                                    error,
+                                    started,
+                                ),
+                                error=error,
                             ),
                         )
                         continue
+                    active.poll_failures = 0
                     if state == "running":
-                        next_poll = pool.submit(
-                            client.poll,
-                            command.to_request(),
-                            job_id,
-                            wait_s=min(DEFAULT_POLL_WAIT_S, max(1.0, command.timeout_s)),
-                        )
-                        polls[next_poll] = command_id
+                        if time.monotonic() >= active.deadline:
+                            error = f"poll deadline exceeded for job {active.job_id}"
+                            finish(
+                                command_id,
+                                CommandOutcome(
+                                    id=command_id,
+                                    state="failed",
+                                    result=_transport_failure_result(
+                                        active.job_id,
+                                        error,
+                                        started,
+                                        timed_out=True,
+                                    ),
+                                    error=error,
+                                ),
+                            )
+                        else:
+                            schedule_poll(command_id)
                         continue
                     if state == "done" and result.ok:
                         finish(
@@ -379,6 +428,28 @@ def run_many(
     return BatchResult(
         outcomes=tuple(outcomes[command.id] for command in ordered),
         duration_ms=int((time.monotonic() - started) * 1000),
+    )
+
+
+def _transport_failure_result(
+    job_id: str,
+    error: str,
+    batch_started: float,
+    *,
+    timed_out: bool = False,
+) -> ExecResult:
+    from privy.client import ExecResult
+
+    return ExecResult(
+        exit_code=1,
+        stdout="",
+        stderr=error + "\n",
+        stdout_bytes=b"",
+        stderr_bytes=(error + "\n").encode(),
+        duration_ms=int((time.monotonic() - batch_started) * 1000),
+        timed_out=timed_out,
+        error="poll_transport" if not timed_out else "poll_deadline",
+        job_id=job_id,
     )
 
 

@@ -522,6 +522,8 @@ class _InprocessRun:
         self.error: str | None = None
         self._state_lock = threading.Lock()
         self._cancel_requested = False
+        self._finished = False
+        self._interruptible = False
         self.thread = threading.Thread(target=self._target, name="privy-inprocess", daemon=True)
 
     def start(self) -> bool:
@@ -535,12 +537,15 @@ class _InprocessRun:
         self.thread.join(timeout=timeout)
         return not self.thread.is_alive()
 
-    def interrupt(self) -> None:
+    def interrupt(self) -> bool:
         with self._state_lock:
             self._cancel_requested = True
-            started = self.thread.ident is not None
-        if started:
+            if self._finished:
+                return False
+            if not self._interruptible:
+                return True
             _try_async_raise(self.thread, KeyboardInterrupt)
+            return True
 
     def output(self) -> tuple[bytes, bytes]:
         return self._stdout_buf.getvalue(), self._stderr_buf.getvalue()
@@ -552,6 +557,12 @@ class _InprocessRun:
             out_router.register(self._stdout_text)
             err_router.register(self._stderr_text)
             try:
+                with self._state_lock:
+                    if self._cancel_requested:
+                        self.exit_code = 130
+                        self.error = "cancelled"
+                        return
+                    self._interruptible = True
                 try:
                     compiled = compile(self._code, "<privy-inprocess>", "exec")
                     exec(compiled, _INPROCESS_GLOBALS)
@@ -565,6 +576,9 @@ class _InprocessRun:
                     self.exit_code = 1
                     self.error = "exception"
             finally:
+                with self._state_lock:
+                    self._interruptible = False
+                    self._finished = True
                 self._stdout_text.flush()
                 self._stderr_text.flush()
                 out_router.unregister()
@@ -636,6 +650,8 @@ def _run_inprocess_python(
 
 
 def _try_async_raise(thread: threading.Thread, exc_type: type[BaseException]) -> None:
+    if not thread.is_alive():
+        return
     tid = thread.ident
     if tid is None:
         return
@@ -681,43 +697,56 @@ class _Job:
 
     def _target(self) -> None:
         start = time.monotonic()
-        with self._lock:
-            cancelled = self.cancelled
-        if cancelled:
+        resp: ExecResponse | None = None
+        try:
+            with self._lock:
+                cancelled = self.cancelled
+            if cancelled:
+                resp = ExecResponse.from_output(
+                    exit_code=130,
+                    stdout=b"",
+                    stderr=b"",
+                    duration_ms=0,
+                    error="cancelled",
+                )
+            elif self.request.mode == "inprocess":
+                resp = _run_inprocess_python(
+                    self.request.code,
+                    self.request.timeout_s,
+                    start,
+                    on_run=self._adopt_run,
+                )
+            else:
+                resp = _run_subprocess(
+                    self.request.kind,
+                    self.request.code,
+                    self.request.timeout_s,
+                    start,
+                    on_proc=self._adopt_proc,
+                )
+        except BaseException as exc:  # noqa: BLE001 - a job must always become terminal
             resp = ExecResponse.from_output(
-                exit_code=130,
+                exit_code=130 if isinstance(exc, KeyboardInterrupt) else 1,
                 stdout=b"",
-                stderr=b"",
-                duration_ms=0,
-                error="cancelled",
+                stderr=("job error: " + traceback.format_exc()).encode("utf-8", "replace"),
+                duration_ms=int((time.monotonic() - start) * 1000),
+                error=type(exc).__name__,
             )
-        else:
-            try:
-                if self.request.mode == "inprocess":
-                    resp = _run_inprocess_python(
-                        self.request.code,
-                        self.request.timeout_s,
-                        start,
-                        on_run=self._adopt_run,
-                    )
-                else:
-                    resp = _run_subprocess(
-                        self.request.kind,
-                        self.request.code,
-                        self.request.timeout_s,
-                        start,
-                        on_proc=self._adopt_proc,
-                    )
-            except Exception as exc:  # noqa: BLE001 - safety net
+        finally:
+            if resp is None:  # pragma: no cover - defensive against interrupted exception handling
                 resp = ExecResponse.from_output(
                     exit_code=1,
                     stdout=b"",
-                    stderr=("job error: " + traceback.format_exc()).encode("utf-8", "replace"),
+                    stderr=b"job supervisor terminated without a response\n",
                     duration_ms=int((time.monotonic() - start) * 1000),
-                    error=type(exc).__name__,
+                    error="supervisor_terminated",
                 )
+            self._finish(resp)
 
+    def _finish(self, resp: ExecResponse) -> None:
         with self._lock:
+            if self.response is not None:
+                return
             self.response = resp
             self.finished_at = time.monotonic()
             self._run = None
@@ -728,6 +757,21 @@ class _Job:
         if done is not None:
             done.set()
         _reap_jobs()
+
+    def _terminalize_dead_supervisor(self) -> None:
+        with self._lock:
+            thread = self._thread
+            if self.response is not None or thread is None or thread.is_alive():
+                return
+        self._finish(
+            ExecResponse.from_output(
+                exit_code=1,
+                stdout=b"",
+                stderr=b"job supervisor exited without publishing a response\n",
+                duration_ms=int((time.monotonic() - self.created_at) * 1000),
+                error="supervisor_terminated",
+            )
+        )
 
     def _adopt_run(self, run: _InprocessRun) -> bool:
         with self._lock:
@@ -741,18 +785,32 @@ class _Job:
         if cancelled:
             _terminate_process_tree(proc)
 
-    def cancel(self) -> None:
+    def cancel(self) -> bool:
+        terminate_proc: subprocess.Popen | None = None
         with self._lock:
-            self.cancelled = True
-            run = self._run
-            proc = self._proc
-        if run is not None:
-            run.interrupt()
-        if proc is not None:
+            if self.response is not None or self.finished_at is not None:
+                return False
+            if self._run is not None:
+                if not self._run.interrupt():
+                    return False
+                self.cancelled = True
+                return True
+            if self._proc is not None:
+                if self._proc.poll() is not None:
+                    return False
+                self.cancelled = True
+                terminate_proc = self._proc
+            elif self._thread is not None and (self._thread.ident is None or self._thread.is_alive()):
+                self.cancelled = True
+                return True
+            else:
+                return False
+        if terminate_proc is not None:
             try:
-                _terminate_process_tree(proc)
+                _terminate_process_tree(terminate_proc)
             except Exception:  # pragma: no cover
                 pass
+        return True
 
 
 _JOBS: dict[str, _Job] = {}
@@ -818,9 +876,11 @@ def poll_job(job_id: str, wait_s: float = DEFAULT_POLL_WAIT_S) -> ExecResponse:
             state="missing",
         )
 
+    job._terminalize_dead_supervisor()
     done = job.done
     if done is not None:
         done.wait(timeout=max(0.0, min(wait_s, MAX_POLL_WAIT_S)))
+    job._terminalize_dead_supervisor()
     if job.response is None:
         return ExecResponse.from_output(
             exit_code=0,
@@ -839,9 +899,9 @@ def poll_job(job_id: str, wait_s: float = DEFAULT_POLL_WAIT_S) -> ExecResponse:
 
 
 def cancel_job(job_id: str) -> ExecResponse:
-    """Best-effort interrupt of a running job; always forgets the handle."""
+    """Best-effort interrupt of a running job without discarding its result."""
     with _JOBS_LOCK:
-        job = _JOBS.pop(job_id, None)
+        job = _JOBS.get(job_id)
     if job is None:
         return ExecResponse.from_output(
             exit_code=1,
@@ -852,7 +912,8 @@ def cancel_job(job_id: str) -> ExecResponse:
             job_id=job_id,
             state="missing",
         )
-    job.cancel()
+    if not job.cancel():
+        return poll_job(job_id, wait_s=0)
     return ExecResponse.from_output(
         exit_code=0,
         stdout=b"",

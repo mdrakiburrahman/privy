@@ -214,8 +214,17 @@ class RelayCredential:
         return token, validate_sas_token(token, self.namespace, self.path)
 
 
-def create_listen_url(service_namespace: str, entity_path: str, token: str | None = None) -> str:
-    url = f"wss://{service_namespace}/$hc/{entity_path}?sb-hc-action=listen&sb-hc-id=privy"
+def create_listen_url(
+    service_namespace: str,
+    entity_path: str,
+    token: str | None = None,
+    *,
+    connection_id: str = "privy",
+) -> str:
+    url = (
+        f"wss://{service_namespace}/$hc/{entity_path}?sb-hc-action=listen"
+        f"&sb-hc-id={urllib.parse.quote(connection_id, safe='')}"
+    )
     if token:
         url += "&sb-hc-token=" + urllib.parse.quote(token)
     return url

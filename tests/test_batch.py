@@ -207,3 +207,71 @@ def test_keyboard_interrupt_cancels_active_jobs():
         run_many(client, [CommandSpec(id="one", kind="bash", code="sleep 10")])
 
     assert client.cancelled == ["job-one"]
+
+
+def test_transient_poll_failures_retry_without_cancelling():
+    class FlakyPollClient:
+        def __init__(self):
+            self.polls = 0
+            self.cancelled = []
+
+        def submit(self, request):
+            return "original-job"
+
+        def poll(self, request, job_id, *, wait_s):
+            self.polls += 1
+            if self.polls <= 2:
+                raise RuntimeError("transient relay disconnect")
+            return "done", ExecResult(
+                exit_code=0,
+                stdout="ok",
+                stderr="",
+                stdout_bytes=b"ok",
+                stderr_bytes=b"",
+                duration_ms=1,
+                timed_out=False,
+                error=None,
+                job_id=job_id,
+            )
+
+        def cancel(self, request, job_id):
+            self.cancelled.append(job_id)
+
+    client = FlakyPollClient()
+
+    result = run_many(client, [CommandSpec(id="one", kind="bash", code="true")])
+
+    assert result.ok
+    assert client.polls == 3
+    assert client.cancelled == []
+    assert result.outcomes[0].result.job_id == "original-job"
+
+
+def test_terminal_poll_failure_retains_job_id_without_cancelling():
+    class FailedPollClient:
+        def __init__(self):
+            self.polls = 0
+            self.cancelled = []
+
+        def submit(self, request):
+            return "reconcile-me"
+
+        def poll(self, request, job_id, *, wait_s):
+            self.polls += 1
+            raise RuntimeError("relay unavailable")
+
+        def cancel(self, request, job_id):
+            self.cancelled.append(job_id)
+
+    client = FailedPollClient()
+
+    result = run_many(client, [CommandSpec(id="one", kind="bash", code="true")])
+    outcome = result.outcomes[0]
+
+    assert outcome.state == "failed"
+    assert outcome.result is not None
+    assert outcome.result.job_id == "reconcile-me"
+    assert outcome.result.error == "poll_transport"
+    assert "reconcile-me" in (outcome.error or "")
+    assert client.polls == 4
+    assert client.cancelled == []

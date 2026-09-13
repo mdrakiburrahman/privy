@@ -26,7 +26,10 @@ import json
 import logging
 import threading
 import time
+import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any
 
 import websocket
@@ -151,6 +154,46 @@ def _log_response(resp: ExecResponse, request_id: Any) -> None:
     log.info("\n".join(parts))
 
 
+@dataclass(frozen=True)
+class _PendingInlineResponse:
+    request_id: Any
+    body_json: str
+
+
+class _InlineResponsePump:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending: deque[_PendingInlineResponse] = deque()
+        self._ready = threading.Event()
+        self._closed = False
+
+    def submit(self, request_id: Any, body_json: str) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            self._pending.append(_PendingInlineResponse(request_id, body_json))
+            self._ready.set()
+            return True
+
+    def drain(self) -> list[_PendingInlineResponse]:
+        with self._lock:
+            pending = list(self._pending)
+            self._pending.clear()
+            self._ready.clear()
+            return pending
+
+    def has_pending(self) -> bool:
+        return self._ready.is_set()
+
+    def close(self) -> int:
+        with self._lock:
+            self._closed = True
+            dropped = len(self._pending)
+            self._pending.clear()
+            self._ready.clear()
+            return dropped
+
+
 class RelayServer:
     """Long-running listener that executes requests arriving via Azure Relay.
 
@@ -180,6 +223,7 @@ class RelayServer:
         token: TokenProvider | None = None,
         ttl_seconds: int = DEFAULT_TOKEN_TTL_SECONDS,
         max_workers: int = 32,
+        listener_connections: int = 1,
         recv_timeout_s: float = 1.0,
         proxy_target: str | None = None,
         inprocess_globals: dict[str, Any] | None = None,
@@ -195,22 +239,35 @@ class RelayServer:
             token=token,
             ttl_seconds=ttl_seconds,
         )
+        if (
+            isinstance(listener_connections, bool)
+            or not isinstance(listener_connections, int)
+            or not 1 <= listener_connections <= 25
+        ):
+            raise ValueError("listener_connections must be between 1 and 25")
         self._max_workers = max_workers
+        self._listener_connections = listener_connections
+        server_id = uuid.uuid4().hex
+        self._listener_connection_ids = tuple(
+            f"privy-{server_id}-{index + 1}" for index in range(listener_connections)
+        )
         self._recv_timeout_s = recv_timeout_s
         self._proxy_target = proxy_target
         self._token_expires_at: int | None = None
 
-        if inprocess_globals:
-            # Lets the host notebook expose live objects (e.g. Fabric's
-            # `spark`/`sc`) to code later submitted with mode="inprocess".
-            seed_inprocess_globals(inprocess_globals)
+        seed_inprocess_globals(
+            {
+                **(inprocess_globals or {}),
+                "_privy_relay_server": self,
+            }
+        )
 
         self._stop = threading.Event()
         self._listening = threading.Event()
+        self._listener_state_lock = threading.Lock()
+        self._active_listener_count = 0
+        self._fatal_error: BaseException | None = None
         self._pool: ThreadPoolExecutor | None = None
-        # The control websocket is a single byte stream: only one writer at a
-        # time may emit a (response frame, body frame) pair.
-        self._send_lock = threading.Lock()
 
     # ---- lifecycle -----------------------------------------------------
 
@@ -219,35 +276,43 @@ class RelayServer:
         self._stop.set()
 
     def wait_until_listening(self, timeout: float | None = None) -> bool:
-        """Block until the listener websocket is connected (useful for tests)."""
+        """Block until every configured listener websocket is connected."""
         return self._listening.wait(timeout)
 
+    @property
+    def active_listener_connections(self) -> int:
+        with self._listener_state_lock:
+            return self._active_listener_count
+
     def serve_forever(self) -> None:
-        """Run the listen loop forever, reconnecting with exponential backoff."""
+        """Run listener connections forever, reconnecting each independently."""
         _ensure_default_logging()
-        backoff = 1.0
         self._pool = ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="privy-worker")
+        listeners = [
+            threading.Thread(
+                target=self._serve_listener,
+                args=(index,),
+                name=f"privy-listener-{index + 1}",
+                daemon=True,
+            )
+            for index in range(self._listener_connections)
+        ]
         try:
-            while not self._stop.is_set():
-                try:
-                    self._serve_once()
-                    backoff = 1.0
-                except KeyboardInterrupt:
-                    log.info("Exiting listener.")
-                    return
-                except RelayTokenError:
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    log.warning(
-                        "Listener error (%s: %s). Reconnecting in %ss…",
-                        type(exc).__name__,
-                        redact_relay_secrets(str(exc)),
-                        backoff,
-                    )
-                    if self._stop.wait(backoff):
-                        return
-                    backoff = min(backoff * 2, 30.0)
+            for listener in listeners:
+                listener.start()
+            while not self._stop.wait(0.1):
+                if self._fatal_error is not None:
+                    raise self._fatal_error
+                if not any(listener.is_alive() for listener in listeners):
+                    raise RuntimeError("all Azure Relay listener threads exited")
+            if self._fatal_error is not None:
+                raise self._fatal_error
+        except KeyboardInterrupt:
+            log.info("Exiting listener.")
         finally:
+            self.stop()
+            for listener in listeners:
+                listener.join(timeout=max(1.0, self._recv_timeout_s + 1.0))
             if self._pool is not None:
                 self._pool.shutdown(wait=False, cancel_futures=True)
                 self._pool = None
@@ -255,32 +320,76 @@ class RelayServer:
 
     # ---- internals -----------------------------------------------------
 
-    def _listen_url(self) -> str:
+    def _serve_listener(self, index: int) -> None:
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                self._serve_once(index)
+                backoff = 1.0
+            except RelayTokenError as exc:
+                with self._listener_state_lock:
+                    if self._fatal_error is None:
+                        self._fatal_error = exc
+                self._stop.set()
+                return
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Listener %s error (%s: %s). Reconnecting in %ss…",
+                    index + 1,
+                    type(exc).__name__,
+                    redact_relay_secrets(str(exc)),
+                    backoff,
+                )
+                if self._stop.wait(backoff):
+                    return
+                backoff = min(backoff * 2, 30.0)
+
+    def _listener_connected(self) -> None:
+        with self._listener_state_lock:
+            self._active_listener_count += 1
+            if self._active_listener_count == self._listener_connections:
+                self._listening.set()
+
+    def _listener_disconnected(self) -> None:
+        with self._listener_state_lock:
+            self._active_listener_count = max(0, self._active_listener_count - 1)
+            if self._active_listener_count < self._listener_connections:
+                self._listening.clear()
+
+    def _listen_url(self, index: int = 0) -> str:
         token, claims = self._credential.resolve()
         self._token_expires_at = claims["se"]
         return create_listen_url(
             self._credential.namespace,
             self._credential.path,
             token,
+            connection_id=self._listener_connection_ids[index],
         )
 
-    def _serve_once(self) -> None:
-        ws = websocket.create_connection(self._listen_url())
+    def _serve_once(self, index: int = 0) -> None:
+        ws = websocket.create_connection(self._listen_url(index))
         ws.settimeout(self._recv_timeout_s)
-        self._listening.set()
+        self._listener_connected()
         remaining = max(0, (self._token_expires_at or 0) - int(time.time()))
         log.info(
-            "Listening on Azure Relay: wss://%s/$hc/%s (token valid for %s)",
+            "Listener %s/%s connected to Azure Relay: wss://%s/$hc/%s (token valid for %s)",
+            index + 1,
+            self._listener_connections,
             self._credential.namespace,
             self._credential.path,
             _format_lifetime(remaining),
         )
+        inline_responses = _InlineResponsePump()
 
         try:
             while not self._stop.is_set():
+                if inline_responses.has_pending():
+                    self._flush_inline_responses(ws, inline_responses)
+                    continue
                 try:
                     raw = ws.recv()
                 except websocket.WebSocketTimeoutException:
+                    self._flush_inline_responses(ws, inline_responses)
                     continue
                 if raw is None or raw == "":
                     log.warning("Control channel closed by peer.")
@@ -301,7 +410,7 @@ class RelayServer:
                     # Inline mode: body (if any) comes on the same control
                     # socket, and the response goes back on it too. Read the
                     # body here (ordering matters), then execute off-thread.
-                    self._handle_inline(ws, req_meta)
+                    self._handle_inline(ws, req_meta, inline_responses)
                 else:
                     # Rendezvous mode: hand off to a worker which opens a
                     # dedicated sub-websocket per request, leaving the
@@ -309,8 +418,12 @@ class RelayServer:
                     if self._pool is None:  # pragma: no cover
                         raise RuntimeError("worker pool not initialised")
                     self._pool.submit(self._handle_rendezvous, req_meta)
+                self._flush_inline_responses(ws, inline_responses)
         finally:
-            self._listening.clear()
+            self._listener_disconnected()
+            dropped = inline_responses.close()
+            if dropped:
+                log.warning("Dropping %s inline response(s) on control-channel loss.", dropped)
             try:
                 ws.close()
             except Exception:  # pragma: no cover
@@ -321,7 +434,12 @@ class RelayServer:
     #   2) execute the request
     #   3) write a response frame (+ body frame) back on `opws`
 
-    def _handle_inline(self, ws: websocket.WebSocket, req_meta: dict[str, Any]) -> None:
+    def _handle_inline(
+        self,
+        ws: websocket.WebSocket,
+        req_meta: dict[str, Any],
+        inline_responses: _InlineResponsePump | None = None,
+    ) -> None:
         try:
             payload_raw = self._maybe_recv_body(ws, req_meta)
         except Exception as exc:  # noqa: BLE001
@@ -334,7 +452,12 @@ class RelayServer:
             try:
                 result = self._execute(payload_raw, request_id=request_id)
                 body = result if isinstance(result, str) else result.to_json()
-                self._send_inline_response(ws, req_meta, request_id, body)
+                if inline_responses is None:
+                    self._send_inline_response(ws, req_meta, request_id, body)
+                elif len(body.encode("utf-8")) > CONTROL_CHANNEL_BODY_LIMIT:
+                    self._send_inline_response(ws, req_meta, request_id, body)
+                elif not inline_responses.submit(request_id, body):
+                    log.warning("Dropping inline response %s after control-channel loss.", request_id)
             except Exception as exc:  # noqa: BLE001
                 log.error(
                     "inline request handler crashed (%s: %s)",
@@ -346,6 +469,14 @@ class RelayServer:
             work()
         else:
             self._pool.submit(work)
+
+    def _flush_inline_responses(
+        self,
+        ws: websocket.WebSocket,
+        inline_responses: _InlineResponsePump,
+    ) -> None:
+        for pending in inline_responses.drain():
+            self._send_response(ws, pending.request_id, pending.body_json)
 
     def _handle_rendezvous(self, req_meta: dict[str, Any]) -> None:
         addr = req_meta.get("address")
@@ -393,8 +524,7 @@ class RelayServer:
         body_json: str,
     ) -> None:
         if len(body_json.encode("utf-8")) <= CONTROL_CHANNEL_BODY_LIMIT:
-            with self._send_lock:
-                self._send_response(control_ws, request_id, body_json)
+            self._send_response(control_ws, request_id, body_json)
             return
 
         address = req_meta.get("address")

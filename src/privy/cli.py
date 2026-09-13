@@ -215,6 +215,7 @@ def _reexec_server(relay: dict[str, Any], args: argparse.Namespace) -> None:
         {
             "relay": relay,
             "max_workers": args.max_workers,
+            "listener_connections": getattr(args, "listener_connections", 1),
             "recv_timeout_s": args.recv_timeout_s,
             "proxy_target": args.proxy_target,
         },
@@ -280,7 +281,7 @@ def _reexec_server(relay: dict[str, Any], args: argparse.Namespace) -> None:
     raise RuntimeError("server credential re-exec unexpectedly returned")
 
 
-def _read_server_config(fd: int) -> tuple[dict[str, Any], int, float, str | None]:
+def _read_server_config(fd: int) -> tuple[dict[str, Any], int, int, float, str | None]:
     if fd < 0:
         raise CliError("server credential descriptor must be non-negative")
     try:
@@ -305,11 +306,17 @@ def _read_server_config(fd: int) -> tuple[dict[str, Any], int, float, str | None
         if not isinstance(relay.get(name), str) or not relay[name]:
             raise CliError(f"server credential payload has invalid {name}")
     max_workers = _config_positive_int(value.get("max_workers"), "max_workers")
+    listener_connections = _config_positive_int(
+        value.get("listener_connections"),
+        "listener_connections",
+    )
+    if listener_connections > 25:
+        raise CliError("server credential payload has invalid listener_connections")
     recv_timeout_s = _config_positive_float(value.get("recv_timeout_s"), "recv_timeout_s")
     proxy_target = value.get("proxy_target")
     if proxy_target is not None and not isinstance(proxy_target, str):
         raise CliError("server credential payload has invalid proxy_target")
-    return relay, max_workers, recv_timeout_s, proxy_target
+    return relay, max_workers, listener_connections, recv_timeout_s, proxy_target
 
 
 def _harden_server_process() -> None:
@@ -510,6 +517,14 @@ Examples:
     _add_relay_args(server)
     server.add_argument("--max-workers", type=_positive_int, default=32, help="worker threads")
     server.add_argument(
+        "--listener-connections",
+        type=_positive_int,
+        choices=range(1, 26),
+        default=1,
+        metavar="1..25",
+        help="concurrent Azure Relay listener connections",
+    )
+    server.add_argument(
         "--recv-timeout-s",
         type=_positive_float,
         default=1.0,
@@ -706,16 +721,20 @@ def _cmd_server(args: argparse.Namespace) -> int:
         if _server_reexec_required():
             _reexec_server(relay, args)
         max_workers = args.max_workers
+        listener_connections = args.listener_connections
         recv_timeout_s = args.recv_timeout_s
         proxy_target = args.proxy_target
     else:
-        relay, max_workers, recv_timeout_s, proxy_target = _read_server_config(args._credential_fd)
+        relay, max_workers, listener_connections, recv_timeout_s, proxy_target = _read_server_config(
+            args._credential_fd
+        )
     for name in _SERVER_SECRET_ENV_VARS:
         os.environ.pop(name, None)
     _harden_server_process()
     server = RelayServer(
         **relay,
         max_workers=max_workers,
+        listener_connections=listener_connections,
         recv_timeout_s=recv_timeout_s,
         proxy_target=proxy_target,
     )

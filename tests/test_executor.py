@@ -1,6 +1,7 @@
 import ctypes
 import os
 import shutil
+import threading
 import time
 
 import pytest
@@ -307,8 +308,9 @@ def test_cancel_job():
     submitted = execute(ExecRequest(kind="bash", code="sleep 30", action="submit"))
     cancelled = cancel_job(submitted.job_id or "")
     assert cancelled.state == "cancelled"
-    # Handle is forgotten, so a later poll no longer knows about it.
-    assert poll_job(submitted.job_id or "", wait_s=0.1).state == "missing"
+    # The handle stays available so callers can reconcile ambiguous transport
+    # failures without losing the original job identity.
+    assert poll_job(submitted.job_id or "", wait_s=0.1).state == "cancelled"
 
 
 def test_job_cancelled_before_start_does_not_execute(monkeypatch):
@@ -368,6 +370,78 @@ def test_completed_job_releases_execution_resources():
     assert job.done is None
 
     cancel_job(submitted.job_id)
+
+
+def test_async_raise_ignores_dead_thread_with_retained_ident(monkeypatch):
+    calls = []
+
+    class DeadThread:
+        ident = 12345
+
+        @staticmethod
+        def is_alive():
+            return False
+
+    monkeypatch.setattr(
+        "privy.executor.ctypes.pythonapi.PyThreadState_SetAsyncExc",
+        lambda *args: calls.append(args),
+    )
+
+    from privy.executor import _try_async_raise
+
+    _try_async_raise(DeadThread(), KeyboardInterrupt)
+
+    assert calls == []
+
+
+def test_completed_inprocess_run_cannot_be_interrupted(monkeypatch):
+    calls = []
+    run = _InprocessRun("pass")
+    assert run.start()
+    assert run.join(timeout=2)
+    monkeypatch.setattr(
+        "privy.executor.ctypes.pythonapi.PyThreadState_SetAsyncExc",
+        lambda *args: calls.append(args),
+    )
+
+    assert run.interrupt() is False
+    assert calls == []
+
+
+def test_job_base_exception_terminalizes_as_failure(monkeypatch):
+    def interrupt_supervisor(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("privy.executor._run_subprocess", interrupt_supervisor)
+    submitted = execute(ExecRequest(kind="python", code="pass", action="submit"))
+
+    final = _drain(submitted.job_id or "")
+
+    assert final.state == "done"
+    assert final.exit_code == 130
+    assert final.error == "KeyboardInterrupt"
+    assert b"KeyboardInterrupt" in final.stderr
+
+
+def test_poll_terminalizes_dead_supervisor_without_response():
+    job = _Job(ExecRequest(kind="python", code="pass"))
+    worker = job._thread
+    assert worker is not None
+    worker.start()
+    worker.join(timeout=2)
+    with job._lock:
+        job.response = None
+        job.finished_at = None
+        job.done = threading.Event()
+        job._thread = worker
+    with _JOBS_LOCK:
+        _JOBS[job.id] = job
+
+    final = poll_job(job.id, wait_s=0)
+
+    assert final.state == "done"
+    assert final.exit_code == 1
+    assert final.error == "supervisor_terminated"
 
 
 def test_concurrent_inprocess_output_is_not_interleaved():

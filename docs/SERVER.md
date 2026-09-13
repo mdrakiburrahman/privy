@@ -90,6 +90,14 @@ change retention. Restarting the listener loses in-memory job handles.
 Each long poll occupies a server worker. Keep `max_workers` above expected concurrent client
 polling; the default is 32.
 
+For wide batches, use multiple Relay ingress connections so long polls are spread across control
+channels instead of depending on one socket. Azure Relay supports up to 25 listeners per Hybrid
+Connection:
+
+```bash
+privy server --max-workers 64 --listener-connections 25
+```
+
 ## Token refresh and expiry
 
 Pass a callable for long-lived listeners:
