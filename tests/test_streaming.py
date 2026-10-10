@@ -65,7 +65,7 @@ def test_stream_keeps_stdout_and_stderr_separate_and_final_is_tail_only():
 
 def test_retry_with_same_offsets_is_idempotent_and_ack_frees_memory():
     job = _submit("echo a; echo b", stream=True)
-    time.sleep(0.5)
+    assert _wait_for(lambda: executor._JOBS[job].response is not None, timeout=30)
     a = poll_job(job, 1.0, 0, 0)
     again = poll_job(job, 1.0, 0, 0)
     assert a.stdout == again.stdout == b"a\nb\n"
@@ -155,7 +155,7 @@ def test_client_streams_chunks_while_running(monkeypatch):
     result = _client().run_bash(LOOP, on_output=lambda s, d: seen.append((time.monotonic() - t0, s, d)))
     assert result.ok and result.stdout == "1\n2\n3\n"
     assert [d for _, _, d in seen] == [b"1\n", b"2\n", b"3\n"]
-    assert seen[0][0] < 0.35 < seen[-1][0]
+    assert seen[-1][0] - seen[0][0] > 0.5  # first chunk arrived well before the last
 
 
 def test_client_stream_result_matches_buffered(monkeypatch):
