@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 import sys
 import time
 
@@ -99,9 +100,9 @@ def test_inprocess_output_streams():
     code = "import time\nprint('x', flush=True)\ntime.sleep(0.6)\nprint('y')"
     job = _submit(code, stream=True, kind="python", mode="inprocess")
     first = poll_job(job, 3.0, 0, 0)
-    assert first.state == "running" and first.stdout == b"x\n"
+    assert first.state == "running" and first.stdout == f"x{os.linesep}".encode()
     final, out, _, _ = _drain_stream(job, first.stdout_offset, first.stderr_offset)
-    assert first.stdout + out == b"x\ny\n" and final.state == "done"
+    assert first.stdout + out == f"x{os.linesep}y{os.linesep}".encode() and final.state == "done"
 
 
 def test_sync_exec_output_unchanged():
