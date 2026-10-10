@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -57,6 +57,38 @@ _CONTROL_HTTP_TIMEOUT_S = 60.0
 #: stay quick and long ones do not hammer the relay.
 _POLL_BACKOFF_MIN_S = 0.25
 _POLL_BACKOFF_MAX_S = 5.0
+
+
+#: ``on_output(stream, data)`` receives ``("stdout" | "stderr", bytes)`` as soon as
+#: the listener has produced them.
+OutputCallback = Callable[[str, bytes], None]
+
+
+#: Consecutive failed streaming polls tolerated before giving up.
+_STREAM_MAX_POLL_FAILURES = 8
+
+
+def _deliver(on_output: OutputCallback | None, stdout: bytes, stderr: bytes) -> None:
+    if on_output is None:
+        return
+    if stdout:
+        on_output("stdout", stdout)
+    if stderr:
+        on_output("stderr", stderr)
+
+
+def _timeout_result(request: ExecRequest, job_id: str, started: float) -> ExecResult:
+    return ExecResult(
+        exit_code=1,
+        stdout="",
+        stderr=f"job {job_id} exceeded timeout_s={request.timeout_s}\n",
+        stdout_bytes=b"",
+        stderr_bytes=b"",
+        duration_ms=int((time.monotonic() - started) * 1000),
+        timed_out=True,
+        error="timeout",
+        job_id=job_id,
+    )
 
 
 @dataclass
@@ -139,10 +171,12 @@ class RelayClient:
         mode: str = "subprocess",
         timeout_s: float = DEFAULT_TIMEOUT_S,
         async_job: bool | None = None,
+        on_output: OutputCallback | None = None,
     ) -> ExecResult:
         return self.send(
             ExecRequest(kind="python", code=code, mode=mode, timeout_s=timeout_s),
             async_job=async_job,
+            on_output=on_output,
         )
 
     def run_bash(
@@ -151,10 +185,12 @@ class RelayClient:
         *,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         async_job: bool | None = None,
+        on_output: OutputCallback | None = None,
     ) -> ExecResult:
         return self.send(
             ExecRequest(kind="bash", code=code, mode="subprocess", timeout_s=timeout_s),
             async_job=async_job,
+            on_output=on_output,
         )
 
     def run_powershell(
@@ -163,10 +199,12 @@ class RelayClient:
         *,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         async_job: bool | None = None,
+        on_output: OutputCallback | None = None,
     ) -> ExecResult:
         return self.send(
             ExecRequest(kind="powershell", code=code, mode="subprocess", timeout_s=timeout_s),
             async_job=async_job,
+            on_output=on_output,
         )
 
     def upload_file(
@@ -216,7 +254,13 @@ class RelayClient:
         """Run commands according to their dependency graph."""
         return run_command_batch(self, commands, max_parallel=max_parallel)
 
-    def send(self, request: ExecRequest, *, async_job: bool | None = None) -> ExecResult:
+    def send(
+        self,
+        request: ExecRequest,
+        *,
+        async_job: bool | None = None,
+        on_output: OutputCallback | None = None,
+    ) -> ExecResult:
         """Send an :class:`ExecRequest`, synchronously or as a background job.
 
         ``async_job=None`` (the default) picks the right shape automatically:
@@ -224,12 +268,22 @@ class RelayClient:
         submit + poll, because a single relay round-trip cannot outlive that.
         Either way the returned :class:`ExecResult` looks identical, so callers
         never have to care.
+
+        ``on_output`` streams stdout/stderr chunks while the command runs; it
+        needs the job transport, so it implies ``async_job=True``. Every output
+        byte is delivered through the callback exactly once (against a listener
+        without streaming support, all of it arrives at completion). The
+        returned result still holds the complete output.
         """
+        if on_output is not None:
+            if async_job is False:
+                raise ValueError("on_output requires the async job transport (async_job=False given)")
+            async_job = True
         if async_job is None:
             async_job = request.timeout_s > RELAY_RESPONSE_LIMIT_S
         if not async_job:
             return self._send(request)
-        return self._run_as_job(request)
+        return self._run_as_job(request, on_output)
 
     def submit(self, request: ExecRequest) -> str:
         """Start ``request`` in the background; returns its ``job_id``."""
@@ -267,17 +321,22 @@ class RelayClient:
 
     # ---- async job driver ---------------------------------------------
 
-    def _run_as_job(self, request: ExecRequest) -> ExecResult:
-        submitted = self._send(
-            replace(request, action="submit"),
+    def _run_as_job(self, request: ExecRequest, on_output: OutputCallback | None = None) -> ExecResult:
+        submitted = self._send_raw(
+            replace(request, action="submit", stream=on_output is not None),
             http_timeout_s=_CONTROL_HTTP_TIMEOUT_S,
         )
         if not submitted.job_id:
             # Older listener: it just ran the code synchronously. The result is
             # already final, so hand it back rather than failing.
-            return submitted
+            result = ExecResult.from_response(submitted)
+            _deliver(on_output, result.stdout_bytes, result.stderr_bytes)
+            return result
 
         job_id = submitted.job_id
+        if on_output is not None and submitted.stream:
+            return self._stream_job(request, job_id, on_output)
+
         deadline = time.monotonic() + request.timeout_s + _CONTROL_HTTP_TIMEOUT_S
         wait_s = min(DEFAULT_POLL_WAIT_S, max(1.0, request.timeout_s))
         backoff = _POLL_BACKOFF_MIN_S
@@ -286,20 +345,11 @@ class RelayClient:
                 started = time.monotonic()
                 state, result = self.poll(request, job_id, wait_s=wait_s)
                 if state != "running":
+                    _deliver(on_output, result.stdout_bytes, result.stderr_bytes)
                     return result
                 if time.monotonic() > deadline:
                     self.cancel(request, job_id)
-                    return ExecResult(
-                        exit_code=1,
-                        stdout="",
-                        stderr=f"job {job_id} exceeded timeout_s={request.timeout_s}\n",
-                        stdout_bytes=b"",
-                        stderr_bytes=b"",
-                        duration_ms=int((time.monotonic() - started) * 1000),
-                        timed_out=True,
-                        error="timeout",
-                        job_id=job_id,
-                    )
+                    return _timeout_result(request, job_id, started)
                 # A long-polling listener already blocked for us; only sleep if
                 # it came back immediately (older server without long-poll).
                 if time.monotonic() - started < 1.0:
@@ -311,7 +361,87 @@ class RelayClient:
             self.cancel(request, job_id)
             raise
 
+    def _stream_job(self, request: ExecRequest, job_id: str, on_output: OutputCallback) -> ExecResult:
+        """Poll with a watermark, delivering each chunk once; retries are idempotent."""
+        deadline = time.monotonic() + request.timeout_s + _CONTROL_HTTP_TIMEOUT_S
+        wait_s = min(DEFAULT_POLL_WAIT_S, max(1.0, request.timeout_s))
+        stdout_offset = stderr_offset = 0
+        stdout_all = bytearray()
+        stderr_all = bytearray()
+        failures = 0
+        try:
+            while True:
+                started = time.monotonic()
+                try:
+                    resp = self._send_raw(
+                        replace(
+                            request,
+                            action="poll",
+                            job_id=job_id,
+                            wait_s=wait_s,
+                            stdout_offset=stdout_offset,
+                            stderr_offset=stderr_offset,
+                        ),
+                        http_timeout_s=_CONTROL_HTTP_TIMEOUT_S,
+                    )
+                except RuntimeError:
+                    # Same offsets next time, so a lost response loses nothing.
+                    failures += 1
+                    if time.monotonic() > deadline or failures > _STREAM_MAX_POLL_FAILURES:
+                        raise
+                    time.sleep(min(_POLL_BACKOFF_MIN_S * 2**failures, _POLL_BACKOFF_MAX_S))
+                    continue
+                failures = 0
+
+                if resp.stdout_offset is None or resp.stderr_offset is None:
+                    # Listener does not track offsets: treat as an ordinary job poll.
+                    if resp.state == "running":
+                        time.sleep(_POLL_BACKOFF_MIN_S)
+                        continue
+                    result = ExecResult.from_response(resp)
+                    _deliver(on_output, result.stdout_bytes, result.stderr_bytes)
+                    return result
+
+                out, err = resp.stdout, resp.stderr
+                if out:
+                    stdout_all += out
+                    on_output("stdout", out)
+                if err:
+                    stderr_all += err
+                    on_output("stderr", err)
+                stdout_offset, stderr_offset = resp.stdout_offset, resp.stderr_offset
+
+                if resp.state != "running":
+                    final = ExecResult.from_response(resp)
+                    final.stdout_bytes = bytes(stdout_all)
+                    final.stderr_bytes = bytes(stderr_all)
+                    final.stdout = final.stdout_bytes.decode("utf-8", "replace")
+                    final.stderr = final.stderr_bytes.decode("utf-8", "replace")
+                    return final
+                if time.monotonic() > deadline:
+                    self.cancel(request, job_id)
+                    result = _timeout_result(request, job_id, started)
+                    result.stdout_bytes = bytes(stdout_all)
+                    result.stderr_bytes = bytes(stderr_all)
+                    result.stdout = result.stdout_bytes.decode("utf-8", "replace")
+                    return result
+                # Output was waiting (full chunk): fetch the next one right away.
+                # An idle poll already blocked server-side; an instant empty
+                # answer would otherwise spin.
+                if not out and not err and time.monotonic() - started < 0.05:
+                    time.sleep(_POLL_BACKOFF_MIN_S)
+        except KeyboardInterrupt:
+            self.cancel(request, job_id)
+            raise
+
     # ---- internals -----------------------------------------------------
+
+    def _send_raw(self, request: ExecRequest, *, http_timeout_s: float | None = None) -> ExecResponse:
+        payload = self._post_json(
+            request.to_json(),
+            http_timeout_s=http_timeout_s,
+        )
+        return ExecResponse.from_json(json.dumps(payload))
 
     def _send(
         self,
@@ -320,11 +450,7 @@ class RelayClient:
         http_timeout_s: float | None = None,
         return_state: bool = False,
     ):
-        payload = self._post_json(
-            request.to_json(),
-            http_timeout_s=http_timeout_s,
-        )
-        resp = ExecResponse.from_json(json.dumps(payload))
+        resp = self._send_raw(request, http_timeout_s=http_timeout_s)
         result = ExecResult.from_response(resp)
         if return_state:
             return resp.state, result

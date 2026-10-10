@@ -24,6 +24,9 @@ DEFAULT_TIMEOUT_S = 600.0
 DEFAULT_POLL_WAIT_S = 20.0
 MAX_POLL_WAIT_S = 45.0
 
+#: Upper bound on streamed output (stdout + stderr) carried by one poll response.
+MAX_STREAM_CHUNK_BYTES = 256 * 1024
+
 
 def b64encode_bytes(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
@@ -56,6 +59,14 @@ class ExecRequest:
     action: Action = "exec"
     job_id: str | None = None
     wait_s: float = DEFAULT_POLL_WAIT_S
+    #: ``submit``: ask for incremental output. The listener answers with
+    #: ``stream=True`` if it supports it; older listeners ignore the field.
+    stream: bool = False
+    #: ``poll`` watermark: the client has received ``stdout[:stdout_offset]``
+    #: and ``stderr[:stderr_offset]``. Doubles as an acknowledgement, so the
+    #: listener may free those bytes. ``None`` selects the legacy full-output poll.
+    stdout_offset: int | None = None
+    stderr_offset: int | None = None
     protocol_version: int = PROTOCOL_VERSION
 
     def to_json(self) -> str:
@@ -85,6 +96,13 @@ class ExecRequest:
             raise ValueError(f"action={action!r} requires job_id")
         timeout_s = float(obj.get("timeout_s", DEFAULT_TIMEOUT_S))
         wait_s = min(float(obj.get("wait_s", DEFAULT_POLL_WAIT_S)), MAX_POLL_WAIT_S)
+        offsets: list[int | None] = []
+        for name in ("stdout_offset", "stderr_offset"):
+            value = obj.get(name)
+            if value is not None:
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(f"{name} must be a non-negative integer")
+            offsets.append(value)
         return cls(
             kind=kind,
             code=code,
@@ -93,6 +111,9 @@ class ExecRequest:
             action=action,
             job_id=job_id,
             wait_s=wait_s,
+            stream=bool(obj.get("stream", False)),
+            stdout_offset=offsets[0],
+            stderr_offset=offsets[1],
             protocol_version=int(obj.get("protocol_version", PROTOCOL_VERSION)),
         )
 
@@ -110,6 +131,11 @@ class ExecResponse:
     #: ``running`` while a submitted job is still executing; ``done`` once the
     #: output fields below are final; ``missing`` for an unknown/expired job.
     state: JobState | None = None
+    #: Streaming jobs: ``True`` on submit/poll responses when the listener
+    #: honours offsets; the offsets are the watermark *after* this response.
+    stream: bool | None = None
+    stdout_offset: int | None = None
+    stderr_offset: int | None = None
     protocol_version: int = PROTOCOL_VERSION
 
     @classmethod
@@ -153,6 +179,9 @@ class ExecResponse:
             error=obj.get("error"),
             job_id=obj.get("job_id"),
             state=obj.get("state"),
+            stream=obj.get("stream"),
+            stdout_offset=obj.get("stdout_offset"),
+            stderr_offset=obj.get("stderr_offset"),
             protocol_version=int(obj.get("protocol_version", PROTOCOL_VERSION)),
         )
 

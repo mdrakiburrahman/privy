@@ -78,6 +78,21 @@ client.cancel(request, job_id)
 
 Jobs live in listener memory and are not durable across listener restarts.
 
+## Stream output
+
+Pass `on_output` to receive chunks while the command runs; it implies the job transport. The result
+still holds the complete output.
+
+```python
+result = client.run_bash(
+    "npx nx run app:build --verbose",
+    on_output=lambda stream, data: print(data.decode(), end=""),
+)
+```
+
+`stream` is `"stdout"` or `"stderr"`. Against a listener without streaming support, everything
+arrives once at completion.
+
 ## Run commands with dependencies
 
 ```python

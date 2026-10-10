@@ -39,7 +39,7 @@ from privy._relay import (
     create_listen_url,
     redact_relay_secrets,
 )
-from privy.executor import execute, seed_inprocess_globals
+from privy.executor import execute, seed_inprocess_globals, set_echo_output
 from privy.protocol import ExecRequest, ExecResponse
 from privy.proxy import PROXY_KIND, ProxyRequest, handle_proxy_request
 from privy.transfer import FILE_TRANSFER_KIND, handle_transfer_request
@@ -183,6 +183,7 @@ class RelayServer:
         recv_timeout_s: float = 1.0,
         proxy_target: str | None = None,
         inprocess_globals: dict[str, Any] | None = None,
+        echo_output: bool = True,
     ) -> None:
         # NOTE: a long-polling ``action="poll"`` occupies a worker for the
         # duration of its wait, so the pool must comfortably exceed the number
@@ -199,6 +200,10 @@ class RelayServer:
         self._recv_timeout_s = recv_timeout_s
         self._proxy_target = proxy_target
         self._token_expires_at: int | None = None
+
+        # Output of every job is copied to this process's stdout/stderr (prefixed
+        # with the job id) as it is produced; pass False for shared/sensitive logs.
+        set_echo_output(echo_output)
 
         if inprocess_globals:
             # Lets the host notebook expose live objects (e.g. Fabric's
