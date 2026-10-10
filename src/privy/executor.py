@@ -23,8 +23,8 @@ behind one another nor steal each other's stdout.
 from __future__ import annotations
 
 import ctypes
-import io
 import os
+import queue
 import shutil
 import subprocess
 import sys
@@ -36,7 +36,14 @@ from collections.abc import Callable
 from typing import Any
 
 from privy._relay import RELAY_SECRET_ENV_VARS
-from privy.protocol import DEFAULT_POLL_WAIT_S, MAX_POLL_WAIT_S, ExecRequest, ExecResponse
+from privy.protocol import (
+    DEFAULT_POLL_WAIT_S,
+    MAX_POLL_WAIT_S,
+    MAX_STREAM_CHUNK_BYTES,
+    ExecRequest,
+    ExecResponse,
+    b64encode_bytes,
+)
 
 # A single globals dict shared across all inprocess invocations; mirrors how
 # users already think about a long-lived Fabric notebook kernel.
@@ -211,6 +218,156 @@ def seed_inprocess_globals(mapping: dict[str, Any]) -> None:
         _INPROCESS_GLOBALS.update(mapping)
 
 
+# ---------------------------------------------------------------------------
+# Incremental output: per-stream append-only buffers + optional listener echo
+# ---------------------------------------------------------------------------
+
+
+class _OffsetError(Exception):
+    """A poll asked for bytes that were already freed or do not exist yet."""
+
+
+class _OutputBuffer:
+    """Append-only byte buffer for one output stream of one run.
+
+    Offsets are absolute (bytes since the run started). ``trim`` frees the
+    bytes the client has acknowledged, so a streamed hour of output does not
+    accumulate in memory. All buffers of a job share one condition so a
+    long-poll wakes as soon as *either* stream grows or the job ends.
+    """
+
+    def __init__(self, cond: threading.Condition, stream: str, echo_id: str | None = None) -> None:
+        self._cond = cond
+        self._stream = stream
+        self._echo_id = echo_id
+        self._data = bytearray()
+        self._base = 0
+
+    @property
+    def end(self) -> int:
+        return self._base + len(self._data)
+
+    def append(self, data: bytes) -> None:
+        if not data:
+            return
+        with self._cond:
+            self._data += data
+            self._cond.notify_all()
+        if self._echo_id is not None:
+            _echo_chunk(self._echo_id, self._stream, data)
+
+    def close(self) -> None:
+        if self._echo_id is not None:
+            _echo_chunk(self._echo_id, self._stream, None)
+
+    def read(self, offset: int, max_bytes: int) -> bytes:
+        """Bytes in ``[offset, offset+max_bytes)``. Caller must hold the condition."""
+        if offset < self._base:
+            raise _OffsetError(f"offset {offset} was already acknowledged (oldest kept: {self._base})")
+        if offset > self.end:
+            raise _OffsetError(f"offset {offset} is beyond the output produced so far ({self.end})")
+        start = offset - self._base
+        return bytes(self._data[start : start + max_bytes])
+
+    def trim(self, offset: int) -> None:
+        """Free bytes below ``offset``. Caller must hold the condition."""
+        drop = min(offset, self.end) - self._base
+        if drop > 0:
+            del self._data[:drop]
+            self._base += drop
+
+    def snapshot(self) -> bytes:
+        with self._cond:
+            return bytes(self._data)
+
+
+class _BufferTextWriter:
+    """Minimal text file object that appends UTF-8 to an :class:`_OutputBuffer`."""
+
+    def __init__(self, buf: _OutputBuffer) -> None:
+        self._buf = buf
+
+    def write(self, data: str) -> int:
+        self._buf.append(data.encode("utf-8", "replace"))
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+
+_ECHO_ENABLED = False
+_ECHO_QUEUE: queue.Queue = queue.Queue(maxsize=4096)
+_ECHO_LOCK = threading.Lock()
+_ECHO_THREAD: threading.Thread | None = None
+_ECHO_DROPPED = 0
+_ECHO_MAX_PARTIAL_LINE = 64 * 1024
+
+
+def set_echo_output(enabled: bool) -> None:
+    """Copy each run's output to this process's stdout/stderr, line-prefixed by job id."""
+    global _ECHO_ENABLED, _ECHO_THREAD
+    with _ECHO_LOCK:
+        _ECHO_ENABLED = bool(enabled)
+        if enabled and _ECHO_THREAD is None:
+            _ECHO_THREAD = threading.Thread(target=_echo_loop, name="privy-echo", daemon=True)
+            _ECHO_THREAD.start()
+
+
+def _echo_chunk(echo_id: str, stream: str, data: bytes | None) -> None:
+    """Queue ``data`` for echo; never blocks (a slow log sink drops chunks instead)."""
+    global _ECHO_DROPPED
+    if not _ECHO_ENABLED:
+        return
+    try:
+        _ECHO_QUEUE.put_nowait((echo_id, stream, data))
+    except queue.Full:
+        _ECHO_DROPPED += 1
+
+
+def _echo_write(stream: str, echo_id: str, lines: list[bytes]) -> None:
+    target = sys.stderr if stream == "stderr" else sys.stdout
+    prefix = f"[{echo_id}] "
+    text = "".join(prefix + line.decode("utf-8", "replace") + "\n" for line in lines)
+    try:
+        target.write(text)
+        target.flush()
+    except Exception:  # noqa: BLE001 - a broken log sink must never affect jobs
+        pass
+
+
+def _echo_loop() -> None:
+    global _ECHO_DROPPED
+    partial: dict[tuple[str, str], bytes] = {}
+    reported = 0
+    while True:
+        echo_id, stream, data = _ECHO_QUEUE.get()
+        key = (echo_id, stream)
+        if data is None:
+            rest = partial.pop(key, b"")
+            if rest:
+                _echo_write(stream, echo_id, [rest])
+        else:
+            pending = partial.get(key, b"") + data
+            *lines, rest = pending.split(b"\n")
+            if len(rest) > _ECHO_MAX_PARTIAL_LINE:
+                lines.append(rest)
+                rest = b""
+            if lines:
+                _echo_write(stream, echo_id, lines)
+            if rest:
+                partial[key] = rest
+            else:
+                partial.pop(key, None)
+        dropped = _ECHO_DROPPED
+        if dropped != reported:
+            _echo_write(
+                "stderr",
+                echo_id,
+                [f"... {dropped - reported} output chunk(s) dropped (log sink too slow)".encode()],
+            )
+            reported = dropped
+
+
 def execute(req: ExecRequest) -> ExecResponse:
     """Dispatch an ExecRequest to the right backend and return an ExecResponse."""
     start = time.monotonic()
@@ -220,7 +377,7 @@ def execute(req: ExecRequest) -> ExecResponse:
                 return _invalid_mode(start)
             return submit_job(req)
         if req.action == "poll":
-            return poll_job(req.job_id or "", req.wait_s)
+            return poll_job(req.job_id or "", req.wait_s, req.stdout_offset, req.stderr_offset)
         if req.action == "cancel":
             return cancel_job(req.job_id or "")
         if req.mode == "inprocess":
@@ -350,7 +507,22 @@ def _run_subprocess(
     timeout_s: float,
     start: float,
     on_proc: Callable[[subprocess.Popen], None] | None = None,
+    out: _OutputBuffer | None = None,
+    err: _OutputBuffer | None = None,
 ) -> ExecResponse:
+    """Run a subprocess, pumping its output into buffers as it is produced.
+
+    With ``out``/``err`` supplied (async jobs) the response carries no output —
+    the caller owns the buffers. Otherwise private buffers are used and the
+    full output is returned in the response.
+    """
+    collect = out is None or err is None
+    if collect:
+        cond = threading.Condition()
+        echo_id = uuid.uuid4().hex[:8] if _ECHO_ENABLED else None
+        out = _OutputBuffer(cond, "stdout", echo_id)
+        err = _OutputBuffer(cond, "stderr", echo_id)
+    assert out is not None and err is not None
     env = _child_env()
     # Force unbuffered text so partial output is not lost on timeout.
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -406,28 +578,70 @@ def _run_subprocess(
     if on_proc is not None:
         on_proc(proc)
 
+    threads = [
+        threading.Thread(target=_pump, args=(proc.stdout, out), name="privy-stdout", daemon=True),
+        threading.Thread(target=_pump, args=(proc.stderr, err), name="privy-stderr", daemon=True),
+    ]
+    if stdin_payload is not None:
+        threads.append(
+            threading.Thread(target=_feed_stdin, args=(proc, stdin_payload), name="privy-stdin", daemon=True)
+        )
+    for thread in threads:
+        thread.start()
+
     timed_out = False
     try:
         try:
-            stdout, stderr = proc.communicate(input=stdin_payload, timeout=timeout_s)
+            proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             timed_out = True
             _terminate_process_tree(proc)
             try:
-                stdout, stderr = proc.communicate(timeout=5)
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:  # pragma: no cover
-                stdout, stderr = b"", b""
+                pass
+        # Readers hit EOF as soon as the process exits; a background child that
+        # inherited the pipes must not hold the result hostage.
+        for thread in threads:
+            thread.join(timeout=2.0)
     finally:
         _release_process_tree(proc)
+        out.close()
+        err.close()
 
     return ExecResponse.from_output(
         exit_code=proc.returncode if proc.returncode is not None else -1,
-        stdout=stdout or b"",
-        stderr=stderr or b"",
+        stdout=out.snapshot() if collect else b"",
+        stderr=err.snapshot() if collect else b"",
         duration_ms=int((time.monotonic() - start) * 1000),
         timed_out=timed_out,
         error="timeout" if timed_out else None,
     )
+
+
+def _pump(stream: Any, buf: _OutputBuffer) -> None:
+    try:
+        while True:
+            chunk = stream.read1(65536)
+            if not chunk:
+                break
+            buf.append(chunk)
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            stream.close()
+        except OSError:  # pragma: no cover
+            pass
+
+
+def _feed_stdin(proc: subprocess.Popen, payload: bytes) -> None:
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(payload)
+        proc.stdin.close()
+    except (OSError, ValueError):
+        pass
 
 
 class _StreamRouter:
@@ -512,12 +726,22 @@ def _ensure_routers() -> tuple[_StreamRouter, _StreamRouter]:
 class _InprocessRun:
     """One ``exec`` of user code on its own thread, with per-thread capture."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        out: _OutputBuffer | None = None,
+        err: _OutputBuffer | None = None,
+    ) -> None:
         self._code = code
-        self._stdout_buf = io.BytesIO()
-        self._stderr_buf = io.BytesIO()
-        self._stdout_text = io.TextIOWrapper(self._stdout_buf, encoding="utf-8", write_through=True)
-        self._stderr_text = io.TextIOWrapper(self._stderr_buf, encoding="utf-8", write_through=True)
+        if out is None or err is None:
+            cond = threading.Condition()
+            echo_id = uuid.uuid4().hex[:8] if _ECHO_ENABLED else None
+            out = _OutputBuffer(cond, "stdout", echo_id)
+            err = _OutputBuffer(cond, "stderr", echo_id)
+        self.out = out
+        self.err = err
+        self._stdout_text = _BufferTextWriter(out)
+        self._stderr_text = _BufferTextWriter(err)
         self.exit_code = 0
         self.error: str | None = None
         self._state_lock = threading.Lock()
@@ -543,7 +767,7 @@ class _InprocessRun:
             _try_async_raise(self.thread, KeyboardInterrupt)
 
     def output(self) -> tuple[bytes, bytes]:
-        return self._stdout_buf.getvalue(), self._stderr_buf.getvalue()
+        return self.out.snapshot(), self.err.snapshot()
 
     def _target(self) -> None:
         out_router, err_router = _ensure_routers()
@@ -565,10 +789,10 @@ class _InprocessRun:
                     self.exit_code = 1
                     self.error = "exception"
             finally:
-                self._stdout_text.flush()
-                self._stderr_text.flush()
                 out_router.unregister()
                 err_router.unregister()
+                self.out.close()
+                self.err.close()
 
 
 class _NullLock:
@@ -587,6 +811,8 @@ def _run_inprocess_python(
     timeout_s: float,
     start: float,
     on_run: Callable[[_InprocessRun], bool] | None = None,
+    out: _OutputBuffer | None = None,
+    err: _OutputBuffer | None = None,
 ) -> ExecResponse:
     """Run ``code`` inside this interpreter, capturing stdout/stderr.
 
@@ -598,7 +824,8 @@ def _run_inprocess_python(
     ``on_run`` receives the :class:`_InprocessRun` as soon as it starts so an
     async job can keep a handle on it for cancellation.
     """
-    run = _InprocessRun(code)
+    collect = out is None or err is None
+    run = _InprocessRun(code, out, err)
     if on_run is not None and not on_run(run):
         return ExecResponse.from_output(
             exit_code=130,
@@ -624,7 +851,7 @@ def _run_inprocess_python(
         run.error = "timeout"
         run.exit_code = 1
 
-    stdout, stderr = run.output()
+    stdout, stderr = run.output() if collect else (b"", b"")
     return ExecResponse.from_output(
         exit_code=run.exit_code,
         stdout=stdout,
@@ -666,6 +893,12 @@ class _Job:
         self.cancelled = False
         self.created_at = time.monotonic()
         self.finished_at: float | None = None
+        #: Shared wake-up for long-polls: signalled on new output and on completion.
+        self.cond = threading.Condition()
+        self.streaming = req.stream
+        echo_id = self.id[:8] if _ECHO_ENABLED else None
+        self.out = _OutputBuffer(self.cond, "stdout", echo_id)
+        self.err = _OutputBuffer(self.cond, "stderr", echo_id)
         self._run: _InprocessRun | None = None
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
@@ -699,6 +932,8 @@ class _Job:
                         self.request.timeout_s,
                         start,
                         on_run=self._adopt_run,
+                        out=self.out,
+                        err=self.err,
                     )
                 else:
                     resp = _run_subprocess(
@@ -707,6 +942,8 @@ class _Job:
                         self.request.timeout_s,
                         start,
                         on_proc=self._adopt_proc,
+                        out=self.out,
+                        err=self.err,
                     )
             except Exception as exc:  # noqa: BLE001 - safety net
                 resp = ExecResponse.from_output(
@@ -717,6 +954,12 @@ class _Job:
                     error=type(exc).__name__,
                 )
 
+        self.out.close()
+        self.err.close()
+        if not self.streaming:
+            # Legacy shape: the final response carries the complete output.
+            resp.stdout_b64 = b64encode_bytes(self.out.snapshot() + resp.stdout)
+            resp.stderr_b64 = b64encode_bytes(self.err.snapshot() + resp.stderr)
         with self._lock:
             self.response = resp
             self.finished_at = time.monotonic()
@@ -725,6 +968,8 @@ class _Job:
             self._thread = None
             done = self.done
             self.done = None
+        with self.cond:
+            self.cond.notify_all()
         if done is not None:
             done.set()
         _reap_jobs()
@@ -793,7 +1038,7 @@ def submit_job(req: ExecRequest) -> ExecResponse:
     with _JOBS_LOCK:
         _JOBS[job.id] = job
     job.start()
-    return ExecResponse.from_output(
+    resp = ExecResponse.from_output(
         exit_code=0,
         stdout=b"",
         stderr=b"",
@@ -801,10 +1046,23 @@ def submit_job(req: ExecRequest) -> ExecResponse:
         job_id=job.id,
         state="running",
     )
+    if req.stream:
+        resp.stream = True
+    return resp
 
 
-def poll_job(job_id: str, wait_s: float = DEFAULT_POLL_WAIT_S) -> ExecResponse:
-    """Wait up to ``wait_s`` for a job, then report its state (and output)."""
+def poll_job(
+    job_id: str,
+    wait_s: float = DEFAULT_POLL_WAIT_S,
+    stdout_offset: int | None = None,
+    stderr_offset: int | None = None,
+) -> ExecResponse:
+    """Wait up to ``wait_s`` for a job, then report its state (and output).
+
+    For streaming jobs the offsets are the client's watermark: the response
+    carries the next chunk of output after them (plus the new offsets) and the
+    job is reported ``done`` only once every byte has been handed over.
+    """
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
     if job is None:
@@ -817,6 +1075,9 @@ def poll_job(job_id: str, wait_s: float = DEFAULT_POLL_WAIT_S) -> ExecResponse:
             job_id=job_id,
             state="missing",
         )
+
+    if job.streaming:
+        return _poll_streaming(job, wait_s, stdout_offset or 0, stderr_offset or 0)
 
     done = job.done
     if done is not None:
@@ -835,6 +1096,64 @@ def poll_job(job_id: str, wait_s: float = DEFAULT_POLL_WAIT_S) -> ExecResponse:
     assert resp is not None  # set before ``done``
     resp.job_id = job_id
     resp.state = "cancelled" if job.cancelled else "done"
+    return resp
+
+
+def _poll_streaming(job: _Job, wait_s: float, so: int, se: int) -> ExecResponse:
+    deadline = time.monotonic() + max(0.0, min(wait_s, MAX_POLL_WAIT_S))
+    half = MAX_STREAM_CHUNK_BYTES // 2
+    with job.cond:
+        try:
+            job.out.trim(so)
+            job.err.trim(se)
+            while True:
+                finished = job.response is not None
+                if job.out.end > so or job.err.end > se or finished:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                job.cond.wait(timeout=remaining)
+            out_chunk = job.out.read(so, half)
+            err_chunk = job.err.read(se, half)
+        except _OffsetError as exc:
+            return ExecResponse.from_output(
+                exit_code=1,
+                stdout=b"",
+                stderr=f"{exc}\n".encode(),
+                duration_ms=0,
+                error="bad_offset",
+                job_id=job.id,
+                state="done",
+            )
+        so += len(out_chunk)
+        se += len(err_chunk)
+        drained = job.out.end <= so and job.err.end <= se
+
+    final = job.response
+    if final is not None and drained:
+        resp = ExecResponse.from_output(
+            exit_code=final.exit_code,
+            stdout=out_chunk,
+            stderr=err_chunk,
+            duration_ms=final.duration_ms,
+            timed_out=final.timed_out,
+            error=final.error,
+            job_id=job.id,
+            state="cancelled" if job.cancelled else "done",
+        )
+    else:
+        resp = ExecResponse.from_output(
+            exit_code=0,
+            stdout=out_chunk,
+            stderr=err_chunk,
+            duration_ms=int((time.monotonic() - job.created_at) * 1000),
+            job_id=job.id,
+            state="running",
+        )
+    resp.stream = True
+    resp.stdout_offset = so
+    resp.stderr_offset = se
     return resp
 
 

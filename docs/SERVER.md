@@ -72,6 +72,16 @@ the Linux listener from same-user process inspection, and gives subprocess child
 environment, but in-process code can still inspect Python process state. Use separate OS
 identities/listeners/credentials when callers require different trust boundaries.
 
+## Output logging
+
+By default the listener copies each job's stdout/stderr to its own output as it is produced, each
+line prefixed with the first 8 characters of the job id, for example `[3fa9c1d2] building...`. This
+makes a long remote command visible in CI step logs.
+
+Command output may contain secrets, and listener logs are often shared. Opt out with
+`--no-echo-output`, `PRIVY_ECHO_OUTPUT=0`, or `RelayServer(..., echo_output=False)`. Echoing never
+blocks a job: if the log sink is too slow, chunks are dropped and a notice is printed.
+
 ## Long-running jobs
 
 Azure Relay requires a listener response in roughly one minute. Privy decouples longer execution

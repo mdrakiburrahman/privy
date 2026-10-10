@@ -81,6 +81,16 @@ stdout, stderr, and exit status.
 The default timeout is 600 seconds, so default CLI calls use the long-job path unless explicitly
 opted out.
 
+## Streaming output
+
+By default `privy client` prints stdout and stderr while the command runs. It submits the command as
+a job and long-polls with a byte-offset watermark, so each chunk is delivered exactly once and a
+dropped poll is retried without loss. The final result and exit code are unchanged.
+
+- `--no-stream` buffers output and prints it at completion.
+- `--json` and `--batch` always buffer, so their output stays one JSON document.
+- Against a listener without streaming support, output appears at completion.
+
 ## Run a dependency graph
 
 Use `--batch FILE`, or `--batch -` for stdin:

@@ -270,6 +270,7 @@ def _reexec_server(relay: dict[str, Any], args: argparse.Namespace) -> None:
         if verbosity:
             argv.append("-" + ("v" * verbosity))
         environment = dict(os.environ)
+        environment["PRIVY_ECHO_OUTPUT"] = "1" if _resolve_echo_output(args) else "0"
         for name in _SERVER_SECRET_ENV_VARS:
             environment.pop(name, None)
         os.execve(executable, argv, environment)
@@ -374,7 +375,13 @@ def _write_bytes(stream: Any, data: bytes) -> None:
         stream.write(data.decode("utf-8", "replace"))
 
 
-def _emit(result: ExecResult, as_json: bool) -> int:
+def _stream_to_terminal(stream: str, data: bytes) -> None:
+    target = sys.stderr if stream == "stderr" else sys.stdout
+    _write_bytes(target, data)
+    target.flush()
+
+
+def _emit(result: ExecResult, as_json: bool, *, streamed: bool = False) -> int:
     if as_json:
         json.dump(
             {
@@ -390,10 +397,11 @@ def _emit(result: ExecResult, as_json: bool) -> int:
         )
         sys.stdout.write("\n")
     else:
-        if result.stdout_bytes:
-            _write_bytes(sys.stdout, result.stdout_bytes)
-        if result.stderr_bytes:
-            _write_bytes(sys.stderr, result.stderr_bytes)
+        if not streamed:
+            if result.stdout_bytes:
+                _write_bytes(sys.stdout, result.stdout_bytes)
+            if result.stderr_bytes:
+                _write_bytes(sys.stderr, result.stderr_bytes)
         if result.error:
             _write_bytes(sys.stderr, f"privy: {result.error}\n".encode())
     sys.stdout.flush()
@@ -472,6 +480,15 @@ def build_parser() -> argparse.ArgumentParser:
   Relay's response deadline; the CLI still waits for and emits the final result.
   --async-job forces that path and --no-async-job disables it. The Python SDK
   additionally exposes RelayClient.submit(), poll(), and cancel().
+  client output is streamed while the command runs (submit + long-poll with a byte-offset
+  watermark); --no-stream, --json and --no-async-job print it once at completion. Against a
+  listener without streaming support output also appears at completion.
+
+Listener output logging:
+  privy server copies every job's stdout/stderr to its own output as it is produced, each line
+  prefixed with [<first 8 chars of job id>]. This is ON by default, so command output (which may
+  contain secrets) lands in the listener's log; pass --no-echo-output or set PRIVY_ECHO_OUTPUT=0
+  for shared logs.
 
 Credential behavior:
   Every Relay command accepts either PRIVY_RELAY_TOKEN/--token, or the
@@ -520,6 +537,23 @@ Examples:
         default=None,
         metavar="URL",
         help="forward proxied HTTP to this local URL, e.g. http://127.0.0.1:8080",
+    )
+    echo = server.add_mutually_exclusive_group()
+    echo.add_argument(
+        "--echo-output",
+        dest="echo_output",
+        action="store_true",
+        default=None,
+        help=(
+            "copy every job's stdout/stderr to this listener's own output as it is produced, "
+            "prefixed with the job id (default; env: PRIVY_ECHO_OUTPUT=0 disables)"
+        ),
+    )
+    echo.add_argument(
+        "--no-echo-output",
+        dest="echo_output",
+        action="store_false",
+        help="do not log remote command output on the listener (use for shared or sensitive logs)",
     )
     server.add_argument(
         "--credential-fd",
@@ -592,7 +626,25 @@ each command's mode/timeout and may set max_parallel (default: 32).""",
         action="store_false",
         help="force one Relay round-trip; long commands may hit Relay's response deadline",
     )
-    client.add_argument("--json", action="store_true", help="emit the complete result as JSON")
+    stream = client.add_mutually_exclusive_group()
+    stream.add_argument(
+        "--stream",
+        dest="stream",
+        action="store_true",
+        default=True,
+        help="print stdout/stderr while the command runs, via submit + long-poll (default)",
+    )
+    stream.add_argument(
+        "--no-stream",
+        dest="stream",
+        action="store_false",
+        help="buffer output and print it when the command finishes",
+    )
+    client.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the complete result as JSON (output is buffered, not streamed)",
+    )
     client.set_defaults(func=_cmd_client)
 
     proxy = sub.add_parser(
@@ -699,8 +751,22 @@ def _add_transfer_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="emit transfer metadata as JSON")
 
 
+def _resolve_echo_output(args: argparse.Namespace) -> bool:
+    """--echo-output/--no-echo-output win over PRIVY_ECHO_OUTPUT; the default is on."""
+    explicit = getattr(args, "echo_output", None)
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get("PRIVY_ECHO_OUTPUT", "").strip().lower()
+    if raw in ("", "1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise CliError(f"invalid PRIVY_ECHO_OUTPUT: {raw!r} (use 1 or 0)")
+
+
 def _cmd_server(args: argparse.Namespace) -> int:
     _guard_packaged_server(args)
+    echo_output = _resolve_echo_output(args)
     if args._credential_fd is None:
         relay = _resolve_relay(args)
         if _server_reexec_required():
@@ -718,6 +784,7 @@ def _cmd_server(args: argparse.Namespace) -> int:
         max_workers=max_workers,
         recv_timeout_s=recv_timeout_s,
         proxy_target=proxy_target,
+        echo_output=echo_output,
     )
     try:
         server.serve_forever()
@@ -740,18 +807,26 @@ def _cmd_client(args: argparse.Namespace) -> int:
     kind, code = _read_code(args)
     if args.mode == "inprocess" and kind != "python":
         raise CliError("--mode inprocess is only valid for Python code")
+    # Streaming needs submit + poll, and --json must stay a single document.
+    streaming = args.stream and not args.json and args.async_job is not False
+    on_output = _stream_to_terminal if streaming else None
     if kind == "bash":
-        result = client.run_bash(code, timeout_s=args.timeout_s, async_job=args.async_job)
+        result = client.run_bash(
+            code, timeout_s=args.timeout_s, async_job=args.async_job, on_output=on_output
+        )
     elif kind == "powershell":
-        result = client.run_powershell(code, timeout_s=args.timeout_s, async_job=args.async_job)
+        result = client.run_powershell(
+            code, timeout_s=args.timeout_s, async_job=args.async_job, on_output=on_output
+        )
     else:
         result = client.run_python(
             code,
             mode=args.mode,
             timeout_s=args.timeout_s,
             async_job=args.async_job,
+            on_output=on_output,
         )
-    return _emit(result, args.json)
+    return _emit(result, args.json, streamed=streaming)
 
 
 def _cmd_proxy(args: argparse.Namespace) -> int:
