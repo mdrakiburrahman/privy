@@ -288,7 +288,9 @@ class _BufferTextWriter:
         self._buf = buf
 
     def write(self, data: str) -> int:
-        self._buf.append(data.encode("utf-8", "replace"))
+        # Same newline translation the TextIOWrapper this replaced applied.
+        text = data.replace("\n", os.linesep) if os.linesep != "\n" else data
+        self._buf.append(text.encode("utf-8", "replace"))
         return len(data)
 
     def flush(self) -> None:
