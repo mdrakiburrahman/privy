@@ -1,8 +1,13 @@
 """Hub-side jobs: commands and file transfers running on targets, plus broadcasts.
 
 Every remote command runs through :meth:`privy.RelayClient.send` on a worker
-thread, streaming its output into bounded buffers so callers can return quickly
-and come back for the rest. Jobs live in hub memory only.
+thread, streaming its output into bounded buffers. Callers can:
+
+* read only the output produced since their previous read (a per-job cursor),
+* follow the output live, chunk by chunk, in arrival order, or
+* page through the retained output by byte offset.
+
+Jobs live in hub memory only.
 """
 
 from __future__ import annotations
@@ -15,12 +20,13 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from privy._relay import redact_relay_secrets
+from privy.hub import console
 from privy.hub.config import Target
 from privy.hub.registry import TargetRegistry
 from privy.protocol import ExecRequest
@@ -36,12 +42,17 @@ TIMED_OUT = "timed_out"
 CANCELLED = "cancelled"
 ERROR = "error"
 TERMINAL_STATES = frozenset({SUCCEEDED, FAILED, TIMED_OUT, CANCELLED, ERROR})
+STREAMS = ("stdout", "stderr")
 
 DEFAULT_MAX_RUNNING = 32
 DEFAULT_RETENTION_S = 60 * 60.0
 DEFAULT_MAX_RETAINED = 200
 DEFAULT_OUTPUT_LIMIT_BYTES = 1024 * 1024
 AUDIT_CODE_CHARS = 4096
+MAX_TRACKED_CHUNKS = 20_000
+
+#: ``on_tick()`` is called while a caller waits, at least every :data:`TICK_S`.
+TICK_S = 0.25
 
 
 class JobLookupError(LookupError):
@@ -74,6 +85,13 @@ def _utf8_safe_length(data: bytes) -> int:
         needed = 2 if byte >> 5 == 0b110 else 3 if byte >> 4 == 0b1110 else 4
         return len(data) if back >= needed else len(data) - back
     return len(data)
+
+
+def _skip_continuation_bytes(data: bytes) -> int:
+    lead = 0
+    while lead < len(data) and lead < 3 and data[lead] & 0b1100_0000 == 0b1000_0000:
+        lead += 1
+    return lead
 
 
 class OutputBuffer:
@@ -116,6 +134,19 @@ class OutputBuffer:
         return bytes(self._data[-limit:])
 
 
+@dataclass
+class StreamPiece:
+    """A slice of output in arrival order.
+
+    ``skipped`` counts earlier bytes (of either stream) that the hub no longer
+    held, or is ``-1`` when it no longer knows how much earlier output there was.
+    """
+
+    stream: str
+    data: bytes
+    skipped: int = 0
+
+
 class HubJob:
     """One command or file transfer the hub runs on a target."""
 
@@ -144,9 +175,15 @@ class HubJob:
         self.remote_job_id: str | None = None
         self.cancel_requested = False
         self.progress: tuple[int, int] | None = None
+        self.progress_step = 0
         self.transfer: dict[str, Any] | None = None
         self.stdout = OutputBuffer(output_limit)
         self.stderr = OutputBuffer(output_limit)
+        #: Read cursor shared by run/get_job callers that pass no explicit offsets.
+        self.cursor = {"stdout": 0, "stderr": 0}
+        #: ``(stream, start, end)`` of each chunk in arrival order, for live streams.
+        self.chunks: list[tuple[str, int, int]] = []
+        self.chunks_base = 0
         self.cond = threading.Condition()
         self.client: Any = None
         self.request: ExecRequest | None = None
@@ -155,77 +192,147 @@ class HubJob:
     def done(self) -> bool:
         return self.state in TERMINAL_STATES
 
+    def buffer(self, stream: str) -> OutputBuffer:
+        return self.stdout if stream == "stdout" else self.stderr
+
     def duration_ms(self) -> int | None:
         if self.started_at is None:
             return None
         end = self.finished_at if self.finished_at is not None else time.time()
         return int((end - self.started_at) * 1000)
 
-    def view(self, *, max_output_bytes: int) -> dict[str, Any]:
-        """JSON-friendly snapshot; output is the tail of each stream."""
+    # ---- views --------------------------------------------------------------
+
+    def _summary_locked(self, *, include_created: bool = False) -> dict[str, Any]:
+        result: dict[str, Any] = {"job_id": self.id, "target": self.target.id}
+        if self.type == "exec":
+            result["language"] = self.spec["language"]
+        else:
+            result["type"] = self.type
+        result["state"] = self.state
+        result["done"] = self.done
+        if self.exit_code is not None:
+            result["exit_code"] = self.exit_code
+        if self.error:
+            result["error"] = self.error
+        duration = self.duration_ms()
+        if duration is not None:
+            result["duration_ms"] = duration
+        if self.broadcast_id:
+            result["broadcast_id"] = self.broadcast_id
+        if include_created:
+            result["created_at"] = utc_iso(self.created_at)
+        return result
+
+    def summary(self, *, include_created: bool = False) -> dict[str, Any]:
         with self.cond:
-            result: dict[str, Any] = {
-                "job_id": self.id,
-                "type": self.type,
-                "target": self.target.id,
-                "state": self.state,
-                "done": self.done,
-                "exit_code": self.exit_code,
-                "error": self.error,
-                "created_at": utc_iso(self.created_at),
-                "started_at": utc_iso(self.started_at),
-                "finished_at": utc_iso(self.finished_at),
-                "duration_ms": self.duration_ms(),
-            }
-            if self.broadcast_id:
-                result["broadcast_id"] = self.broadcast_id
+            return self._summary_locked(include_created=include_created)
+
+    def _delta_locked(
+        self,
+        max_bytes: int,
+        offsets: Mapping[str, int | None] | None,
+        advance: bool,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for stream in STREAMS:
+            buffer = self.buffer(stream)
+            explicit = None if offsets is None else offsets.get(stream)
+            start = self.cursor[stream] if explicit is None else explicit
+            end = buffer.total
+            begin, data = buffer.read(max(start, end - max(0, max_bytes)), end)
+            lead = _skip_continuation_bytes(data)
+            data, begin = data[lead:], begin + lead
+            if not self.done:
+                data = data[: _utf8_safe_length(data)]
+            result[stream] = data.decode("utf-8", "replace")
+            result[f"{stream}_offset"] = begin + len(data)
+            if begin > start:
+                result[f"{stream}_skipped_bytes"] = begin - start
+            if advance and explicit is None:
+                self.cursor[stream] = max(self.cursor[stream], begin + len(data))
+        return result
+
+    def view(
+        self,
+        *,
+        max_output_bytes: int,
+        offsets: Mapping[str, int | None] | None = None,
+        advance: bool = True,
+    ) -> dict[str, Any]:
+        """Lean JSON view. Exec jobs carry the output since the read cursor (and advance it)."""
+        with self.cond:
+            result = self._summary_locked()
             if self.type == "exec":
-                result.update(
-                    language=self.spec["language"],
-                    mode=self.spec["mode"],
-                    timeout_s=self.spec["timeout_s"],
-                    remote_job_id=self.remote_job_id,
-                )
-                for name, buffer in (("stdout", self.stdout), ("stderr", self.stderr)):
-                    tail = buffer.tail(max_output_bytes)
-                    result[name] = tail.decode("utf-8", "replace")
-                    result[f"{name}_bytes"] = buffer.total
-                    result[f"{name}_truncated"] = buffer.total > len(tail)
+                result.update(self._delta_locked(max_output_bytes, offsets, advance))
             else:
-                result.update(
-                    direction=self.type,
-                    local_path=self.spec["local_path"],
-                    remote_path=self.spec["remote_path"],
-                    overwrite=self.spec["overwrite"],
-                    progress=(
-                        None
-                        if self.progress is None
-                        else {"bytes_done": self.progress[0], "bytes_total": self.progress[1]}
-                    ),
-                    result=self.transfer,
-                )
+                result["local_path"] = self.spec["local_path"]
+                result["remote_path"] = self.spec["remote_path"]
+                if self.progress is not None:
+                    result["progress"] = {"bytes_done": self.progress[0], "bytes_total": self.progress[1]}
+                if self.transfer is not None:
+                    result["result"] = self.transfer
             return result
 
     def read_output(self, stream: str, offset: int, limit: int) -> dict[str, Any]:
         with self.cond:
-            buffer = self.stdout if stream == "stdout" else self.stderr
+            buffer = self.buffer(stream)
             begin, data = buffer.read(offset, limit)
             total = buffer.total
             done = self.done
         if begin + len(data) < total:
             data = data[: _utf8_safe_length(data)]
         end = begin + len(data)
-        return {
+        result: dict[str, Any] = {
             "job_id": self.id,
             "stream": stream,
             "offset": begin,
             "next_offset": end,
             "total_bytes": total,
-            "skipped_bytes": max(0, begin - offset),
             "data": data.decode("utf-8", "replace"),
             "eof": done and end >= total,
             "done": done,
         }
+        if begin > offset:
+            result["skipped_bytes"] = begin - offset
+        return result
+
+    def peek(self, stream: str, since: int, limit: int) -> tuple[int, bytes]:
+        """Output after ``since`` without moving any cursor (the newest ``limit`` bytes)."""
+        with self.cond:
+            buffer = self.buffer(stream)
+            end = buffer.total
+            return buffer.read(max(since, end - limit), end)
+
+    def next_pieces(self, index: int, timeout: float) -> tuple[list[StreamPiece], int, bool]:
+        """Wait up to ``timeout`` for chunks after ``index``.
+
+        Returns the new pieces in arrival order, the next index, and whether the
+        job has finished and every chunk has been returned. Bytes the buffers no
+        longer hold are skipped, and counted on the next piece that follows them.
+        """
+        with self.cond:
+            if index - self.chunks_base >= len(self.chunks) and not self.done:
+                self.cond.wait(timeout)
+            pieces: list[StreamPiece] = []
+            if index < self.chunks_base:
+                pieces.append(StreamPiece("stdout", b"", skipped=-1))
+                index = self.chunks_base
+            lost = 0
+            for stream, start, end in self.chunks[index - self.chunks_base :]:
+                buffer = self.buffer(stream)
+                begin = max(start, buffer.start)
+                if begin >= end:
+                    lost += end - start
+                    continue
+                lost += begin - start
+                _, data = buffer.read(begin, end - begin)
+                pieces.append(StreamPiece(stream, data, skipped=lost))
+                lost = 0
+            if lost:
+                pieces.append(StreamPiece("stdout", b"", skipped=lost))
+            index = self.chunks_base + len(self.chunks)
+            return pieces, index, self.done
 
 
 @dataclass
@@ -235,7 +342,6 @@ class Broadcast:
     id: str
     created_at: float
     patterns: list[str]
-    language: str
     job_ids: list[str]
     skipped: list[dict[str, Any]] = field(default_factory=list)
 
@@ -341,26 +447,33 @@ class JobManager:
 
     def start_broadcast(
         self,
-        targets: Sequence[Target],
+        runs: Sequence[tuple[Target, str]],
         *,
         patterns: Sequence[str],
         skipped: Sequence[dict[str, Any]],
-        language: str,
         code: str,
         mode: str,
         timeout_s: float,
         origin: str,
     ) -> tuple[Broadcast, list[HubJob]]:
+        """Start ``code`` on every ``(target, language)`` pair."""
         broadcast_id = "b" + uuid.uuid4().hex[:11]
-        self._ensure_capacity(len(targets))
+        self._ensure_capacity(len(runs))
         self._audit.record(
             "broadcast.start",
             broadcast_id=broadcast_id,
             origin=origin,
             patterns=list(patterns),
-            targets=[target.id for target in targets],
+            targets=[target.id for target, _ in runs],
             skipped=[item["target"] for item in skipped],
-            language=language,
+        )
+        console.broadcast_started(
+            broadcast_id,
+            patterns=list(patterns),
+            targets=[target for target, _ in runs],
+            skipped=list(skipped),
+            code=code,
+            origin=origin,
         )
         jobs = [
             self.start_exec(
@@ -372,13 +485,12 @@ class JobManager:
                 origin=origin,
                 broadcast_id=broadcast_id,
             )
-            for target in targets
+            for target, language in runs
         ]
         broadcast = Broadcast(
             id=broadcast_id,
             created_at=time.time(),
             patterns=list(patterns),
-            language=language,
             job_ids=[job.id for job in jobs],
             skipped=list(skipped),
         )
@@ -423,20 +535,32 @@ class JobManager:
         }
 
     @staticmethod
-    def wait(job: HubJob, wait_s: float) -> None:
-        deadline = time.monotonic() + max(0.0, wait_s)
-        with job.cond:
-            while not job.done:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return
-                job.cond.wait(remaining)
+    def wait(job: HubJob, wait_s: float, on_tick: Callable[[], None] | None = None) -> None:
+        JobManager.wait_all([job], wait_s, on_tick)
 
     @staticmethod
-    def wait_all(jobs: Sequence[HubJob], wait_s: float) -> None:
+    def wait_all(
+        jobs: Sequence[HubJob],
+        wait_s: float,
+        on_tick: Callable[[], None] | None = None,
+    ) -> None:
+        """Wait until every job is done or ``wait_s`` passes.
+
+        ``on_tick`` runs outside any lock whenever a job reports new output or
+        state, and at least every :data:`TICK_S` seconds while waiting.
+        """
         deadline = time.monotonic() + max(0.0, wait_s)
         for job in jobs:
-            JobManager.wait(job, deadline - time.monotonic())
+            while True:
+                remaining = deadline - time.monotonic()
+                with job.cond:
+                    if job.done or remaining <= 0:
+                        break
+                    job.cond.wait(min(remaining, TICK_S) if on_tick else remaining)
+                if on_tick is not None:
+                    on_tick()
+        if on_tick is not None:
+            on_tick()
 
     def cancel(self, job_id: str) -> HubJob:
         job = self.get(job_id)
@@ -444,6 +568,7 @@ class JobManager:
             if job.done:
                 return job
             job.cancel_requested = True
+            console.cancel_requested(job)
             if job.state == QUEUED:
                 self._finish_locked(job, CANCELLED, error="cancelled before it started")
                 return job
@@ -480,8 +605,11 @@ class JobManager:
             with self._lock:
                 self._jobs.pop(job.id, None)
             raise
-        log.info("job %s queued on %s (%s)", job.id, job.target.id, self._describe(job))
         return job
+
+    def _host(self, target: Target) -> str | None:
+        cached = self._registry.cached(target)
+        return (cached.info or {}).get("hostname") if cached and cached.info else None
 
     def _run(self, job: HubJob, body: Callable[[HubJob], None]) -> None:
         with self._slots:
@@ -493,6 +621,7 @@ class JobManager:
                     job.started_at = time.time()
                     job.cond.notify_all()
             if start:
+                console.job_started(job, self._host(job.target))
                 self._run_body(job, body)
         self._reap()
 
@@ -552,6 +681,7 @@ class JobManager:
         def progress(done: int, total: int) -> None:
             with job.cond:
                 job.progress = (done, total)
+                job.progress_step = console.transfer_progress(job, done, total, job.progress_step)
                 job.cond.notify_all()
                 if job.cancel_requested:
                     raise _TransferCancelled()
@@ -579,9 +709,19 @@ class JobManager:
             self._finish_locked(job, SUCCEEDED)
 
     def _append_output(self, job: HubJob, stream: str, data: bytes) -> None:
+        if not data:
+            return
         with job.cond:
-            (job.stdout if stream == "stdout" else job.stderr).append(data)
+            buffer = job.buffer(stream)
+            start = buffer.total
+            buffer.append(data)
+            job.chunks.append((stream, start, buffer.total))
+            if len(job.chunks) > MAX_TRACKED_CHUNKS:
+                drop = len(job.chunks) - MAX_TRACKED_CHUNKS
+                del job.chunks[:drop]
+                job.chunks_base += drop
             job.cond.notify_all()
+        console.echo(job, stream, data)
 
     def _adopt_remote(self, job: HubJob, remote_job_id: str) -> None:
         with job.cond:
@@ -606,21 +746,18 @@ class JobManager:
             )
 
     def _finish_locked(self, job: HubJob, state: str, *, error: str | None = None) -> None:
-        """Settle ``job`` (caller holds ``job.cond``); audit before waking waiters."""
+        """Settle ``job`` (caller holds ``job.cond``).
+
+        The audit record and the console response box are written before waiters
+        wake, so the console shows the result before the caller's response line.
+        """
         if job.done:
             return
         job.state = state
         job.error = error
         job.finished_at = time.time()
         self._audit.record("job.finish", **self._audit_fields(job, include_spec=False))
-        log.info(
-            "job %s %s on %s%s%s",
-            job.id,
-            job.state,
-            job.target.id,
-            "" if job.exit_code is None else f" exit={job.exit_code}",
-            "" if not job.error else f" ({job.error})",
-        )
+        console.job_finished(job)
         job.cond.notify_all()
 
     def _reap(self) -> None:
@@ -639,12 +776,6 @@ class JobManager:
                 expired = now - broadcast.created_at > self._retention_s
                 if expired and not any(job_id in self._jobs for job_id in broadcast.job_ids):
                     self._broadcasts.pop(broadcast_id, None)
-
-    @staticmethod
-    def _describe(job: HubJob) -> str:
-        if job.type == "exec":
-            return f"{job.spec['language']}, timeout {job.spec['timeout_s']:g}s"
-        return f"{job.type} {job.spec['local_path']} <-> {job.spec['remote_path']}"
 
     @staticmethod
     def _audit_fields(job: HubJob, *, include_spec: bool) -> dict[str, Any]:

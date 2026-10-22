@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import threading
+import time
 import uuid
 from types import SimpleNamespace
 
@@ -15,7 +16,6 @@ import requests
 
 from privy import __version__
 from privy.hub.app import build_hub
-from privy.hub.home import read_token
 
 pytestmark = pytest.mark.e2e
 
@@ -43,7 +43,6 @@ def hub(relay_creds, relay_server, tmp_path_factory):
     thread = threading.Thread(target=runtime.serve_forever, name="privy-hub-e2e", daemon=True)
     thread.start()
     session = requests.Session()
-    session.headers["Authorization"] = f"Bearer {read_token(home)}"
     try:
         yield SimpleNamespace(
             url=runtime.url,
@@ -75,8 +74,8 @@ def test_hub_probes_the_live_listener_and_a_missing_hybrid_connection(hub):
     by_id = {target["id"]: target for target in payload["targets"]}
     live = by_id[hub.target]
     assert live["status"] == "online"
-    assert live["listener"]["hostname"] == socket.gethostname()
-    assert live["listener"]["privy_version"] == __version__
+    assert live["host"] == socket.gethostname()
+    assert live["privy_version"] == __version__
     assert by_id[hub.missing]["status"] == "not_found"
 
     detail = _get(hub, f"/v1/targets/{hub.target}")
@@ -97,7 +96,6 @@ def test_hub_runs_python_and_bash_through_the_relay(hub):
 
     assert python["state"] == "succeeded" and python["stdout"].strip() == marker
     assert bash["state"] == "succeeded" and bash["stdout"] == marker
-    assert python["remote_job_id"]
 
 
 def test_hub_returns_running_jobs_and_collects_them_later(hub):
@@ -108,7 +106,8 @@ def test_hub_returns_running_jobs_and_collects_them_later(hub):
 
     finished = _get(hub, f"/v1/jobs/{started['job_id']}", wait_s=60)
     assert finished["state"] == "succeeded"
-    assert finished["stdout"].splitlines() == ["first", "second"]
+    # Each read returns only output produced since the previous one.
+    assert (started["stdout"] + finished["stdout"]).splitlines() == ["first", "second"]
     page = _get(hub, f"/v1/jobs/{started['job_id']}/output", offset=0, limit=5)
     assert page["data"] == "first"
 
@@ -196,3 +195,30 @@ def test_mcp_tools_call_runs_code_on_the_listener(hub):
     result = response.json()["result"]
     assert result["isError"] is False
     assert result["structuredContent"]["stdout"].strip() == marker
+
+
+def test_hub_streams_output_while_the_command_runs(hub):
+    code = "import time\nfor i in range(3):\n    print(f'line {i}', flush=True)\n    time.sleep(1.5)\n"
+    url = f"{hub.url}/v1/jobs?stream=true&target={hub.target}&language=python"
+    arrivals = []
+    started = time.monotonic()
+    with hub.session.post(url, data=code.encode(), stream=True, timeout=180) as response:
+        assert response.status_code == 200
+        for line in response.iter_lines():
+            arrivals.append((time.monotonic() - started, line.decode()))
+
+    lines = [line for _, line in arrivals]
+    assert lines[0].startswith("[privy] job=") and lines[1:4] == ["line 0", "line 1", "line 2"]
+    assert " state=succeeded exit=0 " in lines[-1]
+    # line 0 must arrive long before the command ends (about 4.5 seconds later).
+    assert arrivals[-1][0] - arrivals[1][0] > 2.5
+
+
+def test_hub_takes_raw_code_and_answers_in_text(hub):
+    marker = uuid.uuid4().hex
+    url = f"{hub.url}/v1/jobs?target={hub.target}&language=bash&format=text"
+
+    response = hub.session.post(url, data=f"printf {marker}".encode(), timeout=180)
+
+    assert response.status_code == 200 and response.headers["Content-Type"].startswith("text/plain")
+    assert "): succeeded, exit 0" in response.text and response.text.endswith(f"\n{marker}\n")

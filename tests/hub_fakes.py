@@ -16,7 +16,6 @@ from privy.hub.registry import TargetRegistry
 from privy.hub.service import HubService
 from privy.transfer import TransferResult
 
-TOKEN = "test-hub-token"
 PORT = 7748
 HOST = f"127.0.0.1:{PORT}"
 
@@ -57,6 +56,29 @@ def blocking_run(request, on_output, on_submit, listener):
     listener.started.set()
     listener.cancel_event.wait(10)
     return exec_result(exit_code=130, stdout=b"started\n", error="cancelled")
+
+
+class Scripted:
+    """A listener run that emits each output step only when the test releases it."""
+
+    def __init__(self, steps):
+        self.steps = list(steps)
+        self.gate = threading.Semaphore(0)
+        self.emitted = threading.Semaphore(0)
+
+    def __call__(self, request, on_output, on_submit, listener):
+        on_submit("remote-1")
+        for stream, data in self.steps:
+            assert self.gate.acquire(timeout=5)
+            on_output(stream, data)
+            self.emitted.release()
+        assert self.gate.acquire(timeout=5)
+        stdout = b"".join(data for stream, data in self.steps if stream == "stdout")
+        return exec_result(stdout=stdout)
+
+    def step(self):
+        self.gate.release()
+        assert self.emitted.acquire(timeout=5)
 
 
 class FakeListener:
@@ -161,7 +183,7 @@ class Hub:
         self.audit_path = tmp_path / "audit.jsonl"
         self.jobs = JobManager(self.registry, audit=AuditLog(self.audit_path), **job_options)
         self.service = HubService(registry=self.registry, jobs=self.jobs, version="test")
-        self.app = HubApp(self.service, token=TOKEN, port=PORT)
+        self.app = HubApp(self.service, port=PORT)
 
     def _client(self, target) -> FakeRelayClient:
         return FakeRelayClient(self.listeners.setdefault(target.id, FakeListener(hostname=target.path)))
@@ -172,12 +194,26 @@ class Hub:
         path: str,
         body: Any = None,
         *,
-        token: str | None = TOKEN,
         headers: dict[str, str] | None = None,
     ) -> HttpResponse:
+        """Call the app like an HTTP client: dicts and lists go as JSON, str and bytes as raw bodies."""
         request_headers = {"Host": HOST}
-        if token is not None:
-            request_headers["Authorization"] = f"Bearer {token}"
+        if body is None:
+            raw = b""
+        elif isinstance(body, bytes):
+            raw = body
+        elif isinstance(body, str):
+            raw = body.encode("utf-8")
+        else:
+            raw = json.dumps(body).encode()
+            request_headers["Content-Type"] = "application/json"
         request_headers.update(headers or {})
-        raw = b"" if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
         return self.app.handle(method, path, Headers(request_headers.items()), raw)
+
+    def stream(self, method: str, path: str, body: Any = None, **kwargs: Any) -> tuple[HttpResponse, bytes]:
+        """Call a streaming route and collect everything it writes."""
+        response = self.call(method, path, body, **kwargs)
+        chunks: list[bytes] = []
+        if response.stream is not None:
+            response.stream(chunks.append)
+        return response, b"".join(chunks)

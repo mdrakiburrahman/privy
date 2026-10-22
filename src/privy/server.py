@@ -31,6 +31,7 @@ from typing import Any
 
 import websocket
 
+from privy._logfmt import MAX_LOG_BYTES, decode_for_log, indent, short_id
 from privy._relay import (
     DEFAULT_TOKEN_TTL_SECONDS,
     RelayCredential,
@@ -74,7 +75,10 @@ def _ensure_default_logging() -> None:
 
 log = logging.getLogger("privy.server")
 
-_MAX_LOG_BYTES = 4000  # truncate very long output in the console dump
+_MAX_LOG_BYTES = MAX_LOG_BYTES  # truncate very long output in the console dump
+_short_id = short_id
+_decode_for_log = decode_for_log
+_indent = indent
 
 
 def _format_lifetime(seconds: int) -> str:
@@ -85,28 +89,6 @@ def _format_lifetime(seconds: int) -> str:
     if seconds >= 60:
         return f"{seconds // 60}m"
     return f"{seconds}s"
-
-
-def _short_id(request_id: Any) -> str:
-    s = str(request_id or "-")
-    return s if len(s) <= 12 else s[:8] + "…"
-
-
-def _decode_for_log(data: bytes) -> str:
-    if not data:
-        return ""
-    truncated = len(data) > _MAX_LOG_BYTES
-    view = data[:_MAX_LOG_BYTES]
-    text = view.decode("utf-8", "replace").rstrip("\n")
-    if truncated:
-        text += f"\n… [truncated {len(data) - _MAX_LOG_BYTES} more bytes]"
-    return text
-
-
-def _indent(text: str, prefix: str = "    ") -> str:
-    if not text:
-        return prefix + "(empty)"
-    return "\n".join(prefix + line for line in text.splitlines())
 
 
 def _log_request(req: ExecRequest, request_id: Any) -> None:

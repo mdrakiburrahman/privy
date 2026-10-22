@@ -16,6 +16,8 @@ from privy.hub.registry import (
     TargetLookupError,
     TargetRegistry,
     describe_relay_failure,
+    language_from,
+    machine_name,
 )
 
 NO_LISTENER = (
@@ -71,6 +73,69 @@ def test_resolve_explains_an_empty_registry(tmp_path):
 
     with pytest.raises(TargetLookupError, match="no relays are hydrated"):
         registry.resolve("anything")
+
+
+def test_resolve_accepts_machine_and_host_names(tmp_path):
+    offline = FakeListener(info_error=RelayHTTPError("x", status_code=404, detail=NO_LISTENER))
+    registry = _registry(
+        tmp_path, {"dev/box2_windows": FakeListener(hostname="BUILD-07"), "contoso-lab/box1_windows": offline}
+    )
+
+    assert registry.resolve("box2").id == "dev/box2_windows"
+    assert registry.resolve("GPU1").id == "contoso-lab/gpu1_linux"
+    assert registry.resolve("build-07").id == "dev/box2_windows"
+    assert registry.resolve("contoso-lab/box1").id == "contoso-lab/box1_windows"
+    # box1 exists in both relays; only one of them is online, so that one is meant.
+    assert registry.resolve("box1").id == "dev/box1_windows"
+
+
+def test_ambiguous_names_list_every_candidate_with_its_status(tmp_path):
+    registry = _registry(tmp_path, {})
+
+    with pytest.raises(TargetLookupError) as ambiguous:
+        registry.resolve("box1")
+
+    assert "dev/box1_windows (online)" in str(ambiguous.value)
+    assert ambiguous.value.candidates == ["contoso-lab/box1_windows", "dev/box1_windows"]
+
+
+@pytest.mark.parametrize("name", ["", "   ", "dev/", "dev/  "])
+def test_empty_names_never_match_a_target(tmp_path, name):
+    # Targets without a known host name (offline, older listeners) must not match an empty name.
+    offline = FakeListener(info_error=RelayHTTPError("x", status_code=404, detail=NO_LISTENER))
+    registry = _registry(
+        tmp_path,
+        {
+            "dev/box1_windows": FakeListener(legacy=True),
+            "dev/box2_windows": offline,
+            "contoso-lab/gpu1_linux": offline,
+            "contoso-lab/box1_windows": offline,
+        },
+    )
+
+    with pytest.raises(TargetLookupError):
+        registry.resolve(name)
+
+
+@pytest.mark.parametrize(
+    ("info", "path", "language"),
+    [
+        ({"platform": {"system": "Windows"}}, "box_linux", "powershell"),
+        ({"platform": {"system": "Linux"}}, "box_windows", "bash"),
+        (None, "box_windows", "powershell"),
+        (None, "box_wsl", "bash"),
+        (None, "box_devcontainer", "bash"),
+        (None, "box", None),
+    ],
+)
+def test_default_language_follows_the_listener_os(info, path, language):
+    assert language_from(info, path) == language
+
+
+def test_machine_names_drop_the_platform_suffix():
+    assert machine_name("DevBox01_windows") == "devbox01"
+    assert machine_name("gpu_box_linux") == "gpu_box"
+    assert machine_name("plain") == "plain"
 
 
 def test_select_matches_ids_or_hybrid_connection_names(tmp_path):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from collections.abc import Callable, Iterable
@@ -45,6 +46,8 @@ from privy.transfer import (
 from privy.transfer import (
     upload_file as upload_over_relay,
 )
+
+log = logging.getLogger("privy.client")
 
 #: Azure Relay fails a request whose listener has not responded within roughly
 #: a minute ("the listener did not respond in the required time", HTTP 504).
@@ -496,11 +499,26 @@ class RelayClient:
     # ---- internals -----------------------------------------------------
 
     def _send_raw(self, request: ExecRequest, *, http_timeout_s: float | None = None) -> ExecResponse:
+        started = time.monotonic()
         payload = self._post_json(
             request.to_json(),
             http_timeout_s=http_timeout_s,
         )
-        return ExecResponse.from_json(json.dumps(payload))
+        response = ExecResponse.from_json(json.dumps(payload))
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "relay %s/%s %s%s -> %s exit=%s stdout+%d stderr+%d (%d ms)",
+                self._credential.namespace,
+                self._credential.path,
+                request.action,
+                f" job={request.job_id}" if request.job_id else f" {request.kind}",
+                response.state or "done",
+                response.exit_code,
+                len(response.stdout_b64) * 3 // 4,
+                len(response.stderr_b64) * 3 // 4,
+                (time.monotonic() - started) * 1000,
+            )
+        return response
 
     def _send(
         self,
