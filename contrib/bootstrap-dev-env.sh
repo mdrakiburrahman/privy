@@ -9,6 +9,8 @@
 # ---------------------------------------------------------------------------------------
 #
 
+set -eo pipefail
+
 export REPO_ROOT=$(git rev-parse --show-toplevel)
 export DEBIAN_FRONTEND=noninteractive
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v "/mnt/c" | tr '\n' ':' | sed 's/:$//')
@@ -20,6 +22,7 @@ command -v curl &>/dev/null || PACKAGES="$PACKAGES curl"
 command -v gh &>/dev/null || PACKAGES="$PACKAGES gh"
 command -v jq &>/dev/null || PACKAGES="$PACKAGES jq"
 command -v file &>/dev/null || PACKAGES="$PACKAGES file"
+command -v wslview &>/dev/null || PACKAGES="$PACKAGES wslu"
 
 [ -n "$PACKAGES" ] && sudo apt-get update -qq && sudo apt-get install -yqq $PACKAGES
 
@@ -45,7 +48,7 @@ fi
 
 command -v uv &>/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh; source "$HOME/.local/bin/env" 2>/dev/null || true; }
 
-AZ_PATH=$(which az 2>/dev/null)
+AZ_PATH=$(which az 2>/dev/null || true)
 if [[ -z "$AZ_PATH" || "$AZ_PATH" == *"/mnt/c"* ]]; then
   echo "Native Linux Azure CLI not found, installing..."
   curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
@@ -54,14 +57,19 @@ if [[ -z "$AZ_PATH" || "$AZ_PATH" == *"/mnt/c"* ]]; then
 else
   echo "Native Linux Azure CLI already installed at: $AZ_PATH"
 fi
-az account get-access-token --query "expiresOn" -o tsv >/dev/null 2>&1
-if [[ $? -ne 0 ]]; then
+if ! az account get-access-token --query "expiresOn" -o tsv >/dev/null 2>&1; then
     echo "az is not logged in, logging in..."
-    az login >/dev/null
+    # prompt=none lets the signed-in Windows browser complete the login with single sign-on, without clicks.
+    # Login experience v2 off skips the subscription picker that waits for input in a terminal.
+    BROWSER='bash -c "exec wslview \"${0/prompt=select_account/prompt=none}\"" %s' AZURE_CORE_LOGIN_EXPERIENCE_V2=off \
+        az login --output none
 fi
 
 [[ ":$PATH:" != *":$HOME/.local/bin:"* ]] && export PATH="$HOME/.local/bin:$PATH"
-code --install-extension donjayamanne.python-extension-pack
+# Only VS Code's WSL terminal provides code; the one-shot Taskfile runs this before VS Code opens.
+if command -v code &>/dev/null; then
+  code --install-extension donjayamanne.python-extension-pack
+fi
 
 echo "Done"
 echo "Python: $(python --version)"

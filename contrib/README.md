@@ -11,43 +11,35 @@ For build, test, packaging, GCI, and publishing commands, see the
    winget install -e --id Microsoft.VisualStudioCode
    ```
 
-1. Get a fresh new WSL machine up:
-
-   > ⚠️ Warning: this removes Docker Desktop if you have it installed
+1. Clone the repo on Windows, then check out and push the branch you want to work on:
 
    ```powershell
-   $GIT_ROOT = git rev-parse --show-toplevel
-   & "$GIT_ROOT\contrib\bootstrap-dev-env.ps1"
-   ```
-
-1. Clone the repo, and open VSCode in it:
-
-   > ⚠️ Important: We use WSL in `~/` because Linux > Windows drive commits via `/mnt/c` is
-   > extremely slow for Spark I/O. You can technically run the Devcontainer using Windows Docker
-   > Desktop, but the I/O experience is slow and poor.
-
-   ```bash
-   cd ~/
-
-   read -p "Enter your name (e.g. 'FirstName LastName'): " user_name
-   read -p "Enter your GitHub email (e.g. 'your-email@blah.com'): " user_email
-   read -p "Enter the branch to switch to: (e.g. 'main') " branch_name
-
    git clone https://github.com/mdrakiburrahman/privy.git
-
-   git config --global user.name "$user_name"
-   git config --global user.email "$user_email"
-   cd privy/
-   git pull origin
-   git switch "$branch_name"
-   code .
    ```
 
-1. Run the bootstrapper script, that installs all tools idempotently:
+1. From an **elevated PowerShell 7** prompt in the checkout, install [Task](https://taskfile.dev)
+   and run [`bootstrap-dev-env.yaml`](bootstrap-dev-env.yaml):
+
+   > ⚠️ This **deletes every WSL distribution** on the machine before recreating `Ubuntu-24.04`, and
+   > removes Docker Desktop if you have it installed. Push any work inside WSL first.
+
+   ```powershell
+   winget install Task.Task
+   $env:PATH = [Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('PATH', 'User')
+   task --taskfile contrib/bootstrap-dev-env.yaml
+   ```
+
+   Without any prompts, this recreates WSL on the drive with the most free space and clones your
+   current branch into `/workspaces/privy` with this checkout's git identity. It then runs
+   [`bootstrap-dev-env.sh`](bootstrap-dev-env.sh), which installs all tools idempotently and signs
+   in the Azure CLI through your signed-in browser with single sign-on (no clicks), then opens the
+   repo in VS Code connected to WSL. After a restart, run
+   `task --taskfile contrib/bootstrap-dev-env.yaml up` instead; it keeps WSL and reopens VS Code.
+
+1. Install the Python extension pack from VS Code's WSL terminal (optional):
 
    ```bash
-   GIT_ROOT=$(git rev-parse --show-toplevel)
-   chmod +x ${GIT_ROOT}/contrib/bootstrap-dev-env.sh && ${GIT_ROOT}/contrib/bootstrap-dev-env.sh
+   code --install-extension donjayamanne.python-extension-pack
    ```
 
 1. Install recommended developer tooling (optional):
@@ -64,7 +56,7 @@ $HOME/.local/bin/copilot --yolo
    ```
 
 1. If `uv` (or other tools installed by the bootstrapper) isn't found in a shell that was already
-   open before running step 4, reload your shell config to pick up the updated `PATH`:
+   open before the bootstrap ran, reload your shell config to pick up the updated `PATH`:
 
    ```bash
    source ~/.bashrc
