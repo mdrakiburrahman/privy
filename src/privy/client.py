@@ -29,6 +29,8 @@ from privy.batch import (
 from privy.protocol import (
     DEFAULT_POLL_WAIT_S,
     DEFAULT_TIMEOUT_S,
+    LISTENER_INFO_KIND,
+    PROTOCOL_VERSION,
     ExecRequest,
     ExecResponse,
 )
@@ -62,6 +64,34 @@ _POLL_BACKOFF_MAX_S = 5.0
 #: ``on_output(stream, data)`` receives ``("stdout" | "stderr", bytes)`` as soon as
 #: the listener has produced them.
 OutputCallback = Callable[[str, bytes], None]
+
+#: ``on_submit(job_id)`` receives the listener's job id once a job was accepted.
+SubmitCallback = Callable[[str], None]
+
+#: HTTP timeout for a ``listener_info`` probe.
+_INFO_HTTP_TIMEOUT_S = 15.0
+_ERROR_DETAIL_CHARS = 300
+
+
+class RelayHTTPError(RuntimeError):
+    """A Relay request failed before the listener produced a JSON answer.
+
+    ``status_code`` is the HTTP status from Azure Relay or the listener, or
+    ``None`` when no response arrived; ``timed_out`` marks a client-side timeout.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        timed_out: bool = False,
+        detail: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.timed_out = timed_out
+        self.detail = detail
 
 
 #: Consecutive failed streaming polls tolerated before giving up.
@@ -254,12 +284,29 @@ class RelayClient:
         """Run commands according to their dependency graph."""
         return run_command_batch(self, commands, max_parallel=max_parallel)
 
+    def listener_info(self, *, http_timeout_s: float = _INFO_HTTP_TIMEOUT_S) -> dict[str, Any] | None:
+        """Describe the listener (host, OS, runtimes) without running any code.
+
+        Returns ``None`` when the listener is reachable but predates this
+        request. Raises :class:`RelayHTTPError` when it cannot be reached.
+        """
+        payload = self._post_json(
+            json.dumps({"kind": LISTENER_INFO_KIND, "protocol_version": PROTOCOL_VERSION}),
+            http_timeout_s=http_timeout_s,
+        )
+        if payload.get("kind") == LISTENER_INFO_KIND:
+            return payload
+        if payload.get("error") == "bad_request":
+            return None
+        raise RuntimeError("listener returned an unexpected listener_info response")
+
     def send(
         self,
         request: ExecRequest,
         *,
         async_job: bool | None = None,
         on_output: OutputCallback | None = None,
+        on_submit: SubmitCallback | None = None,
     ) -> ExecResult:
         """Send an :class:`ExecRequest`, synchronously or as a background job.
 
@@ -274,16 +321,21 @@ class RelayClient:
         byte is delivered through the callback exactly once (against a listener
         without streaming support, all of it arrives at completion). The
         returned result still holds the complete output.
+
+        ``on_submit`` receives the listener's job id as soon as the job is
+        accepted, so another thread can :meth:`cancel` it. It also implies
+        ``async_job=True``.
         """
-        if on_output is not None:
-            if async_job is False:
-                raise ValueError("on_output requires the async job transport (async_job=False given)")
-            async_job = True
+        for name, callback in (("on_output", on_output), ("on_submit", on_submit)):
+            if callback is not None:
+                if async_job is False:
+                    raise ValueError(f"{name} requires the async job transport (async_job=False given)")
+                async_job = True
         if async_job is None:
             async_job = request.timeout_s > RELAY_RESPONSE_LIMIT_S
         if not async_job:
             return self._send(request)
-        return self._run_as_job(request, on_output)
+        return self._run_as_job(request, on_output, on_submit)
 
     def submit(self, request: ExecRequest) -> str:
         """Start ``request`` in the background; returns its ``job_id``."""
@@ -321,7 +373,12 @@ class RelayClient:
 
     # ---- async job driver ---------------------------------------------
 
-    def _run_as_job(self, request: ExecRequest, on_output: OutputCallback | None = None) -> ExecResult:
+    def _run_as_job(
+        self,
+        request: ExecRequest,
+        on_output: OutputCallback | None = None,
+        on_submit: SubmitCallback | None = None,
+    ) -> ExecResult:
         submitted = self._send_raw(
             replace(request, action="submit", stream=on_output is not None),
             http_timeout_s=_CONTROL_HTTP_TIMEOUT_S,
@@ -334,6 +391,8 @@ class RelayClient:
             return result
 
         job_id = submitted.job_id
+        if on_submit is not None:
+            on_submit(job_id)
         if on_output is not None and submitted.stream:
             return self._stream_job(request, job_id, on_output)
 
@@ -478,7 +537,19 @@ class RelayClient:
             response.raise_for_status()
         except requests.RequestException as exc:
             message = redact_relay_secrets(str(exc))
-            raise RuntimeError(f"relay request failed: {message}") from None
+            failed = getattr(exc, "response", None)
+            detail = ""
+            if failed is not None:
+                try:
+                    detail = redact_relay_secrets(failed.text[:_ERROR_DETAIL_CHARS])
+                except Exception:  # noqa: BLE001 - diagnostics only
+                    detail = ""
+            raise RelayHTTPError(
+                f"relay request failed: {message}",
+                status_code=None if failed is None else failed.status_code,
+                timed_out=isinstance(exc, requests.Timeout),
+                detail=detail,
+            ) from None
         try:
             decoded = response.json()
         except json.JSONDecodeError as exc:

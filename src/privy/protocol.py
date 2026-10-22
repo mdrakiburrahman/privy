@@ -27,6 +27,9 @@ MAX_POLL_WAIT_S = 45.0
 #: Upper bound on streamed output (stdout + stderr) carried by one poll response.
 MAX_STREAM_CHUNK_BYTES = 256 * 1024
 
+#: Request kind answered with a description of the listener instead of running code.
+LISTENER_INFO_KIND = "listener_info"
+
 
 def b64encode_bytes(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")

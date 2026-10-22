@@ -234,7 +234,7 @@ class ProxyClientServer:
 
         from privy.proxy import ProxyClientServer
         proxy = ProxyClientServer(
-            namespace="mdrrahman-dev-relay",
+            namespace="my-relay",
             path="demo",
             keyrule="demo-listen-send",
             key="...",
