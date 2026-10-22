@@ -48,9 +48,10 @@ examples in one deterministic plain-text document.
 ## Control many listeners
 
 `privy hub serve` runs a local control plane for every listener whose Relay keys you hydrate. It
-reports which machines are online and runs code or copies files on any of them through a loopback
-REST API and an MCP endpoint that Copilot and other AI assistants can use. See [Hub](docs/HUB.md)
-and [Scheduled tasks](docs/SCHEDULED_TASKS.md).
+reports which machines are online and runs code or copies files on any of them, with live output,
+through a REST API and an MCP endpoint. It has no authentication: point an AI assistant at
+`http://127.0.0.1:7748/` and it can start running commands. See [Hub](docs/HUB.md) and
+[Scheduled tasks](docs/SCHEDULED_TASKS.md).
 
 ## Documentation
 
@@ -64,7 +65,7 @@ and [Scheduled tasks](docs/SCHEDULED_TASKS.md).
 | [Authentication](docs/AUTHENTICATION.md)   | Injected SAS tokens, providers, validation, expiry, TTLs, and broker flows.                   |
 | [File transfer](docs/FILE_TRANSFER.md)     | Chunking, resume, SHA-256 integrity, paths, and overwrite behavior.                           |
 | [HTTP proxy](docs/PROXY.md)                | Browse or call a remote HTTP service through the Relay listener.                              |
-| [Hub](docs/HUB.md)                         | Discover, probe, and run code on many listeners through a local REST API and MCP endpoint.    |
+| [Hub](docs/HUB.md)                         | Discover, probe, and run code on many listeners with live output through REST and MCP.        |
 | [Scheduled tasks](docs/SCHEDULED_TASKS.md) | Run listeners and the hub as Windows logon tasks, and hydrate the hub's Relay keys.           |
 | [Deployment](docs/DEPLOYMENT.md)           | Build the wheel/CLI, run GCI, publish after merge, and download artifacts.                    |
 | [Python package feeds](docs/PYPI.md)       | Use an approved package mirror when direct PyPI access is blocked.                            |

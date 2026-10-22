@@ -14,6 +14,7 @@ from typing import Any
 
 from privy._relay import RelayTokenError, redact_relay_secrets
 from privy.client import RelayClient, RelayHTTPError
+from privy.hub import console
 from privy.hub.config import RelaysSnapshot, RelaysStore, Target
 
 log = logging.getLogger("privy.hub")
@@ -101,6 +102,34 @@ def _matches(target: Target, pattern: str) -> bool:
     return "/" not in pattern and fnmatch.fnmatchcase(target.path.lower(), pattern)
 
 
+def machine_name(path: str) -> str:
+    """The machine part of a hybrid connection name: ``devbox01_windows`` -> ``devbox01``."""
+    return path.rsplit("_", 1)[0].lower() if "_" in path else path.lower()
+
+
+_WINDOWS_SUFFIXES = ("windows", "win")
+_POSIX_SUFFIXES = ("linux", "wsl", "devcontainer", "ubuntu", "debian", "mac", "macos", "darwin")
+
+
+def language_from(info: dict[str, Any] | None, path: str) -> str | None:
+    """Default language for a listener: ``powershell`` on Windows, ``bash`` elsewhere.
+
+    Uses the listener's reported OS, else the hybrid connection's suffix
+    (``_windows``, ``_wsl``, ...); ``None`` when neither tells.
+    """
+    system = str(((info or {}).get("platform") or {}).get("system") or "")
+    if system == "Windows":
+        return "powershell"
+    if system:
+        return "bash"
+    suffix = path.rsplit("_", 1)[-1].lower() if "_" in path else ""
+    if suffix in _WINDOWS_SUFFIXES:
+        return "powershell"
+    if suffix in _POSIX_SUFFIXES:
+        return "bash"
+    return None
+
+
 class TargetRegistry:
     """Resolve, select, and probe the targets hydrated in ``relays.json``."""
 
@@ -135,26 +164,78 @@ class TargetRegistry:
         return RelayClient(**target.relay_client_kwargs(ttl_seconds=self._token_ttl_s))
 
     def resolve(self, name: str) -> Target:
-        """Find a target by id (``relay/path``) or by a hybrid connection name unique across relays."""
+        """Find one target by name.
+
+        Accepted, in order: the full id (``relay/hyco``), the hybrid connection
+        name, the machine name (the hybrid connection name without a trailing
+        ``_windows``-style suffix), or the listener's host name. Any of them may
+        be prefixed with ``relay/``. When several targets match, the single one
+        that is online wins.
+        """
         wanted = name.strip().lower()
         targets = self.snapshot().targets
-        for target in targets:
-            if target.id.lower() == wanted:
-                return target
-        by_path = [target for target in targets if target.path.lower() == wanted]
-        if len(by_path) == 1:
-            return by_path[0]
-        if by_path:
-            ids = sorted(target.id for target in by_path)
-            raise TargetLookupError(f"target {name!r} is ambiguous; use one of: {', '.join(ids)}", ids)
-        names = [target.id for target in targets] + [target.path for target in targets]
-        close = difflib.get_close_matches(name, names, n=5, cutoff=0.5)
         if not targets:
             raise TargetLookupError(
                 f"unknown target {name!r}: no relays are hydrated (see {self.snapshot().path})"
             )
+        if not wanted:
+            raise TargetLookupError("target must not be empty; call list_targets to see all targets")
+        for target in targets:
+            if target.id.lower() == wanted:
+                return target
+        scope, short = list(targets), wanted
+        relay, slash, rest = wanted.partition("/")
+        if slash:
+            scoped = [target for target in targets if target.relay.lower() == relay]
+            if scoped:
+                scope, short = scoped, rest.strip()
+                if not short:
+                    raise TargetLookupError(
+                        f"target {name!r} names no machine after the relay",
+                        [target.id for target in scoped],
+                    )
+        candidates = [target for target in scope if target.path.lower() == short]
+        if not candidates:
+            candidates = [target for target in scope if machine_name(target.path) == short]
+        if not candidates:
+            self.probe_many(scope)
+            candidates = [target for target in scope if self._has_hostname(target, short)]
+        if len(candidates) == 1:
+            return candidates[0]
+        if candidates:
+            probes = self.probe_many(candidates)
+            online = [target for target in candidates if probes[target.id].status == ONLINE]
+            if len(online) == 1:
+                return online[0]
+            ordered = sorted(candidates, key=lambda item: item.id)
+            listing = ", ".join(f"{target.id} ({probes[target.id].status})" for target in ordered)
+            raise TargetLookupError(
+                f"target {name!r} is ambiguous; use one of: {listing}",
+                [target.id for target in ordered],
+            )
+        names = sorted(
+            {target.id for target in targets}
+            | {target.path for target in targets}
+            | {machine_name(target.path) for target in targets}
+        )
+        close = difflib.get_close_matches(name.strip(), names, n=5, cutoff=0.5)
         hint = f"; did you mean: {', '.join(close)}" if close else "; call list_targets to see all targets"
         raise TargetLookupError(f"unknown target {name!r}{hint}", close)
+
+    def _hostname(self, target: Target) -> str | None:
+        cached = self.cached(target)
+        if cached is None or not cached.info:
+            return None
+        hostname = cached.info.get("hostname")
+        return hostname if isinstance(hostname, str) else None
+
+    def _has_hostname(self, target: Target, wanted: str) -> bool:
+        hostname = self._hostname(target)
+        return hostname is not None and hostname.strip().lower() == wanted
+
+    def default_language(self, target: Target) -> str | None:
+        """``powershell`` for Windows listeners, ``bash`` elsewhere, ``None`` if unknown."""
+        return language_from(self.probe(target).info, target.path)
 
     def select(self, patterns: Iterable[str]) -> list[Target]:
         """Targets whose id (or hybrid connection name) matches any glob pattern."""
@@ -181,6 +262,7 @@ class TargetRegistry:
         result = self._probe_now(target)
         with self._cache_lock:
             self._cache[target.id] = result
+        console.probe(target, result)
         return result
 
     def probe_many(self, targets: Sequence[Target], *, refresh: bool = False) -> dict[str, ProbeResult]:

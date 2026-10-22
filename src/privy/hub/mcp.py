@@ -1,4 +1,4 @@
-"""Model Context Protocol endpoint (Streamable HTTP, JSON responses).
+"""Model Context Protocol endpoint (Streamable HTTP).
 
 The hub is a *dual-era* MCP server:
 
@@ -10,7 +10,12 @@ The hub is a *dual-era* MCP server:
   The hub answers without minting an ``Mcp-Session-Id``: every request is
   self-contained, so no session state is needed.
 
-Every hub operation is exposed as one tool.
+Every hub operation is exposed as one tool. A ``tools/call`` that waits for
+jobs and carries ``params._meta.progressToken`` (from a client accepting
+``text/event-stream``) is answered as an SSE stream: ``notifications/progress``
+with the newest output while the call waits, then the JSON-RPC response.
+Tool results carry a plain-text rendering as ``content`` and the JSON as
+``structuredContent``.
 """
 
 from __future__ import annotations
@@ -19,10 +24,20 @@ import base64
 import binascii
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
-from privy.hub.service import INSTRUCTIONS, OPERATIONS, OPERATIONS_BY_NAME, HubError, HubService
+from privy.hub.render import render, render_error
+from privy.hub.responses import EVENT_STREAM_TYPE, HttpResponse, json_bytes
+from privy.hub.service import (
+    INSTRUCTIONS,
+    OPERATIONS,
+    OPERATIONS_BY_NAME,
+    PROGRESS_OPERATIONS,
+    HubError,
+    HubService,
+    Progress,
+)
 
 log = logging.getLogger("privy.hub")
 
@@ -32,8 +47,7 @@ LEGACY_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 SUPPORTED_VERSIONS = MODERN_VERSIONS + LEGACY_VERSIONS
 SERVER_NAME = "privy-hub"
 
-#: Caching hints required on cacheable modern results. Only an authenticated
-#: caller can read them, so they are private to that caller.
+#: Caching hints required on cacheable modern results.
 DISCOVER_TTL_MS = 60 * 60 * 1000
 TOOLS_TTL_MS = 5 * 60 * 1000
 CACHE_SCOPE = "private"
@@ -103,6 +117,46 @@ def tool_definitions() -> list[dict[str, Any]]:
     ]
 
 
+def _protocol_version(params: dict[str, Any]) -> Any:
+    meta = params.get("_meta")
+    return meta.get(META_PROTOCOL_VERSION) if isinstance(meta, dict) else None
+
+
+def _progress_token(message: Any, headers: Mapping[str, str]) -> str | int | None:
+    """The progress token of a tool call that waits for jobs, when the client accepts SSE."""
+    if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+        return None
+    if message.get("method") != "tools/call" or "id" not in message:
+        return None
+    if "text/event-stream" not in (headers.get("Accept") or "").lower():
+        return None
+    params = message.get("params")
+    if not isinstance(params, dict) or params.get("name") not in PROGRESS_OPERATIONS:
+        return None
+    meta = params.get("_meta")
+    token = meta.get("progressToken") if isinstance(meta, dict) else None
+    if isinstance(token, bool) or not isinstance(token, (str, int)):
+        return None
+    return token
+
+
+def _sse(payload: Any) -> bytes:
+    return b"event: message\ndata: " + json_bytes(payload) + b"\n\n"
+
+
+def _outcome(response: dict[str, Any] | None) -> str | None:
+    """What the console line says about a JSON-RPC response beyond its HTTP status."""
+    if not response:
+        return None
+    if "error" in response:
+        return f"rpc error {response['error'].get('code')}"
+    result = response.get("result")
+    if isinstance(result, dict) and result.get("isError"):
+        error = (result.get("structuredContent") or {}).get("error") or {}
+        return f"isError {error.get('code', '')}".rstrip()
+    return None
+
+
 class McpEndpoint:
     """Serve JSON-RPC messages POSTed to :data:`MCP_PATH`."""
 
@@ -110,30 +164,72 @@ class McpEndpoint:
         self.service = service
         self._tools = tool_definitions()
 
-    def handle(self, method: str, headers: Mapping[str, str], body: bytes) -> tuple[int, Any, dict[str, str]]:
-        """Return ``(HTTP status, JSON payload or None for no body, extra headers)``."""
+    def handle(self, method: str, headers: Mapping[str, str], body: bytes) -> HttpResponse:
         if method != "POST":
             payload = _error_payload(None, INVALID_REQUEST, "The MCP endpoint only accepts POST")
-            return 405, payload, {"Allow": "POST"}
+            return HttpResponse(405, payload, {"Allow": "POST"})
         try:
             message = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            return 400, _error_payload(None, PARSE_ERROR, "Parse error"), {}
+            return HttpResponse(400, _error_payload(None, PARSE_ERROR, "Parse error"))
 
         if isinstance(message, list):
-            # JSON-RPC batches were allowed by protocol 2025-03-26.
+            # JSON-RPC batches were allowed by protocol 2025-03-26; they get no progress.
             responses = [
                 response for _, response in (self._message(item, headers) for item in message) if response
             ]
             if not responses:
-                return 202, None, {}
-            return 200, responses, {}
+                return HttpResponse(202)
+            return HttpResponse(200, responses)
+        token = _progress_token(message, headers)
+        if token is not None:
+            return self._streamed(message, headers, token)
         status, response = self._message(message, headers)
         if response is None:
-            return 202, None, {}
-        return status, response, {}
+            return HttpResponse(202)
+        return HttpResponse(status, response, note=_outcome(response))
 
-    def _message(self, message: Any, headers: Mapping[str, str]) -> tuple[int, dict[str, Any] | None]:
+    def _streamed(
+        self, message: dict[str, Any], headers: Mapping[str, str], token: str | int
+    ) -> HttpResponse:
+        """Answer a tool call as SSE: progress notifications while it waits, then the response."""
+        params = message["params"]
+        version = _protocol_version(params)
+        if version is not None:
+            try:
+                self._check_modern("tools/call", params, version, headers)
+            except _RpcError as exc:
+                return HttpResponse(exc.status, _error_payload(message["id"], exc.code, str(exc), exc.data))
+        response = HttpResponse(200, content_type=EVENT_STREAM_TYPE, note="stream")
+
+        def write_events(write: Callable[[bytes], None]) -> None:
+            last = 0
+
+            def progress(text: str, done: int | None = None, total: int | None = None) -> None:
+                nonlocal last
+                # progress must grow with every notification, including heartbeats between byte counts.
+                last = done if done is not None and done > last else last + 1
+                update: dict[str, Any] = {"progressToken": token, "progress": last}
+                if total is not None:
+                    update["total"] = total
+                if text:
+                    update["message"] = text
+                write(_sse({"jsonrpc": "2.0", "method": "notifications/progress", "params": update}))
+
+            _, final = self._message(message, headers, progress)
+            outcome = _outcome(final)
+            response.note = f"stream {outcome}" if outcome else "stream"
+            write(_sse(final))
+
+        response.stream = write_events
+        return response
+
+    def _message(
+        self,
+        message: Any,
+        headers: Mapping[str, str],
+        progress: Progress | None = None,
+    ) -> tuple[int, dict[str, Any] | None]:
         if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
             return 400, _error_payload(None, INVALID_REQUEST, "Invalid Request")
         if "method" not in message or "id" not in message:
@@ -147,15 +243,17 @@ class McpEndpoint:
         if not isinstance(method, str) or not isinstance(params, dict):
             return 400, _error_payload(request_id, INVALID_REQUEST, "Invalid Request")
         try:
-            meta = params.get("_meta")
-            version = meta.get(META_PROTOCOL_VERSION) if isinstance(meta, dict) else None
+            version = _protocol_version(params)
             log.debug("MCP %s (%s)", method, f"modern {version}" if version is not None else "legacy")
             if version is not None:
-                result = self._modern(method, params, version, headers)
+                result = self._modern(method, params, version, headers, progress)
             else:
-                result = self._legacy(method, params)
+                result = self._legacy(method, params, progress)
         except _RpcError as exc:
             return exc.status, _error_payload(request_id, exc.code, str(exc), exc.data)
+        except ConnectionError:
+            # The client of a progress stream went away; the hub's job keeps running.
+            raise
         except Exception:  # noqa: BLE001 - never leak a traceback to the client
             log.exception("MCP %s failed", method)
             return 500, _error_payload(request_id, INTERNAL_ERROR, "Internal error")
@@ -163,7 +261,8 @@ class McpEndpoint:
 
     # ---- eras ---------------------------------------------------------------
 
-    def _modern(self, method: str, params: dict[str, Any], version: Any, headers: Mapping[str, str]) -> dict:
+    @staticmethod
+    def _check_modern(method: str, params: dict[str, Any], version: Any, headers: Mapping[str, str]) -> None:
         header_version = headers.get("MCP-Protocol-Version")
         if header_version != version:
             raise _RpcError(
@@ -193,19 +292,29 @@ class McpEndpoint:
                 status=400,
                 data={"supported": list(SUPPORTED_VERSIONS), "requested": version},
             )
+
+    def _modern(
+        self,
+        method: str,
+        params: dict[str, Any],
+        version: Any,
+        headers: Mapping[str, str],
+        progress: Progress | None,
+    ) -> dict[str, Any]:
+        self._check_modern(method, params, version, headers)
         if method == "server/discover":
             result = {**self._discover(), "ttlMs": DISCOVER_TTL_MS, "cacheScope": CACHE_SCOPE}
         elif method == "tools/list":
             result = {"tools": self._tools, "ttlMs": TOOLS_TTL_MS, "cacheScope": CACHE_SCOPE}
         elif method == "tools/call":
-            result = self._call_tool(params)
+            result = self._call_tool(params, progress)
         elif method == "ping":
             result = {}
         else:
             raise _RpcError(METHOD_NOT_FOUND, f"Method not found: {method}", status=404)
         return {"resultType": "complete", **result}
 
-    def _legacy(self, method: str, params: dict[str, Any]) -> dict:
+    def _legacy(self, method: str, params: dict[str, Any], progress: Progress | None) -> dict[str, Any]:
         if method == "initialize":
             requested = params.get("protocolVersion")
             negotiated = requested if requested in LEGACY_VERSIONS else LEGACY_VERSIONS[0]
@@ -220,7 +329,7 @@ class McpEndpoint:
         if method == "tools/list":
             return {"tools": self._tools}
         if method == "tools/call":
-            return self._call_tool(params)
+            return self._call_tool(params, progress)
         if method == "server/discover":
             return self._discover()
         raise _RpcError(METHOD_NOT_FOUND, f"Method not found: {method}")
@@ -238,38 +347,26 @@ class McpEndpoint:
             "instructions": INSTRUCTIONS,
         }
 
-    def _call_tool(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _call_tool(self, params: dict[str, Any], progress: Progress | None = None) -> dict[str, Any]:
         name = params.get("name")
         if not isinstance(name, str) or name not in OPERATIONS_BY_NAME:
             raise _RpcError(INVALID_PARAMS, f"Unknown tool: {name!r}")
         arguments = params.get("arguments")
         if arguments is None:
             arguments = {}
-        log.info("MCP tools/call %s%s", name, _describe_call(arguments))
         try:
             if not isinstance(arguments, dict):
                 raise HubError("arguments must be an object", code="invalid_argument")
-            result = self.service.invoke(name, arguments, origin="mcp")
+            result = self.service.invoke(name, arguments, origin="mcp", progress=progress)
         except HubError as exc:
-            error = {"error": exc.to_dict()}
+            error = exc.to_dict()
             return {
-                "content": [{"type": "text", "text": json.dumps(error, indent=2, ensure_ascii=False)}],
-                "structuredContent": error,
+                "content": [{"type": "text", "text": render_error(error)}],
+                "structuredContent": {"error": error},
                 "isError": True,
             }
         return {
-            "content": [{"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}],
+            "content": [{"type": "text", "text": render(name, result, transport="mcp")}],
             "structuredContent": result,
             "isError": False,
         }
-
-
-def _describe_call(arguments: Any) -> str:
-    if not isinstance(arguments, dict):
-        return ""
-    parts = [
-        f"{key}={arguments[key]!r}"
-        for key in ("target", "language", "job_id", "broadcast_id", "targets")
-        if key in arguments
-    ]
-    return f" ({', '.join(parts)})" if parts else ""

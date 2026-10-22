@@ -2,7 +2,7 @@ import json
 import threading
 
 import pytest
-from hub_fakes import FakeListener, Hub, blocking_run, exec_result
+from hub_fakes import FakeListener, Hub, Scripted, blocking_run, exec_result
 
 from privy.client import RelayHTTPError
 from privy.hub.jobs import (
@@ -58,9 +58,12 @@ def test_exec_job_streams_output_and_records_the_remote_job(tmp_path):
     assert view["state"] == SUCCEEDED and view["done"] is True
     assert view["exit_code"] == 0
     assert view["stdout"] == "ran bash: hostname\n"
-    assert view["stdout_truncated"] is False
-    assert view["remote_job_id"] == "remote-1"
+    assert view["stdout_offset"] == len("ran bash: hostname\n")
+    assert "stdout_skipped_bytes" not in view
     assert view["duration_ms"] is not None
+    assert job.remote_job_id == "remote-1"
+    # The next read continues where this one stopped.
+    assert job.view(max_output_bytes=1024)["stdout"] == ""
 
 
 @pytest.mark.parametrize(
@@ -178,9 +181,116 @@ def test_output_beyond_the_limit_is_reported_as_skipped(tmp_path):
     job = _run(hub)
 
     view = job.view(max_output_bytes=100)
-    assert view["stdout"] == "6789" and view["stdout_bytes"] == 10 and view["stdout_truncated"] is True
+    assert view["stdout"] == "6789" and view["stdout_offset"] == 10 and view["stdout_skipped_bytes"] == 6
     page = job.read_output("stdout", 0, 100)
     assert page["offset"] == 6 and page["skipped_bytes"] == 6 and page["data"] == "6789"
+
+
+def test_views_return_only_output_since_the_previous_read(tmp_path):
+    script = Scripted([("stdout", b"one\n"), ("stderr", b"warn\n"), ("stdout", b"two\n")])
+    hub = Hub(tmp_path, {"dev/box1_windows": FakeListener(run=script)})
+    job = _run(hub, wait_s=0)
+
+    script.step()
+    first = job.view(max_output_bytes=1024)
+    script.step()
+    script.step()
+    second = job.view(max_output_bytes=1024)
+    explicit = job.view(max_output_bytes=1024, offsets={"stdout": 0, "stderr": None})
+    script.gate.release()
+    hub.jobs.wait(job, 5)
+    last = job.view(max_output_bytes=1024)
+
+    assert (first["stdout"], first["stderr"], first["done"]) == ("one\n", "", False)
+    assert (second["stdout"], second["stderr"]) == ("two\n", "warn\n")
+    assert (second["stdout_offset"], second["stderr_offset"]) == (8, 5)
+    # Explicit offsets re-read without moving the shared position.
+    assert explicit["stdout"] == "one\ntwo\n" and explicit["stderr"] == ""
+    assert (last["stdout"], last["stderr"], last["done"]) == ("", "", True)
+
+
+def test_views_keep_the_newest_bytes_and_report_what_was_skipped(tmp_path):
+    script = Scripted([("stdout", b"0123456789")])
+    hub = Hub(tmp_path, {"dev/box1_windows": FakeListener(run=script)})
+    job = _run(hub, wait_s=0)
+    script.step()
+
+    view = job.view(max_output_bytes=4)
+
+    assert view["stdout"] == "6789" and view["stdout_skipped_bytes"] == 6 and view["stdout_offset"] == 10
+    assert job.view(max_output_bytes=4)["stdout"] == ""
+    script.gate.release()
+    hub.jobs.wait(job, 5)
+
+
+def test_running_views_never_split_a_utf8_character(tmp_path):
+    euro = "€".encode()
+    script = Scripted([("stdout", b"price " + euro[:1]), ("stdout", euro[1:] + b"\n")])
+    hub = Hub(tmp_path, {"dev/box1_windows": FakeListener(run=script)})
+    job = _run(hub, wait_s=0)
+
+    script.step()
+    partial = job.view(max_output_bytes=1024)
+    script.step()
+    rest = job.view(max_output_bytes=1024)
+    script.gate.release()
+    hub.jobs.wait(job, 5)
+
+    assert partial["stdout"] == "price " and partial["stdout_offset"] == 6
+    assert rest["stdout"] == "€\n"
+
+
+def test_next_pieces_follow_both_streams_in_arrival_order(tmp_path):
+    script = Scripted([("stdout", b"a"), ("stderr", b"b"), ("stdout", b"c")])
+    hub = Hub(tmp_path, {"dev/box1_windows": FakeListener(run=script)})
+    job = _run(hub, wait_s=0)
+    for _ in script.steps:
+        script.step()
+
+    pieces, index, finished = job.next_pieces(0, 0)
+    assert [(piece.stream, piece.data) for piece in pieces] == [
+        ("stdout", b"a"),
+        ("stderr", b"b"),
+        ("stdout", b"c"),
+    ]
+    assert (index, finished) == (3, False)
+    script.gate.release()
+    hub.jobs.wait(job, 5)
+    assert job.next_pieces(index, 5) == ([], 3, True)
+
+
+def test_next_pieces_never_repeat_output_the_buffer_dropped(tmp_path):
+    lines = [f"line{i}\n".encode() for i in range(6)]
+    script = Scripted([("stdout", line) for line in lines])
+    hub = Hub(tmp_path, {"dev/box1_windows": FakeListener(run=script)}, output_limit_bytes=10)
+    job = _run(hub, wait_s=0)
+    for _ in lines:
+        script.step()
+    script.gate.release()
+    hub.jobs.wait(job, 5)
+
+    pieces, index, finished = job.next_pieces(0, 0)
+
+    # Only the last 10 of 36 bytes are kept: one gap of 26 bytes, then the rest exactly once.
+    assert [(piece.data, piece.skipped) for piece in pieces] == [(b"ne4\n", 26), (b"line5\n", 0)]
+    assert (index, finished) == (6, True)
+
+
+def test_next_pieces_mark_chunks_that_are_no_longer_tracked(tmp_path, monkeypatch):
+    monkeypatch.setattr("privy.hub.jobs.MAX_TRACKED_CHUNKS", 2)
+    script = Scripted([("stdout", b"1"), ("stdout", b"2"), ("stdout", b"3")])
+    hub = Hub(tmp_path, {"dev/box1_windows": FakeListener(run=script)})
+    job = _run(hub, wait_s=0)
+    for _ in script.steps:
+        script.step()
+    script.gate.release()
+    hub.jobs.wait(job, 5)
+
+    pieces, index, finished = job.next_pieces(0, 0)
+
+    assert pieces[0].skipped == -1
+    assert [piece.data for piece in pieces[1:]] == [b"2", b"3"]
+    assert (index, finished) == (3, True)
 
 
 def test_audit_log_records_requests_and_outcomes(tmp_path):
@@ -265,10 +375,9 @@ def test_broadcast_starts_one_job_per_target(tmp_path):
     targets = hub.registry.select(["dev/*"])
 
     broadcast, started = hub.jobs.start_broadcast(
-        targets,
+        [(target, "powershell") for target in targets],
         patterns=["dev/*"],
         skipped=[{"target": "contoso-lab/gpu1_linux", "status": "offline", "reason": "x"}],
-        language="powershell",
         code="hostname",
         mode="subprocess",
         timeout_s=30,
@@ -290,7 +399,6 @@ def test_a_broadcast_with_every_target_skipped_is_still_retrievable(tmp_path):
         [],
         patterns=["dev/*"],
         skipped=[{"target": "dev/box1_windows", "status": "offline", "reason": "x"}],
-        language="bash",
         code="true",
         mode="subprocess",
         timeout_s=30,

@@ -119,13 +119,15 @@ function Test-PrivyHub {
         }
     }
 
-    $token = (Get-Content -LiteralPath (Join-Path $HubHome "hub-token") -Raw).Trim()
-    $headers = @{ Authorization = "Bearer $token" }
     $targetId = "gci/$($RelayValues['PRIVY_RELAY_PATH'])"
-    $targets = Invoke-RestMethod -Uri "$url/v1/targets?refresh=true" -Headers $headers -TimeoutSec 120
+    $quickstart = Invoke-RestMethod -Uri "$url/" -TimeoutSec 120
+    if ("$quickstart" -notmatch [regex]::Escape("| $targetId |")) {
+        throw "Windows binary hub quickstart does not list $targetId as online"
+    }
+    $targets = Invoke-RestMethod -Uri "$url/v1/targets?refresh=true" -TimeoutSec 120
     $target = @($targets.targets | Where-Object { $_.id -eq $targetId })[0]
     if (-not $target -or $target.status -ne "online") {
-        throw "Windows binary hub reports $targetId as '$($target.status)': $($target.error)"
+        throw "Windows binary hub reports $targetId as '$($target.status)': $($target.reason)"
     }
 
     $body = @{
@@ -137,12 +139,16 @@ function Test-PrivyHub {
     $job = Invoke-RestMethod `
         -Method Post `
         -Uri "$url/v1/jobs" `
-        -Headers $headers `
         -ContentType "application/json" `
         -Body $body `
         -TimeoutSec 120
     if ($job.state -ne "succeeded" -or "$($job.stdout)".Trim() -ne $ListenerId) {
         throw "Windows binary hub job did not reach the launched listener: state=$($job.state) error=$($job.error)"
+    }
+
+    $stream = @(& curl.exe -sN --max-time 120 "$url/v1/jobs?stream=true&target=$targetId" --data-binary 'Write-Output $env:PRIVY_TEST_SERVER_ID')
+    if ($LASTEXITCODE -ne 0 -or $stream -notcontains $ListenerId -or $stream[-1] -notmatch ' state=succeeded exit=0 ') {
+        throw "Windows binary hub stream did not carry the listener's output: $($stream -join ' | ')"
     }
     Write-Host "Windows binary hub probed the listener and ran PowerShell on it through the Relay."
 }

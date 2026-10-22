@@ -627,10 +627,10 @@ if (-not $healthy) {
 Get-ScheduledTask -TaskName $TaskName | Select-Object TaskName, State | Format-Table -AutoSize | Out-String | Write-Host
 Invoke-Privy $exePath $RuntimeDir @('hub', 'status', '--home', $WorkDir)
 
-$tokenFile = Join-Path $WorkDir "hub-token"
 Write-Host ""
-Write-Host "Register the hub with Copilot CLI:"
-Write-Host "  copilot mcp add --transport http --header `"Authorization: Bearer `$((Get-Content '$tokenFile').Trim())`" privy-hub http://127.0.0.1:$Port/mcp"
+Write-Host "The hub is ready at http://127.0.0.1:$Port/ (no authentication)."
+Write-Host "Tell your AI assistant to read that page, or register the MCP endpoint with Copilot CLI:"
+Write-Host "  copilot mcp add --transport http --timeout 180000 privy-hub http://127.0.0.1:$Port/mcp"
 ```
 
 ```powershell
@@ -648,28 +648,31 @@ privy hub at http://127.0.0.1:7748 (pid 4242)
 relays file: C:\.temp\privy-hub\relays.json (1 relay(s))
 targets: 3, offline 1, online 2
 TARGET                STATUS   HOST      OS                         USER   PRIVY
-dev/devbox01_windows  online   devbox01  Windows-11-10.0.26100-SP0  alice  0.2.0
+dev/devbox01_windows  online   devbox01  Windows-11-10.0.26100-SP0  alice  0.3.0
 dev/devbox02_windows  online   -         -                          -      older
 dev/devbox03_windows  offline  -         -                          -      -
+Point an LLM at http://127.0.0.1:7748/ to use these machines.
 ```
 
 `older` marks a listener that runs a privy release without host details; re-run the listener script
 on that machine with `-UpdateBinary`.
 
-### 3. Connect Copilot CLI
+### 3. Point your AI assistant at the hub
 
-Run the command the installer printed. It reads the token at run time so it never appears in your
-shell history:
+The hub has no authentication, so there is nothing to configure: tell the assistant to read
+`http://127.0.0.1:7748/`. The page lists the machines online right now and shows how to run commands
+on them with live output.
+
+To use the hub's tools through MCP instead, register it with Copilot CLI:
 
 ```powershell
-copilot mcp add --transport http `
-    --header "Authorization: Bearer $((Get-Content 'C:\.temp\privy-hub\hub-token').Trim())" `
-    privy-hub http://127.0.0.1:7748/mcp
+copilot mcp add --transport http --timeout 180000 privy-hub http://127.0.0.1:7748/mcp
 ```
 
 New Copilot sessions then see the hub's tools (`list_targets`, `run`, `get_job`, `broadcast`, and
 others). Copilot asks before calling a tool unless you allow it; consider allowing the read-only
-tools and approving `run`, `broadcast`, and file transfers individually.
+tools and approving `run`, `broadcast`, and file transfers individually. A registration made for hub
+0.2 keeps working: the hub ignores its `Authorization` header.
 
 ### Operate the hub
 
@@ -681,7 +684,7 @@ tools and approving `run`, `broadcast`, and file transfers individually.
 | Restart                | `Stop-ScheduledTask PrivyHub; Start-ScheduledTask PrivyHub`                 |
 | Upgrade                | re-run `Install-PrivyHubTask.ps1 -UpdateBinary`                             |
 | Review what was run    | `Get-Content C:\.temp\privy-hub\audit.jsonl -Tail 20`                       |
-| Rotate the API token   | delete `hub-token`, restart the task, and re-register Copilot               |
+| Watch what runs        | the `privy hub` console window shows every call, command, and its output    |
 | Uninstall              | `Unregister-ScheduledTask PrivyHub -Confirm:$false`, then delete the folder |
 
 Stopping the scheduled task closes its console window; kill a lingering `privy.exe` from the hosting
