@@ -19,6 +19,8 @@ $logRoot = Join-Path $repoRoot ".temp"
 $logId = [Guid]::NewGuid().ToString("N")
 $stdoutLog = Join-Path $logRoot "privy-server-$logId.stdout.log"
 $stderrLog = Join-Path $logRoot "privy-server-$logId.stderr.log"
+$hubStdoutLog = Join-Path $logRoot "privy-hub-$logId.stdout.log"
+$hubStderrLog = Join-Path $logRoot "privy-hub-$logId.stderr.log"
 $requiredVariables = @(
     "PRIVY_RELAY_NAMESPACE"
     "PRIVY_RELAY_PATH"
@@ -47,6 +49,104 @@ function Get-RedactedLog {
     return $text.Trim()
 }
 
+function Get-FreeLoopbackPort {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    try {
+        return ([System.Net.IPEndPoint] $listener.LocalEndpoint).Port
+    }
+    finally {
+        $listener.Stop()
+    }
+}
+
+function Test-PrivyHub {
+    param(
+        [string] $Binary,
+        [hashtable] $RelayValues,
+        [string] $HubHome,
+        [string] $ListenerId
+    )
+
+    New-Item -ItemType Directory -Force -Path $HubHome | Out-Null
+    $relays = @{
+        version = 1
+        relays  = @(
+            @{
+                name               = "gci"
+                namespace          = $RelayValues["PRIVY_RELAY_NAMESPACE"]
+                hybrid_connections = @(
+                    @{
+                        path    = $RelayValues["PRIVY_RELAY_PATH"]
+                        keyrule = $RelayValues["PRIVY_RELAY_KEYRULE"]
+                        key     = $RelayValues["PRIVY_RELAY_KEY"]
+                    }
+                )
+            }
+        )
+    }
+    [System.IO.File]::WriteAllText(
+        (Join-Path $HubHome "relays.json"),
+        ($relays | ConvertTo-Json -Depth 6),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+
+    $port = Get-FreeLoopbackPort
+    $url = "http://127.0.0.1:$port"
+    $script:hub = Start-Process `
+        -FilePath $Binary `
+        -ArgumentList @("hub", "serve", "--home", "`"$HubHome`"", "--port", "$port") `
+        -PassThru `
+        -NoNewWindow `
+        -RedirectStandardOutput $hubStdoutLog `
+        -RedirectStandardError $hubStderrLog
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($StartupTimeoutSeconds)
+    while ($true) {
+        if ($script:hub.HasExited) {
+            $hubError = Get-RedactedLog -Path $hubStderrLog -Secrets $RelayValues
+            throw "Windows binary hub exited before serving (exit $($script:hub.ExitCode)): $hubError"
+        }
+        try {
+            $null = Invoke-RestMethod -Uri "$url/healthz" -TimeoutSec 5
+            break
+        }
+        catch {
+            if ([DateTime]::UtcNow -ge $deadline) {
+                throw "Windows binary hub did not become healthy at $url within $StartupTimeoutSeconds seconds"
+            }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+
+    $token = (Get-Content -LiteralPath (Join-Path $HubHome "hub-token") -Raw).Trim()
+    $headers = @{ Authorization = "Bearer $token" }
+    $targetId = "gci/$($RelayValues['PRIVY_RELAY_PATH'])"
+    $targets = Invoke-RestMethod -Uri "$url/v1/targets?refresh=true" -Headers $headers -TimeoutSec 120
+    $target = @($targets.targets | Where-Object { $_.id -eq $targetId })[0]
+    if (-not $target -or $target.status -ne "online") {
+        throw "Windows binary hub reports $targetId as '$($target.status)': $($target.error)"
+    }
+
+    $body = @{
+        target   = $targetId
+        language = "powershell"
+        code     = 'Write-Output $env:PRIVY_TEST_SERVER_ID'
+        wait_s   = 60
+    } | ConvertTo-Json
+    $job = Invoke-RestMethod `
+        -Method Post `
+        -Uri "$url/v1/jobs" `
+        -Headers $headers `
+        -ContentType "application/json" `
+        -Body $body `
+        -TimeoutSec 120
+    if ($job.state -ne "succeeded" -or "$($job.stdout)".Trim() -ne $ListenerId) {
+        throw "Windows binary hub job did not reach the launched listener: state=$($job.state) error=$($job.error)"
+    }
+    Write-Host "Windows binary hub probed the listener and ran PowerShell on it through the Relay."
+}
+
 Assert-PrivyWindowsX64Binary -Path $binary
 $configuredValues = Get-PrivyEnvironmentValues -EnvFile $EnvFile
 $relayValues = @{}
@@ -64,6 +164,7 @@ foreach ($name in @($requiredVariables + "PRIVY_TEST_SERVER_ID" + "TEMP" + "TMP"
 }
 
 $server = $null
+$hub = $null
 $lastClientOutput = ""
 $listenerId = [Guid]::NewGuid().ToString("N")
 New-Item -ItemType Directory -Force -Path $runtimeTemp, $logRoot | Out-Null
@@ -94,6 +195,7 @@ Write-Output (
 )
 "@
 
+    $roundTripSucceeded = $false
     while ([DateTime]::UtcNow -lt $deadline) {
         if ($server.HasExited) {
             $serverError = Get-RedactedLog -Path $stderrLog -Secrets $relayValues
@@ -105,14 +207,30 @@ Write-Output (
         $lastClientOutput = ($clientOutput | Out-String).Trim()
         if ($clientExitCode -eq 0 -and $lastClientOutput.StartsWith($expectedPrefix)) {
             Write-Host "Windows binary PowerShell server/client Relay round trip succeeded."
-            return
+            $roundTripSucceeded = $true
+            break
         }
         Start-Sleep -Seconds 1
     }
 
-    throw "Windows binary client did not reach the launched server within $StartupTimeoutSeconds seconds. Last response: $lastClientOutput"
+    if (-not $roundTripSucceeded) {
+        throw "Windows binary client did not reach the launched server within $StartupTimeoutSeconds seconds. Last response: $lastClientOutput"
+    }
+
+    Test-PrivyHub `
+        -Binary $binary `
+        -RelayValues $relayValues `
+        -HubHome (Join-Path $runtimeTemp "hub") `
+        -ListenerId $listenerId
 }
 finally {
+    if ($hub) {
+        if (-not $hub.HasExited) {
+            $hub.Kill($true)
+        }
+        $hub.WaitForExit()
+        $hub.Dispose()
+    }
     if ($server) {
         if (-not $server.HasExited) {
             $server.Kill($true)
@@ -124,5 +242,5 @@ finally {
         [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], "Process")
     }
     Remove-Item -LiteralPath $runtimeTemp -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $stdoutLog, $stderrLog -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $stdoutLog, $stderrLog, $hubStdoutLog, $hubStderrLog -Force -ErrorAction SilentlyContinue
 }

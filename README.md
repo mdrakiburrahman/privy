@@ -45,21 +45,30 @@ uv run privy client --bash 'uname -a'
 and environment variable, async behavior, batch schema, transfer commands, and token minting
 examples in one deterministic plain-text document.
 
+## Control many listeners
+
+`privy hub serve` runs a local control plane for every listener whose Relay keys you hydrate. It
+reports which machines are online and runs code or copies files on any of them through a loopback
+REST API and an MCP endpoint that Copilot and other AI assistants can use. See [Hub](docs/HUB.md)
+and [Scheduled tasks](docs/SCHEDULED_TASKS.md).
+
 ## Documentation
 
-| Guide                                    | Contents                                                                                      |
-| ---------------------------------------- | --------------------------------------------------------------------------------------------- |
-| [Installation](INSTALL.md)               | Install the Python package or standalone Linux and Windows executables.                       |
-| [Setup](docs/SETUP.md)                   | Provision Azure Relay, configure credentials, and split Listen/Send rules.                    |
-| [Server](docs/SERVER.md)                 | Run the listener, expose notebook globals, manage long jobs, and proxy a local service.       |
-| [CLI](docs/CLI.md)                       | Complete command behavior, output and exit contracts, dependency manifests, and runtime help. |
-| [Python SDK](docs/SDK.md)                | Execute code, submit jobs, run dependency graphs, and transfer files.                         |
-| [Authentication](docs/AUTHENTICATION.md) | Injected SAS tokens, providers, validation, expiry, TTLs, and broker flows.                   |
-| [File transfer](docs/FILE_TRANSFER.md)   | Chunking, resume, SHA-256 integrity, paths, and overwrite behavior.                           |
-| [HTTP proxy](docs/PROXY.md)              | Browse or call a remote HTTP service through the Relay listener.                              |
-| [Deployment](docs/DEPLOYMENT.md)         | Build the wheel/CLI, run GCI, publish after merge, and download artifacts.                    |
-| [Python package feeds](docs/PYPI.md)     | Use an approved package mirror when direct PyPI access is blocked.                            |
-| [Contributing](contrib/README.md)        | Bootstrap the development environment.                                                        |
+| Guide                                      | Contents                                                                                      |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------- |
+| [Installation](INSTALL.md)                 | Install the Python package or standalone Linux and Windows executables.                       |
+| [Setup](docs/SETUP.md)                     | Provision Azure Relay, configure credentials, and split Listen/Send rules.                    |
+| [Server](docs/SERVER.md)                   | Run the listener, expose notebook globals, manage long jobs, and proxy a local service.       |
+| [CLI](docs/CLI.md)                         | Complete command behavior, output and exit contracts, dependency manifests, and runtime help. |
+| [Python SDK](docs/SDK.md)                  | Execute code, submit jobs, run dependency graphs, and transfer files.                         |
+| [Authentication](docs/AUTHENTICATION.md)   | Injected SAS tokens, providers, validation, expiry, TTLs, and broker flows.                   |
+| [File transfer](docs/FILE_TRANSFER.md)     | Chunking, resume, SHA-256 integrity, paths, and overwrite behavior.                           |
+| [HTTP proxy](docs/PROXY.md)                | Browse or call a remote HTTP service through the Relay listener.                              |
+| [Hub](docs/HUB.md)                         | Discover, probe, and run code on many listeners through a local REST API and MCP endpoint.    |
+| [Scheduled tasks](docs/SCHEDULED_TASKS.md) | Run listeners and the hub as Windows logon tasks, and hydrate the hub's Relay keys.           |
+| [Deployment](docs/DEPLOYMENT.md)           | Build the wheel/CLI, run GCI, publish after merge, and download artifacts.                    |
+| [Python package feeds](docs/PYPI.md)       | Use an approved package mirror when direct PyPI access is blocked.                            |
+| [Contributing](contrib/README.md)          | Bootstrap the development environment.                                                        |
 
 ## Markdown checks
 

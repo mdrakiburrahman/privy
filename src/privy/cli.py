@@ -25,6 +25,8 @@ from privy._relay import (
 )
 from privy.batch import BatchResult, BatchValidationError, parse_batch_manifest
 from privy.client import RELAY_RESPONSE_LIMIT_S, ExecResult, RelayClient
+from privy.hub.home import DEFAULT_PORT as HUB_DEFAULT_PORT
+from privy.hub.home import HOME_ENV as HUB_HOME_ENV
 from privy.protocol import DEFAULT_TIMEOUT_S
 from privy.proxy import ProxyClientServer
 from privy.server import RelayServer
@@ -503,6 +505,7 @@ Examples:
   privy client --batch commands.json --json
   privy file upload ./model.pkl /tmp/model.pkl --overwrite
   privy token mint --rights send --ttl 30m
+  privy hub serve --port 7748
 """,
     )
     parser.add_argument("--version", action="version", version=f"privy {__version__}")
@@ -515,7 +518,7 @@ Examples:
     )
     sub = parser.add_subparsers(
         dest="command",
-        metavar="{server,client,proxy,file,token}",
+        metavar="{server,client,proxy,file,token,hub}",
         title="commands",
     )
 
@@ -732,7 +735,96 @@ each command's mode/timeout and may set max_parallel (default: 32).""",
     )
     mint.set_defaults(func=_cmd_token_mint)
 
+    hub_parser = sub.add_parser(
+        "hub",
+        help="run a local control plane for many listeners",
+        description=(
+            "Serve a loopback REST API and Model Context Protocol endpoint that discover, probe, and "
+            "run code on every listener hydrated in relays.json. The hub never calls Azure Resource "
+            "Manager; it signs short-lived tokens from the hydrated keys."
+        ),
+        epilog="""Files in the hub home directory:
+  relays.json     hydrated relay keys (see docs/SCHEDULED_TASKS.md); reloaded when it changes
+  hub-token       bearer token for the API, created on first start
+  hub-state.json  URL and pid of the running hub (no secrets)
+  audit.jsonl     every command and transfer the hub was asked to run
+
+Endpoints (all but /healthz require 'Authorization: Bearer <hub-token>'):
+  GET  /v1             capabilities and usage instructions
+  GET  /openapi.json   OpenAPI 3.1 description of the REST API
+  POST /mcp            MCP endpoint exposing the same operations as tools
+  GET  /healthz        liveness check
+""",
+    )
+    hub_parser.set_defaults(_help_parser=hub_parser)
+    hub_sub = hub_parser.add_subparsers(
+        dest="hub_command",
+        metavar="{serve,status}",
+        title="hub commands",
+    )
+
+    hub_serve = hub_sub.add_parser(
+        "serve",
+        help="serve the hub until interrupted",
+        description="Bind the hub API to a loopback port and serve it until Ctrl-C.",
+    )
+    _add_common_args(hub_serve)
+    _add_hub_home_arg(hub_serve)
+    hub_serve.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="interface to bind; anything but loopback exposes remote execution to the network",
+    )
+    hub_serve.add_argument(
+        "--port", type=_port, default=HUB_DEFAULT_PORT, help="TCP port (0 picks a free one)"
+    )
+    hub_serve.add_argument(
+        "--relays-file",
+        default=None,
+        metavar="PATH",
+        help="hydrated relays file (default: HOME/relays.json)",
+    )
+    hub_serve.add_argument("--max-jobs", type=_positive_int, default=32, help="jobs that may run at once")
+    hub_serve.add_argument(
+        "--probe-ttl-s",
+        type=_positive_float,
+        default=30.0,
+        help="seconds a probed listener status is reused",
+    )
+    hub_serve.add_argument(
+        "--allow-origin",
+        action="append",
+        default=[],
+        metavar="ORIGIN",
+        help="browser origin allowed to call the API (repeatable; by default every Origin is refused)",
+    )
+    hub_serve.set_defaults(func=_cmd_hub_serve)
+
+    hub_status = hub_sub.add_parser(
+        "status",
+        help="show the running hub and its targets",
+        description="Check the running hub and print every target with its live status.",
+    )
+    _add_common_args(hub_status)
+    _add_hub_home_arg(hub_status)
+    hub_status.add_argument("--url", default=None, help="hub URL (default: from HOME/hub-state.json)")
+    hub_status.add_argument("--refresh", action="store_true", help="re-probe every target now")
+    hub_status.add_argument("--json", action="store_true", help="print the raw list_targets JSON")
+    hub_status.set_defaults(func=_cmd_hub_status)
+
     return parser
+
+
+def _add_hub_home_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--home",
+        default=None,
+        metavar="DIR",
+        help=(
+            f"hub home directory (env: {HUB_HOME_ENV}; default: %%LOCALAPPDATA%%\\privy\\hub on "
+            "Windows, ~/.local/state/privy/hub elsewhere)"
+        ),
+    )
 
 
 def _add_transfer_args(parser: argparse.ArgumentParser) -> None:
@@ -870,6 +962,136 @@ def _cmd_token_mint(args: argparse.Namespace) -> int:
     return 0
 
 
+_LOOPBACK_BIND_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _hub_home(args: argparse.Namespace) -> Path:
+    from privy.hub.home import default_home
+
+    return Path(args.home).expanduser() if args.home else default_home()
+
+
+def _cmd_hub_serve(args: argparse.Namespace) -> int:
+    from privy.hub.app import build_hub
+    from privy.hub.home import TOKEN_FILENAME
+
+    if max(args.verbose, getattr(args, "verbose_sub", 0)) == 0:
+        # The hub usually runs in a visible console; show its activity by default.
+        logging.getLogger("privy").setLevel(logging.INFO)
+    if args.host not in _LOOPBACK_BIND_HOSTS:
+        print(
+            f"privy: warning: binding {args.host} exposes remote execution beyond this machine",
+            file=sys.stderr,
+        )
+    home = _hub_home(args)
+    try:
+        runtime = build_hub(
+            home=home,
+            host=args.host,
+            port=args.port,
+            relays_file=Path(args.relays_file).expanduser() if args.relays_file else None,
+            max_jobs=args.max_jobs,
+            probe_ttl_s=args.probe_ttl_s,
+            allowed_origins=args.allow_origin,
+            version=__version__,
+        )
+    except OSError as exc:
+        raise CliError(f"cannot start the hub on {args.host}:{args.port}: {exc}") from exc
+
+    log = logging.getLogger("privy.hub")
+    summary = runtime.service.summary()
+    url = runtime.url
+    log.info("privy hub %s listening on %s (home %s)", __version__, url, home)
+    if summary["relays_file"]["exists"]:
+        log.info(
+            "Serving %d relay(s) with %d target(s) from %s",
+            summary["relays"],
+            summary["targets"],
+            runtime.relays_file,
+        )
+    else:
+        log.info("Waiting for %s to be hydrated; serving no targets until then.", runtime.relays_file)
+    log.info("REST %s/v1, OpenAPI %s/openapi.json, MCP %s/mcp", url, url, url)
+    log.info("Clients authenticate with 'Authorization: Bearer <%s>'.", home / TOKEN_FILENAME)
+    try:
+        runtime.serve_forever()
+    except KeyboardInterrupt:
+        log.info("Stopping hub.")
+    finally:
+        runtime.server.server_close()
+    return 0
+
+
+def _cmd_hub_status(args: argparse.Namespace) -> int:
+    import requests
+
+    from privy.hub.home import read_state, read_token
+
+    home = _hub_home(args)
+    state = read_state(home) or {}
+    url = (args.url or state.get("url") or f"http://127.0.0.1:{HUB_DEFAULT_PORT}").rstrip("/")
+    try:
+        token = read_token(home)
+    except OSError as exc:
+        raise CliError(f"no hub token in {home}; start 'privy hub serve' first or pass --home") from exc
+    try:
+        requests.get(f"{url}/healthz", timeout=5).raise_for_status()
+        response = requests.get(
+            f"{url}/v1/targets",
+            params={"refresh": "true" if args.refresh else "false"},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=180,
+        )
+        payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        print(f"privy: hub is not reachable at {url}: {exc}", file=sys.stderr)
+        return 1
+    if response.status_code != 200:
+        message = (payload.get("error") or {}).get("message") if isinstance(payload, dict) else None
+        print(f"privy: hub returned HTTP {response.status_code}: {message or payload}", file=sys.stderr)
+        return 1
+    if args.json:
+        json.dump(payload, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 0
+
+    relays_file = payload["relays_file"]
+    pid = f" (pid {state['pid']})" if state.get("pid") else ""
+    print(f"privy hub at {url}{pid}")
+    if relays_file["exists"]:
+        print(f"relays file: {relays_file['path']} ({len(payload['relays'])} relay(s))")
+    else:
+        print(f"relays file: {relays_file['path']} (not hydrated yet)")
+    if relays_file.get("error"):
+        print(f"relays file error: {relays_file['error']}")
+    counts = {key: value for key, value in payload["counts"].items() if key != "targets"}
+    print(
+        f"targets: {payload['counts']['targets']}"
+        + "".join(f", {status} {count}" for status, count in counts.items())
+    )
+    rows = [("TARGET", "STATUS", "HOST", "OS", "USER", "PRIVY")]
+    for target in payload["targets"]:
+        listener = target.get("listener") or {}
+        version = listener.get("privy_version")
+        if listener and not listener.get("details_available"):
+            version = "older"
+        rows.append(
+            (
+                target["id"],
+                target["status"],
+                listener.get("hostname") or "-",
+                listener.get("os") or "-",
+                listener.get("user") or "-",
+                version or "-",
+            )
+        )
+    if len(rows) > 1:
+        widths = [max(len(str(row[index])) for row in rows) for index in range(len(rows[0]))]
+        for row in rows:
+            print("  ".join(str(cell).ljust(width) for cell, width in zip(row, widths)).rstrip())
+    return 0
+
+
 def _positive_int(value: Any) -> int:
     try:
         parsed = int(value)
@@ -887,6 +1109,16 @@ def _positive_float(value: Any) -> float:
         raise argparse.ArgumentTypeError("must be a number") from exc
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def _port(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 0 <= parsed <= 65535:
+        raise argparse.ArgumentTypeError("must be between 0 and 65535")
     return parsed
 
 

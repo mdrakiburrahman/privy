@@ -123,3 +123,11 @@ privy server --proxy-target http://127.0.0.1:8080
 ```
 
 See [HTTP proxy](PROXY.md) for the client side.
+
+## Listener info
+
+A request body of `{"kind": "listener_info"}` returns the listener's host name, OS, user, working
+directory, privy version, available runtimes, and job counts without running any code. The
+[hub](HUB.md) uses it to probe listeners, so it is logged only at DEBUG. Listeners older than privy
+0.2.0 answer it with a `bad_request` execution response, which still proves they are online.
+`RelayClient.listener_info()` returns the description, or `None` for such older listeners.

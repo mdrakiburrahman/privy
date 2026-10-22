@@ -461,6 +461,21 @@ def _powershell_executable() -> str:
     return found
 
 
+def available_runtimes() -> dict[str, str | None]:
+    """Resolve each subprocess runtime without raising; ``None`` marks a missing one."""
+    found: dict[str, str | None] = {}
+    for name, resolve in (
+        ("python", _python_executable),
+        ("bash", _bash_executable),
+        ("powershell", _powershell_executable),
+    ):
+        try:
+            found[name] = resolve()
+        except FileNotFoundError:
+            found[name] = None
+    return found
+
+
 #: Variables PyInstaller rewrites for its own bundled libraries. Leaking them
 #: into a child makes system binaries (e.g. `az` → system python3) load privy's
 #: bundled libpython/libssl and segfault. PyInstaller stashes the pre-launch
@@ -1031,6 +1046,14 @@ def _reap_jobs() -> None:
         stale.update(jid for _, jid in completed[:overflow])
         for jid in stale:
             _JOBS.pop(jid, None)
+
+
+def job_counts() -> dict[str, int]:
+    """Number of jobs still running and finished jobs retained for collection."""
+    with _JOBS_LOCK:
+        jobs = list(_JOBS.values())
+    running = sum(1 for job in jobs if job.finished_at is None)
+    return {"running": running, "retained": len(jobs) - running}
 
 
 def submit_job(req: ExecRequest) -> ExecResponse:

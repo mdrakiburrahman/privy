@@ -93,6 +93,39 @@ result = client.run_bash(
 `stream` is `"stdout"` or `"stderr"`. Against a listener without streaming support, everything
 arrives once at completion.
 
+`on_submit` receives the listener's job id as soon as the job starts, so another thread can cancel
+it:
+
+```python
+job_ids = []
+request = ExecRequest(kind="bash", code="./long.sh", timeout_s=3600)
+result = client.send(request, on_submit=job_ids.append)
+
+# From another thread while send() is running:
+client.cancel(request, job_ids[0])
+```
+
+## Probe a listener
+
+```python
+from privy import RelayHTTPError
+
+try:
+    info = client.listener_info()
+except RelayHTTPError as exc:
+    print("unreachable:", exc.status_code, exc.detail)
+else:
+    if info is None:
+        print("online, but the listener predates listener_info")
+    else:
+        print(info["hostname"], info["platform"]["description"], info["runtimes"])
+```
+
+`listener_info()` never runs code on the listener. `RelayHTTPError` (a `RuntimeError`) carries the
+HTTP status, a redacted response excerpt, and whether the request timed out. Azure Relay answers 404
+both when no listener is connected (`EndpointNotFound`) and when the Hybrid Connection does not
+exist.
+
 ## Run commands with dependencies
 
 ```python

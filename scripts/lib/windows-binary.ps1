@@ -56,6 +56,7 @@ function Invoke-PrivyWindowsSmokeTests {
         @{ Label = "proxy --help"; Arguments = @("proxy", "--help") }
         @{ Label = "file --help"; Arguments = @("file", "--help") }
         @{ Label = "token --help"; Arguments = @("token", "--help") }
+        @{ Label = "hub --help"; Arguments = @("hub", "--help") }
     )
 
     $oldTemp = $env:TEMP

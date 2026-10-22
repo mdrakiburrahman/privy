@@ -40,6 +40,7 @@ from privy._relay import (
     redact_relay_secrets,
 )
 from privy.executor import execute, seed_inprocess_globals, set_echo_output
+from privy.info import LISTENER_INFO_KIND, collect_listener_info
 from privy.protocol import ExecRequest, ExecResponse
 from privy.proxy import PROXY_KIND, ProxyRequest, handle_proxy_request
 from privy.transfer import FILE_TRANSFER_KIND, handle_transfer_request
@@ -161,7 +162,7 @@ class RelayServer:
 
         from privy import RelayServer
         RelayServer(
-            namespace="mdrrahman-dev-relay",
+            namespace="my-relay",
             path="demo",
             keyrule="demo-listen-send",
             key="<primary-key>",
@@ -200,6 +201,7 @@ class RelayServer:
         self._recv_timeout_s = recv_timeout_s
         self._proxy_target = proxy_target
         self._token_expires_at: int | None = None
+        self._started_at = time.time()
 
         # Output of every job is copied to this process's stdout/stderr (prefixed
         # with the job id) as it is produced; pass False for shared/sensitive logs.
@@ -455,6 +457,15 @@ class RelayServer:
         # Check if this is an HTTP proxy request
         try:
             raw_obj = json.loads(payload_raw)
+            if isinstance(raw_obj, dict) and raw_obj.get("kind") == LISTENER_INFO_KIND:
+                # Hubs probe with this often; keep it out of the INFO log.
+                log.debug("INFO request %s", _short_id(request_id))
+                return json.dumps(
+                    collect_listener_info(
+                        started_at=self._started_at,
+                        proxy_enabled=bool(self._proxy_target),
+                    )
+                )
             if isinstance(raw_obj, dict) and raw_obj.get("kind") == FILE_TRANSFER_KIND:
                 log.info("FILE %s %s", raw_obj.get("action", "unknown"), raw_obj.get("path", ""))
                 return handle_transfer_request(payload_raw).to_json()

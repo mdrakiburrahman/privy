@@ -159,6 +159,18 @@ privy token mint --rights listen --ttl 2h
 
 See [Authentication](AUTHENTICATION.md) for the role-specific environment variables and broker flow.
 
+## Run the hub
+
+```bash
+privy hub serve --port 7748
+privy hub status --refresh
+```
+
+`privy hub serve` exposes every listener hydrated in `relays.json` through a loopback REST API and
+MCP endpoint, and logs its activity at INFO by default. `--home` (or `PRIVY_HUB_HOME`) selects the
+folder holding `relays.json`, the API token, and the audit log. `privy hub status` prints each
+target's live status and exits `1` when the hub is unreachable. See [Hub](HUB.md).
+
 ## Output and exit behavior
 
 - Single-command stdout and stderr preserve their remote streams.

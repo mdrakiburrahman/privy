@@ -17,7 +17,7 @@ from privy.batch import (
     CommandSpec,
     parse_batch_manifest,
 )
-from privy.client import RELAY_RESPONSE_LIMIT_S, ExecResult, RelayClient
+from privy.client import RELAY_RESPONSE_LIMIT_S, ExecResult, RelayClient, RelayHTTPError
 from privy.executor import cancel_job, poll_job, submit_job
 from privy.protocol import ExecRequest, ExecResponse
 from privy.proxy import ProxyClientServer
@@ -46,6 +46,7 @@ __all__ = [
     "MAX_CHUNK_SIZE",
     "ProxyClientServer",
     "RelayClient",
+    "RelayHTTPError",
     "RelayServer",
     "RelayTokenAudienceError",
     "RelayTokenError",
@@ -63,4 +64,4 @@ __all__ = [
     "validate_sas_token",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
