@@ -8,12 +8,21 @@ from urllib.parse import quote
 
 import pytest
 import requests
-from hub_fakes import FakeListener, FakeRelayClient, Hub, Scripted, blocking_run, exec_result, write_relays
+from hub_fakes import (
+    FakeListener,
+    FakeRelayClient,
+    Hub,
+    Scripted,
+    blocking_run,
+    exec_result,
+    relays_document,
+    write_relays,
+)
 
 from privy.client import RelayHTTPError
-from privy.hub.app import HubApp, build_hub
+from privy.hub.app import Headers, HubApp, build_hub
 from privy.hub.home import LEGACY_TOKEN_FILENAME, read_state
-from privy.hub.rest import ROUTES, STREAM_JOB
+from privy.hub.rest import RELAYS_OPERATION, ROUTES, STREAM_JOB
 from privy.hub.service import OPERATIONS
 from privy.transfer import TransferResult
 
@@ -65,14 +74,15 @@ def test_every_endpoint_is_open_without_credentials(hub):
     assert hub.call("GET", "/healthz").status == 200
     assert hub.call("GET", "/v1").status == 200
     assert hub.call("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "ping"}).status == 200
-    # Clients configured for hub 0.2 still send a token, and browsers send Origin: both are ignored.
+    # Legacy authentication headers remain ignored, but cross-origin browsers are rejected.
     stale = {"Authorization": "Bearer from-hub-0.2", "Origin": "http://localhost:3000"}
-    assert hub.call("GET", "/v1/targets", headers=stale).status == 200
-    assert hub.call("GET", "/v1", headers={"Host": "devbox.example:7748"}).status == 200
+    assert hub.call("GET", "/v1/targets", headers=stale).status == 403
+    assert hub.call("GET", "/v1", headers={"Authorization": "Bearer obsolete"}).status == 200
+    assert hub.call("GET", "/v1", headers={"Host": "devbox.example:7748"}).status == 403
 
 
 def test_quickstart_lists_online_machines_with_runnable_examples(hub):
-    response = hub.call("GET", "/", headers={"Host": "localhost:9999"})
+    response = hub.call("GET", "/", headers={"Host": "localhost:7748"})
 
     assert response.status == 200 and response.media_type().startswith("text/plain")
     text = response.text
@@ -82,12 +92,13 @@ def test_quickstart_lists_online_machines_with_runnable_examples(hub):
     assert "1 more are not online" in text
     # box1 exists in two relays, so the examples use its full id.
     assert (
-        'curl.exe -sN "http://localhost:9999/v1/jobs?stream=true&target=dev/box1_windows" '
+        'curl.exe -sN "http://localhost:7748/v1/jobs?stream=true&target=dev/box1_windows" '
         "--data-binary 'Get-Date; hostname'"
     ) in text
     # A bare @file is PowerShell's splatting operator, so the advice must quote it.
     assert "`--data-binary '@script.ps1'`" in text and "--data-binary @" not in text
-    assert hub.call("GET", "/llms.txt", headers={"Host": "localhost:9999"}).text == text
+    assert hub.call("GET", "/llms.txt", headers={"Host": "localhost:7748"}).text == text
+    assert "http://localhost:7748/v1/relays" in text
 
 
 def test_quickstart_without_relays_explains_hydration(hub):
@@ -129,7 +140,12 @@ def test_capabilities_and_openapi_describe_every_operation(hub):
     operation_ids = {
         spec["operationId"] for methods in document["paths"].values() for spec in methods.values()
     }
-    assert set(names) | {STREAM_JOB, "quickstart", "llms_txt"} <= operation_ids
+    assert set(names) | {STREAM_JOB, RELAYS_OPERATION, "quickstart", "llms_txt"} <= operation_ids
+    assert capabilities["relay_credentials"]["endpoint"] == "http://127.0.0.1:7748/v1/relays"
+    assert RELAYS_OPERATION not in capabilities["mcp"]["tools"]
+    credentials = document["paths"]["/v1/relays"]["get"]
+    assert set(credentials["responses"]["200"]["content"]) == {"application/json"}
+    assert {"403", "503"} <= credentials["responses"].keys()
     run = document["paths"]["/v1/jobs"]["post"]
     body = run["requestBody"]["content"]
     assert body["application/json"]["schema"]["required"] == ["target", "code"]
@@ -139,6 +155,348 @@ def test_capabilities_and_openapi_describe_every_operation(hub):
     assert run["responses"]["200"]["content"]["application/json"]["example"]["state"] == "succeeded"
     stream = document["paths"]["/v1/jobs/{job_id}/stream"]["get"]
     assert stream["responses"]["200"]["content"]["text/plain"]["example"].startswith("[privy] job=")
+
+
+# ---- local request policy -------------------------------------------------------
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1:7748", "localhost:7748", "LOCALHOST:7748", "[::1]:7748"])
+def test_local_clients_and_same_origin_browsers_work_without_auth(hub, host):
+    assert hub.call("GET", "/v1", headers={"Host": host}).status == 200
+    assert hub.call("GET", "/v1", headers={"Host": host, "Origin": f"http://{host}"}).status == 200
+    assert hub.call("GET", "/", headers={"Host": host, "Sec-Fetch-Site": "none"}).status == 200
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "",
+        "attacker.example:7748",
+        "127.0.0.1.attacker.example:7748",
+        "localhost.attacker.example:7748",
+        "localhost.:7748",
+        "127.1:7748",
+        "2130706433:7748",
+        "0.0.0.0:7748",
+        "192.168.1.10:7748",
+        "127.0.0.1:9999",
+        "localhost",
+        "http://localhost:7748",
+        "user@localhost:7748",
+        "localhost:7748/",
+        "localhost:7748,attacker.example",
+        "localhost:65536",
+        "::1:7748",
+        "[::1]:7748/",
+        "[::ffff:127.0.0.1]:7748",
+        "localhost:7748 ",
+        "localhost:\t7748",
+    ],
+)
+def test_untrusted_or_malformed_hosts_are_forbidden(hub, host):
+    response = hub.call("GET", "/v1/relays", headers={"Host": host})
+    assert response.status == 403 and response.payload["error"]["code"] == "forbidden_host"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "",
+        "null",
+        "https://127.0.0.1:7748",
+        "http://attacker.example:7748",
+        "http://127.0.0.1:9999",
+        "http://localhost:7748",
+        "http://[::1]:7748",
+        "http://127.0.0.1:7748/",
+        "http://user@127.0.0.1:7748",
+        "http://127.0.0.1:7748?x",
+        "http://127.0.0.1:7748#x",
+        "http://127.0.0.1:7748 http://attacker.example",
+        "http://127.0.0.1:\t7748",
+    ],
+)
+def test_cross_origin_and_malformed_origins_are_forbidden(hub, origin):
+    response = hub.call("GET", "/v1/relays", headers={"Origin": origin})
+    assert response.status == 403 and response.payload["error"]["code"] == "forbidden_origin"
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/"),
+        ("GET", "/llms.txt"),
+        ("GET", "/openapi.json"),
+        ("GET", "/healthz"),
+        ("GET", "/v1"),
+        ("GET", "/v1/relays"),
+        ("GET", "/v1/targets"),
+        ("POST", "/v1/jobs"),
+        ("GET", "/v1/jobs/example/stream"),
+        ("POST", "/mcp"),
+        ("OPTIONS", "/v1/relays"),
+    ],
+)
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Host": "rebind.attacker.example:7748"},
+        {"Origin": "https://attacker.example"},
+        {"Sec-Fetch-Site": "cross-site"},
+    ],
+)
+def test_request_policy_applies_before_all_routes_and_side_effects(hub, method, path, headers):
+    response = hub.call(method, path, headers=headers)
+    assert response.status == 403 and response.stream is None
+    assert all(not listener.requests and not listener.info_calls for listener in hub.listeners.values())
+    assert not hub.audit_path.exists()
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        [],
+        [("Host", "localhost:7748"), ("host", "localhost:7748")],
+        [("Host", "localhost:7748"), ("Host", "attacker.example:7748")],
+        [("Host", "localhost:7748"), ("Origin", "http://localhost:7748"), ("origin", "null")],
+        [("Host", "localhost:7748"), ("Sec-Fetch-Site", "none"), ("sec-fetch-site", "cross-site")],
+    ],
+)
+def test_missing_and_duplicate_security_headers_are_rejected(hub, items):
+    assert hub.app.handle("GET", "/v1/relays", Headers(items), b"").status == 403
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "http://attacker.example:7748/v1/relays",
+        "http://localhost:7748/v1/relays",
+        "http://127.0.0.1:9999/v1/relays",
+        "https://127.0.0.1:7748/v1/relays",
+        "//127.0.0.1:7748/v1/relays",
+        "http://[invalid/v1/relays",
+        "/v1/relays#fragment",
+        "http://127.0.0.1:\t7748/v1/relays",
+    ],
+)
+def test_conflicting_or_malformed_request_targets_are_rejected(hub, target):
+    assert hub.call("GET", target).status == 403
+
+
+def test_matching_absolute_target_and_case_insensitive_header_mappings_work(hub):
+    response = hub.app.handle(
+        "GET", "http://localhost:7748/v1", {"host": "localhost:7748", "origin": "http://LOCALHOST:7748"}, b""
+    )
+    assert response.status == 200
+    assert response.payload["quickstart"] == "http://localhost:7748/"
+
+
+def test_forwarded_headers_do_not_override_an_untrusted_host(hub):
+    response = hub.call(
+        "GET",
+        "/v1/relays",
+        headers={
+            "Host": "attacker.example:7748",
+            "X-Forwarded-Host": "127.0.0.1:7748",
+            "Forwarded": "host=127.0.0.1:7748;proto=http",
+        },
+    )
+    assert response.status == 403
+
+
+def test_default_http_port_is_valid_only_when_hub_uses_port_80(hub):
+    hub.app.set_port(80)
+    assert (
+        hub.call("GET", "/v1", headers={"Host": "localhost", "Origin": "http://localhost:80"}).status == 200
+    )
+    assert hub.call("GET", "/v1", headers={"Host": "localhost:7748"}).status == 403
+
+
+# ---- credentials ---------------------------------------------------------------
+
+
+def test_relay_credentials_are_normalized_without_probing(hub):
+    response = hub.call("GET", "/v1/relays")
+    assert response.status == 200 and response.payload["stale"] is False
+    targets = {target["id"]: target for target in response.payload["targets"]}
+    assert targets[BOX1] == {
+        "id": BOX1,
+        "relay": "dev",
+        "namespace": "contoso-relay",
+        "path": "box1_windows",
+        "keyrule": "all",
+        "key": "a2V5MQ==",
+    }
+    assert targets["contoso-lab/gpu1_linux"] == {
+        "id": "contoso-lab/gpu1_linux",
+        "relay": "contoso-lab",
+        "namespace": "contoso-lab.servicebus.windows.net",
+        "path": "gpu1_linux",
+        "keyrule": "privy-send",
+        "key": "bmFtZXNwYWNl",
+    }
+    assert len(targets) == 4
+    assert all(not listener.info_calls for listener in hub.listeners.values())
+    assert not hub.audit_path.exists()
+
+
+def test_credential_overrides_and_tokens_reload_without_minting(hub):
+    document = relays_document()
+    document["relays"][0].update(keyrule="parent", key="parent-key")
+    document["relays"][0]["hybrid_connections"].append("inherited")
+    token = "SharedAccessSignature sr=x&sig=y&se=1&skn=z"
+    document["relays"][0]["hybrid_connections"].append({"path": "token", "token": token})
+    write_relays(hub.relays_file, document)
+    targets = {target["id"]: target for target in hub.call("GET", "/v1/relays").payload["targets"]}
+    assert targets[BOX1]["key"] == "a2V5MQ=="
+    assert targets["dev/inherited"]["keyrule"] == "parent"
+    assert targets["dev/inherited"]["key"] == "parent-key"
+    assert targets["dev/token"] == {
+        "id": "dev/token",
+        "relay": "dev",
+        "namespace": "contoso-relay",
+        "path": "token",
+        "token": token,
+    }
+    assert all(not listener.info_calls for listener in hub.listeners.values())
+
+
+@pytest.mark.parametrize("failure", ["missing", "invalid", "unreadable"])
+def test_credential_export_uses_last_valid_cache_and_recovers(hub, monkeypatch, failure):
+    original = hub.call("GET", "/v1/relays").payload
+    with monkeypatch.context() as patch:
+        if failure == "missing":
+            hub.relays_file.unlink()
+        elif failure == "invalid":
+            hub.relays_file.write_text("{broken", encoding="utf-8")
+        else:
+            _deny_file_stat(patch, hub.relays_file)
+        response = hub.call("GET", "/v1/relays")
+        assert response.status == 200
+        assert response.payload["targets"] == original["targets"]
+        assert response.payload["stale"] is True and response.payload["warning"]
+        if failure == "missing":
+            assert hub.registry.snapshot().targets == ()
+    write_relays(hub.relays_file, {"relays": []})
+    assert hub.call("GET", "/v1/relays").payload == {"targets": [], "stale": False}
+
+
+def _deny_file_stat(monkeypatch, source):
+    original = type(source).stat
+
+    def stat(path, *args, **kwargs):
+        if path == source:
+            raise PermissionError("test file is not readable")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(source), "stat", stat)
+
+
+@pytest.mark.parametrize("state", ["missing", "invalid", "unreadable"])
+def test_credential_export_fails_without_any_valid_configuration(hub, monkeypatch, state):
+    # Hub construction does not read the store until the first request.
+    if state == "missing":
+        hub.relays_file.unlink()
+    elif state == "invalid":
+        hub.relays_file.write_text("{broken", encoding="utf-8")
+    else:
+        _deny_file_stat(monkeypatch, hub.relays_file)
+    response = hub.call("GET", "/v1/relays")
+    assert response.status == 503 and response.payload["error"]["code"] == "credentials_unavailable"
+
+
+def test_credential_export_methods_and_json_only_format(hub):
+    assert hub.call("HEAD", "/v1/relays").status == 200
+    for method in ("POST", "PUT", "DELETE", "OPTIONS"):
+        response = hub.call(method, "/v1/relays")
+        assert response.status == 405 and response.headers["Allow"] == "GET, HEAD"
+    assert hub.call("GET", "/v1/relays?format=json").status == 200
+    assert hub.call("GET", "/v1/relays?format=text").status == 400
+    assert hub.call("GET", "/v1/relays?path=another-file").status == 400
+
+
+def test_credentials_are_absent_from_normal_documents_and_mcp_tools(hub):
+    documents = [
+        hub.call("GET", path).body()
+        for path in ("/", "/llms.txt", "/v1", "/v1/targets", "/v1/targets/dev/box1_windows", "/openapi.json")
+    ]
+    tools = hub.call("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).payload
+    assert RELAYS_OPERATION not in {tool["name"] for tool in tools["result"]["tools"]}
+    documents.append(json.dumps(tools).encode())
+    call = hub.call(
+        "POST",
+        "/mcp",
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": RELAYS_OPERATION, "arguments": {}},
+        },
+    )
+    documents.append(call.body())
+    assert "error" in call.payload or call.payload["result"]["isError"]
+    for document in documents:
+        for key in (b"a2V5MQ==", b"a2V5Mg==", b"bmFtZXNwYWNl"):
+            assert key not in document
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"destination_type": None},
+        {"destination_type": "auto"},
+        {"destination_type": ""},
+        {"overwrite": None},
+        {"overwrite": 1},
+        {"local_path": "relative"},
+        {"remote_path": ""},
+        {"remote_path": "x\x00y"},
+        {"unexpected": True},
+        {"local_path": None},
+        {"target": ""},
+        {"wait_s": 30},
+    ],
+)
+def test_sync_rest_rejects_bad_arguments_without_launching(hub, tmp_path, changes):
+    source = tmp_path / "source"
+    source.touch()
+    args = {
+        "target": BOX1,
+        "local_path": str(source),
+        "remote_path": "C:\\remote",
+        "destination_type": "directory",
+        **changes,
+    }
+    response = hub.call("POST", "/v1/files/sync", args)
+    assert response.status == 400
+    assert not hub.audit_path.exists()
+
+
+def test_sync_discovery_openapi_and_method_contract(hub):
+    document = hub.call("GET", "/openapi.json").payload
+    spec = document["paths"]["/v1/files/sync"]["post"]
+    assert spec["operationId"] == "sync_files"
+    assert "202" in spec["responses"] and "200" not in spec["responses"]
+    assert "Location" in spec["responses"]["202"]["headers"]
+    schema = spec["requestBody"]["content"]["application/json"]["schema"]
+    assert set(schema["required"]) == {"target", "local_path", "remote_path", "destination_type"}
+    assert schema["properties"]["destination_type"]["enum"] == ["directory", "file"]
+    assert schema["properties"]["overwrite"]["default"] is True
+    assert schema["additionalProperties"] is False
+    capabilities = hub.call("GET", "/v1").payload
+    assert any(operation["name"] == "sync_files" for operation in capabilities["operations"])
+    assert "sync_files" not in capabilities["mcp"]["tools"]
+    assert hub.call("GET", "/v1/files/sync").status == 405
+    assert hub.call("POST", "/v1/files/sync", {}).status == 400
+    assert (
+        hub.call(
+            "POST",
+            "/v1/files/sync",
+            {},
+            headers={"Origin": "https://attacker.example"},
+        ).status
+        == 403
+    )
 
 
 # ---- targets -------------------------------------------------------------------
@@ -499,6 +857,7 @@ def test_call_labels_show_what_was_asked():
     assert describe("POST", "/mcp", json.dumps(call).encode()) == 'MCP tools/call run {"code":"x"}'
     assert describe("POST", "/mcp", b"[{}, {}]") == "MCP batch of 2 message(s)"
     assert describe("GET", "/v1/jobs/a%0Ab", b"") == "REST GET /v1/jobs/a\\nb"
+    assert describe("POST", "http://[invalid/jobs", b"") == "REST POST http://[invalid/jobs"
 
 
 # ---- the real HTTP server ----------------------------------------------------------------
@@ -512,6 +871,138 @@ def _serve(runtime) -> threading.Thread:
 
 def _messages(caplog) -> list[str]:
     return [record.getMessage() for record in caplog.records if record.name == "privy.hub"]
+
+
+@pytest.fixture
+def http_hub(tmp_path):
+    listener = FakeListener()
+    source = write_relays(tmp_path / "configured-relays.json")
+    runtime = build_hub(
+        home=tmp_path / "home",
+        relays_file=source,
+        port=0,
+        version="test",
+        client_factory=lambda target: FakeRelayClient(listener),
+    )
+    thread = _serve(runtime)
+    try:
+        yield runtime, listener
+    finally:
+        runtime.shutdown()
+        thread.join(5)
+
+
+def test_http_credential_export_is_uncached_and_not_logged(http_hub, caplog):
+    runtime, listener = http_hub
+    caplog.set_level(logging.INFO, logger="privy.hub")
+    url = f"{runtime.url}/v1/relays"
+    response = requests.get(url, timeout=5)
+    assert response.status_code == 200 and len(response.json()["targets"]) == 4
+    assert response.json()["stale"] is False
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Content-Type"].startswith("application/json")
+    assert not any(name.lower().startswith("access-control-") for name in response.headers)
+    head = requests.head(url, timeout=5)
+    assert head.status_code == 200 and head.content == b""
+    assert head.headers["Content-Length"] == response.headers["Content-Length"]
+    assert head.headers["Cache-Control"] == "no-store"
+    browser = requests.get(url, headers={"Origin": runtime.url, "Sec-Fetch-Site": "same-origin"}, timeout=5)
+    assert browser.status_code == 200
+    assert listener.info_calls == 0 and listener.requests == []
+    assert not (runtime.home / "audit.jsonl").exists()
+    assert wait_for(lambda: any("REST GET /v1/relays -> 200" in message for message in _messages(caplog)))
+    for key in ("a2V5MQ==", "a2V5Mg==", "bmFtZXNwYWNl"):
+        assert key not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "missing_host",
+        "rebound_host",
+        "duplicate_host",
+        "origin_list",
+        "null_origin",
+        "wrong_origin",
+        "duplicate_origin",
+        "cross_site",
+        "wrong_port",
+        "absolute_target",
+    ],
+)
+@pytest.mark.parametrize("path", ["/v1/relays", "/v1/jobs", "/mcp"])
+def test_http_guards_reject_before_reading_bodies_and_running_jobs(http_hub, caplog, case, path):
+    runtime, listener = http_hub
+    caplog.set_level(logging.INFO, logger="privy.hub")
+    host, port = runtime.server.server_address[:2]
+    authority = f"127.0.0.1:{port}"
+    headers = [("Host", authority)]
+    if case == "missing_host":
+        headers = []
+    elif case == "rebound_host":
+        headers = [("Host", f"rebound.attacker.example:{port}")]
+    elif case == "duplicate_host":
+        headers.append(("host", authority))
+    elif case == "origin_list":
+        headers.append(("Origin", f"{runtime.url} http://attacker.example"))
+    elif case == "null_origin":
+        headers.append(("Origin", "null"))
+    elif case == "wrong_origin":
+        headers.append(("Origin", f"http://localhost:{port}"))
+    elif case == "duplicate_origin":
+        headers.extend([("Origin", runtime.url), ("origin", runtime.url)])
+    elif case == "cross_site":
+        headers.append(("Sec-Fetch-Site", "cross-site"))
+    elif case == "wrong_port":
+        headers = [("Host", "127.0.0.1:0")]
+    elif case == "absolute_target":
+        path = f"http://attacker.example:{port}{path}"
+    connection = http.client.HTTPConnection(host, port, timeout=5)
+    try:
+        connection.putrequest("POST", path, skip_host=True)
+        for name, value in headers:
+            connection.putheader(name, value)
+        # Do not send the promised body: validation must run before a blocking read.
+        connection.putheader("Content-Length", "1000")
+        connection.endheaders()
+        response = connection.getresponse()
+        assert response.status == 403
+        assert response.getheader("Connection") == "close" and response.will_close
+        assert response.getheader("Cache-Control") == "no-store"
+        assert json.loads(response.read())["error"]["code"] in ("forbidden_host", "forbidden_origin")
+    finally:
+        connection.close()
+    assert listener.info_calls == 0 and listener.requests == []
+    assert not (runtime.home / "audit.jsonl").exists()
+
+
+def test_rejected_job_and_mcp_payloads_have_no_side_effects_or_body_logs(http_hub, caplog):
+    runtime, listener = http_hub
+    caplog.set_level(logging.INFO, logger="privy.hub")
+    sentinel = "this-rejected-code-must-not-be-logged"
+    for path, payload in [
+        ("/v1/jobs", {"target": BOX1, "code": sentinel}),
+        (
+            "/mcp",
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "run", "arguments": {"target": BOX1, "code": sentinel}},
+            },
+        ),
+    ]:
+        response = requests.post(
+            f"{runtime.url}{path}",
+            headers={"Origin": "https://attacker.example"},
+            json=payload,
+            timeout=5,
+        )
+        assert response.status_code == 403
+    assert listener.requests == [] and listener.info_calls == 0
+    assert not (runtime.home / "audit.jsonl").exists()
+    assert wait_for(lambda: len([m for m in _messages(caplog) if "403" in m]) == 2)
+    assert sentinel not in caplog.text
 
 
 def test_build_hub_serves_http_without_credentials(tmp_path, caplog):

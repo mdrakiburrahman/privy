@@ -29,6 +29,7 @@ from privy._relay import redact_relay_secrets
 from privy.hub import console
 from privy.hub.config import Target
 from privy.hub.registry import TargetRegistry
+from privy.hub.sync import sync
 from privy.protocol import ExecRequest
 from privy.transfer import DEFAULT_CHUNK_SIZE, TransferError
 
@@ -177,6 +178,7 @@ class HubJob:
         self.progress: tuple[int, int] | None = None
         self.progress_step = 0
         self.transfer: dict[str, Any] | None = None
+        self.sync_progress: dict[str, Any] | None = None
         self.stdout = OutputBuffer(output_limit)
         self.stderr = OutputBuffer(output_limit)
         #: Read cursor shared by run/get_job callers that pass no explicit offsets.
@@ -270,8 +272,11 @@ class HubJob:
                 result["remote_path"] = self.spec["remote_path"]
                 if self.progress is not None:
                     result["progress"] = {"bytes_done": self.progress[0], "bytes_total": self.progress[1]}
+                if self.type == "sync":
+                    result["destination_type"] = self.spec["destination_type"]
+                    result["progress"] = dict(self.sync_progress or {"phase": "queued"})
                 if self.transfer is not None:
-                    result["result"] = self.transfer
+                    result["result"] = dict(self.transfer)
             return result
 
     def read_output(self, stream: str, offset: int, limit: int) -> dict[str, Any]:
@@ -445,6 +450,30 @@ class JobManager:
         )
         return self._launch(job, self._transfer_body)
 
+    def start_sync(
+        self,
+        target: Target,
+        *,
+        local_path: str,
+        remote_path: str,
+        destination_type: str,
+        overwrite: bool,
+        origin: str,
+    ) -> HubJob:
+        job = HubJob(
+            job_type="sync",
+            target=target,
+            spec={
+                "local_path": local_path,
+                "remote_path": remote_path,
+                "destination_type": destination_type,
+                "overwrite": overwrite,
+            },
+            origin=origin,
+            output_limit=0,
+        )
+        return self._launch(job, self._sync_body)
+
     def start_broadcast(
         self,
         runs: Sequence[tuple[Target, str]],
@@ -573,7 +602,7 @@ class JobManager:
                 self._finish_locked(job, CANCELLED, error="cancelled before it started")
                 return job
             remote = job.remote_job_id
-        if job.type == "exec" and remote:
+        if job.type in ("exec", "sync") and remote:
             self._cancel_remote(job)
         return job
 
@@ -708,6 +737,51 @@ class JobManager:
             job.exit_code = 0
             self._finish_locked(job, SUCCEEDED)
 
+    def _sync_body(self, job: HubJob) -> None:
+        client = self._registry.client(job.target)
+
+        def check_cancel() -> None:
+            with job.cond:
+                if job.cancel_requested:
+                    raise _TransferCancelled()
+
+        def report(update: dict[str, Any]) -> None:
+            with job.cond:
+                job.sync_progress = dict(update)
+                job.transfer = dict(update)
+                job.progress = update["bytes_done"], update["bytes_total"]
+                job.progress_step = console.transfer_progress(job, *job.progress, job.progress_step)
+                job.cond.notify_all()
+
+        def run_remote(code: str) -> str:
+            # Frozen Windows listeners may have no external Python installation.
+            request = ExecRequest(
+                kind="python", code=f"exec({code!r}, {{}})", mode="inprocess", timeout_s=600
+            )
+            with job.cond:
+                job.client, job.request, job.remote_job_id = client, request, None
+            check_cancel()
+            try:
+                result = client.send(request, on_submit=lambda remote_id: self._adopt_remote(job, remote_id))
+            finally:
+                with job.cond:
+                    job.remote_job_id = None
+            check_cancel()
+            if result.timed_out or result.error or result.exit_code != 0:
+                raise TransferError(
+                    "sync_prepare_failed",
+                    f"remote sync preparation failed: {result.error or result.stderr or result.exit_code}",
+                )
+            return result.stdout
+
+        sync(client, **job.spec, check_cancel=check_cancel, report=report, run_remote=run_remote)
+        with job.cond:
+            if job.cancel_requested:
+                self._finish_locked(job, CANCELLED, error="cancelled")
+            else:
+                job.exit_code = 0
+                self._finish_locked(job, SUCCEEDED)
+
     def _append_output(self, job: HubJob, stream: str, data: bytes) -> None:
         if not data:
             return
@@ -804,6 +878,8 @@ class JobManager:
                     remote_path=job.spec["remote_path"],
                     overwrite=job.spec["overwrite"],
                 )
+                if job.type == "sync":
+                    fields["destination_type"] = job.spec["destination_type"]
         else:
             fields.update(
                 state=job.state,
@@ -813,6 +889,11 @@ class JobManager:
             )
             if job.type == "exec":
                 fields.update(stdout_bytes=job.stdout.total, stderr_bytes=job.stderr.total)
+            elif job.type == "sync" and job.transfer is not None:
+                fields.update(
+                    (name, job.transfer[name])
+                    for name in ("files_copied", "files_skipped", "files_done", "bytes_copied")
+                )
             elif job.transfer is not None:
                 fields.update(size=job.transfer.get("size"), sha256=job.transfer.get("sha256"))
         return fields

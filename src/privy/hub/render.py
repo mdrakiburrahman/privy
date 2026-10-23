@@ -49,7 +49,15 @@ def _job_body(job: dict[str, Any]) -> str:
         progress = job.get("progress") or {}
         lines = [f"{job.get('type')}: local {job.get('local_path')} / remote {job.get('remote_path')}"]
         result = job.get("result")
-        if result:
+        if job.get("type") == "sync":
+            counts = result or progress
+            lines.append(
+                f"{counts.get('phase', 'queued')}: {counts.get('files_copied', 0)} copied, "
+                f"{counts.get('files_skipped', 0)} skipped, "
+                f"{counts.get('files_done', 0)}/{counts.get('files_total', 0)} files, "
+                f"{counts.get('bytes_done', 0)}/{counts.get('bytes_total', 0)} bytes"
+            )
+        elif result:
             lines.append(f"{result.get('size')} bytes, sha256 {result.get('sha256')}")
         elif progress:
             lines.append(f"{progress.get('bytes_done')} of {progress.get('bytes_total')} bytes so far")

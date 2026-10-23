@@ -123,6 +123,7 @@ def quickstart(service: HubService, base_url: str) -> str:
         "Run PowerShell, Bash, or Python on remote machines from this computer and see the output live, as",
         "if the machine were local. Each machine runs a privy listener behind Azure Relay; this hub holds the",
         "keys. **No authentication**: call the endpoints below directly.",
+        "Use a loopback URL on this port. Browsers must use this exact origin; local CLI clients need no Origin header.",
         "",
         f"Base URL: `{base_url}`",
         "",
@@ -197,6 +198,7 @@ def quickstart(service: HubService, base_url: str) -> str:
         "",
         "| Task | Request |",
         "| --- | --- |",
+        f"| Export Relay credentials (sensitive, REST-only JSON) | `GET {base_url}/v1/relays` |",
         f"| List machines | `GET {base_url}/v1/targets?format=text` |",
         f"| One machine's details | `GET {base_url}/v1/targets/{example.machine}?format=text` |",
         f"| Run on many machines | `POST {base_url}/v1/broadcasts?format=text&targets=*_windows` with the code as the body |",
@@ -205,6 +207,8 @@ def quickstart(service: HubService, base_url: str) -> str:
         f"| Recent jobs | `GET {base_url}/v1/jobs?format=text` |",
         f"| Copy a file to a machine | `POST {base_url}/v1/files/upload?target=...&local_path=...&remote_path=...` |",
         f"| Copy a file back | `POST {base_url}/v1/files/download?target=...&remote_path=...&local_path=...` |",
+        f"| Sync a file or folder (REST only) | `POST {base_url}/v1/files/sync` with JSON: "
+        "`target`, `local_path`, `remote_path`, `destination_type` (`directory` or `file`) |",
         f"| Every endpoint, parameter, and example | `GET {base_url}/openapi.json` |",
         "",
         "## Rules of thumb",
@@ -218,7 +222,7 @@ def quickstart(service: HubService, base_url: str) -> str:
         "  absolute paths on this computer.",
         "- Commands run as the listener's user with its full privileges. Prefer read-only commands unless",
         "  you were asked to change something.",
-        "- MCP clients can use the same operations as tools at `/mcp`.",
+        "- MCP clients can use job/target operations as tools at `/mcp`; sync and credential export are REST-only.",
         "",
     ]
     return "\n".join(lines)
@@ -344,6 +348,20 @@ def examples(operation: str, base_url: str, example: Example) -> dict[str, Any]:
             "samples": [
                 f'curl.exe -s -X POST "{base_url}/v1/files/download?format=text&target={machine}'
                 '&remote_path=C:\\temp\\log.txt&local_path=C:\\data\\log.txt"'
+            ],
+        },
+        "sync_files": {
+            "request": {
+                "target": machine,
+                "local_path": "C:\\data\\project",
+                "remote_path": "C:\\temp\\project",
+                "destination_type": "directory",
+            },
+            "samples": [
+                f'Invoke-RestMethod -Method Post "{base_url}/v1/files/sync" '
+                '-ContentType "application/json" -Body (@{'
+                f'target="{machine}"; local_path="C:\\data\\project"; '
+                'remote_path="C:\\temp\\project"; destination_type="directory"} | ConvertTo-Json)'
             ],
         },
     }

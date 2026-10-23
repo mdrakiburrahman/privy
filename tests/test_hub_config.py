@@ -159,3 +159,73 @@ def test_store_checks_the_file_at_most_once_per_interval(tmp_path):
     assert len(store.snapshot().targets) == 4
     now[0] = 5.0
     assert store.snapshot().targets == ()
+
+
+def test_credentials_snapshot_retains_last_valid_after_missing_and_invalid_files(tmp_path):
+    path = tmp_path / "relays.json"
+    store = RelaysStore(path, check_interval_s=0)
+    loaded, current = store.credentials_snapshot()
+    assert loaded is None and not current.file_exists
+
+    path.write_text("{invalid", encoding="utf-8")
+    loaded, current = store.credentials_snapshot()
+    assert loaded is None and current.error
+
+    write_relays(path)
+    loaded, current = store.credentials_snapshot()
+    assert loaded is current and len(loaded.targets) == 4
+    last_valid = loaded
+
+    path.unlink()
+    loaded, current = store.credentials_snapshot()
+    assert loaded is last_valid and not current.file_exists
+    assert store.snapshot().targets == ()
+
+    path.write_text("{still invalid", encoding="utf-8")
+    loaded, current = store.credentials_snapshot()
+    assert loaded is last_valid and current.error
+    assert store.snapshot().targets == ()
+
+    write_relays(path, {"relays": []})
+    loaded, current = store.credentials_snapshot()
+    assert loaded is current and loaded.targets == () and current.error is None
+
+
+def test_credentials_snapshot_keeps_last_valid_after_read_failure(tmp_path, monkeypatch):
+    path = write_relays(tmp_path / "relays.json")
+    store = RelaysStore(path, check_interval_s=0)
+    loaded, _ = store.credentials_snapshot()
+
+    def cannot_read(path):
+        raise PermissionError("test file is not readable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("privy.hub.config.read_relays_file", cannot_read)
+        failed = store.reload()
+        assert failed.error
+        cached, current = store.credentials_snapshot()
+        assert cached is loaded and current.error == failed.error
+
+    fixed = store.snapshot()
+    assert fixed.error is None
+    assert store.credentials_snapshot() == (fixed, fixed)
+
+
+def test_credentials_snapshot_recovers_from_stat_failure_without_a_file_change(tmp_path, monkeypatch):
+    path = write_relays(tmp_path / "relays.json")
+    store = RelaysStore(path, check_interval_s=0)
+    loaded, _ = store.credentials_snapshot()
+    original = type(path).stat
+
+    def cannot_stat(source, *args, **kwargs):
+        if source == path:
+            raise PermissionError("test file is not readable")
+        return original(source, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(type(path), "stat", cannot_stat)
+        cached, current = store.credentials_snapshot()
+        assert cached is loaded and current.error
+    cached, current = store.credentials_snapshot()
+    assert cached is current and current.error is None
+    assert cached.targets == loaded.targets

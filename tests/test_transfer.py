@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+import privy.transfer as transfer
 from privy.transfer import (
     TransferError,
     TransferRequest,
@@ -32,6 +33,108 @@ def test_upload_file_roundtrips_binary_chunks(tmp_path):
     assert result.size == len(payload)
     assert result.sha256 == hashlib.sha256(payload).hexdigest()
     assert result.resumed_from == 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["receipts", "remote.bin", "source.bin"]
+
+
+def test_upload_migrates_legacy_receipt_and_preserves_replay(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"committed bytes")
+    first = upload_file(_post, source, destination)
+    receipt = transfer._completion_marker_path(destination.resolve(), first.transfer_id)
+    legacy = destination.with_name(f".{destination.name}.privy-upload-{first.transfer_id[:16]}.complete")
+    receipt.replace(legacy)
+    replace = transfer.os.replace
+
+    def cross_volume_replace(source, target):
+        if source == legacy:
+            raise OSError("receipt and destination are on different volumes")
+        return replace(source, target)
+
+    monkeypatch.setattr(transfer.os, "replace", cross_volume_replace)
+
+    replayed = upload_file(_post, source, destination)
+
+    assert replayed.resumed_from == first.size
+    assert receipt.is_file()
+    assert not legacy.exists()
+    assert destination.read_bytes() == b"committed bytes"
+
+
+def test_upload_cleans_only_valid_legacy_receipts(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"old")
+    old = upload_file(_post, source, destination)
+    receipt = transfer._completion_marker_path(destination.resolve(), old.transfer_id)
+    legacy = destination.with_name(f".destination.privy-upload-{old.transfer_id[:16]}.complete")
+    receipt.replace(legacy)
+    unrelated = destination.with_name(".destination.privy-upload-not-a-receipt.complete")
+    unrelated.write_text("user data")
+    malformed = destination.with_name(".destination.privy-upload-0000000000000000.complete")
+    malformed.write_text("user data")
+    source.write_bytes(b"new")
+
+    upload_file(_post, source, destination, overwrite=True)
+
+    assert not legacy.exists()
+    assert unrelated.read_text() == malformed.read_text() == "user data"
+    assert len(list((tmp_path / "receipts").iterdir())) == 1
+
+
+def test_upload_receipt_failure_is_reported_without_committing(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"new")
+    blocked = tmp_path / "blocked"
+    blocked.touch()
+    monkeypatch.setattr(transfer, "_completion_directory", lambda: blocked)
+
+    with pytest.raises(TransferError) as exc:
+        upload_file(_post, source, destination)
+
+    assert exc.value.code == "filesystem_error"
+    assert not destination.exists()
+    assert list(tmp_path.glob("*.part"))
+
+
+def test_upload_completion_response_can_be_replayed_from_private_receipt(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"payload")
+    completion = None
+
+    def recording_post(raw):
+        nonlocal completion
+        result = _post(raw)
+        if json.loads(raw)["action"] == "upload_complete" and result.get("complete"):
+            completion = raw
+        return result
+
+    upload_file(recording_post, source, destination)
+    assert completion is not None
+
+    # A retry after a lost final response, including after verifier state is discarded.
+    transfer._UPLOAD_VERIFIERS.clear()
+    replayed = TransferResponse.from_json(_post(completion))
+
+    assert replayed.complete
+    assert destination.read_bytes() == b"payload"
+    assert not list(tmp_path.glob("*.complete"))
+
+
+def test_receipt_does_not_accept_a_changed_destination(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"payload")
+    upload_file(_post, source, destination)
+    destination.write_bytes(b"changed destination")
+
+    with pytest.raises(TransferError) as exc:
+        upload_file(_post, source, destination)
+
+    assert exc.value.code == "destination_exists"
+    assert destination.read_bytes() == b"changed destination"
 
 
 def test_upload_resumes_matching_partial(tmp_path):

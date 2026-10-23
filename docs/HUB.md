@@ -70,6 +70,7 @@ curl.exe -sN "http://127.0.0.1:7748/v1/jobs?stream=true&target=devbox01" --data-
   id, or host name. When a name matches several targets, for example `devbox01_windows` and
   `devbox01_wsl`, the one that is online is used.
 - Every `/v1` operation accepts `format=text` for a compact, terminal-like answer instead of JSON.
+  The REST-only credentials export at `/v1/relays` is JSON-only.
 - Disconnecting from a stream does not stop the job. `GET /v1/jobs/{job_id}/stream` replays its
   output and follows it.
 - For multi-line scripts or code with quotes, save the code to a file and send
@@ -171,6 +172,7 @@ complete OpenAPI 3.1 description with examples.
 | Method and path                     | Operation                                                                  |
 | ----------------------------------- | -------------------------------------------------------------------------- |
 | `GET /` and `GET /llms.txt`         | Quickstart (Markdown) with the machines online now                         |
+| `GET /v1/relays`                    | Export normalized Relay credentials per target (sensitive JSON; REST only) |
 | `GET /v1/targets`                   | `list_targets` (`refresh`, `online_only`, `relay`, `probe`)                |
 | `GET /v1/targets/{target}`          | `get_target`                                                               |
 | `POST /v1/jobs`                     | `run`; `stream=true` streams the output                                    |
@@ -183,12 +185,13 @@ complete OpenAPI 3.1 description with examples.
 | `GET /v1/broadcasts/{broadcast_id}` | `get_broadcast`                                                            |
 | `POST /v1/files/upload`             | `upload_file`                                                              |
 | `POST /v1/files/download`           | `download_file`                                                            |
+| `POST /v1/files/sync`               | `sync_files`: async file/folder contents update (REST only; 202 + job URL) |
 
 Arguments go in the query string, in a JSON body (`Content-Type: application/json`), or both. For
 `POST /v1/jobs` and `POST /v1/broadcasts`, putting `target` (or `targets`) in the query string makes
 the raw request body the code: the easiest form to type in a shell. `targets` takes comma-separated
-glob patterns. Errors use `{"error": {"code": "...", "message": "..."}}` with an HTTP 4xx status, or
-`error (<code>): <message>` with `format=text`.
+glob patterns. Errors use `{"error": {"code": "...", "message": "..."}}` with an HTTP 4xx/5xx
+status, or `error (<code>): <message>` with `format=text`.
 
 ```powershell
 $hub = "http://127.0.0.1:7748"
@@ -197,6 +200,47 @@ Invoke-RestMethod "$hub/v1/targets?online_only=true&format=text"
 $job = Invoke-RestMethod -Method Post "$hub/v1/jobs?target=devbox01&wait_s=5" -Body 'Get-ChildItem C:\'
 Invoke-RestMethod "$hub/v1/jobs/$($job.job_id)?wait_s=60"
 ```
+
+### Export Relay credentials
+
+`GET /v1/relays` returns the effective credentials for every configured target, including offline
+listeners. It reads the same validated configuration as the hub: `HOME\relays.json` unless
+`--relays-file` overrides it. It does not probe listeners, call Azure, or mint tokens.
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:7748/v1/relays"
+```
+
+```json
+{
+  "targets": [
+    {
+      "id": "dev/devbox01_windows",
+      "relay": "dev",
+      "namespace": "contoso-relay",
+      "path": "devbox01_windows",
+      "keyrule": "all",
+      "key": "<key>"
+    }
+  ],
+  "stale": false
+}
+```
+
+Namespace-level credentials are inherited, and per-connection credentials override them. Each entry
+contains either `keyrule` and `key` or `token`, never both. Raw file metadata is not included. This
+endpoint is JSON-only (`format=json` is optional), supports `HEAD`, and is not an MCP tool.
+
+If the file becomes invalid, unreadable, or missing after a successful load, this endpoint serves
+the last valid credentials with `stale: true` and a `warning`. Cached keys may have been revoked,
+and cached tokens may have expired. A valid empty configuration replaces the cache with no targets.
+Before any valid configuration has loaded, the endpoint returns HTTP 503 with error code
+`credentials_unavailable`. Ordinary target/job behavior is unchanged: a missing file still removes
+targets from normal operations.
+
+**The response contains secrets**, is sent with `Cache-Control: no-store`, and is never logged by
+the hub. Do not paste it into chats, logs, or source control. Exported long-lived keys can retain
+access after the hub stops.
 
 ### Live streams
 
@@ -220,9 +264,9 @@ very long job's output, a `[privy] ... no longer kept by the hub` line marks the
 - **2025-11-25, 2025-06-18, and 2025-03-26** clients open with `initialize`. The hub needs no
   session, so it never issues `Mcp-Session-Id`.
 
-Each REST operation is also a tool, and the server returns usage instructions for the model. Tool
-results carry a compact text rendering as `content`, which is what the model reads, and the JSON as
-`structuredContent`.
+Each job/target REST operation is also a tool except file sync; sync and credential export are
+REST-only. The server returns usage instructions for the model. Tool results carry a compact text
+rendering as `content`, which is what the model reads, and the JSON as `structuredContent`.
 
 | Tool                           | Purpose                                                         |
 | ------------------------------ | --------------------------------------------------------------- |
@@ -296,6 +340,133 @@ target's default language unless `language` is given. `get_broadcast` waits for 
 machine; remote relative paths resolve against the listener's working directory. Transfers are
 resumable and SHA-256 verified, and they refuse to replace a destination unless `overwrite` is true.
 
+### Sync a local file or folder into a target
+
+`POST /v1/files/sync` creates a **sync job** and returns **202 Accepted** with
+`Location: /v1/jobs/<job_id>`. Paths refer to the hub's filesystem and the listener's filesystem,
+not to the HTTP caller's machine. This endpoint is REST-only; it uses the existing listener's Python
+execution and resumable, SHA-256-verified upload, with no listener upgrade required. Remote
+preparation uses the listener's embedded Python in an isolated namespace, so a frozen Windows
+listener does not need an external `python.exe` installation.
+
+| Argument           | Required | Meaning                                                                                                          |
+| ------------------ | -------- | ---------------------------------------------------------------------------------------------------------------- |
+| `target`           | Yes      | Machine name, Hybrid Connection, full target id, or host name.                                                   |
+| `local_path`       | Yes      | Absolute file or directory on the hub machine.                                                                   |
+| `remote_path`      | Yes      | Absolute destination using the target's path syntax.                                                             |
+| `destination_type` | Yes      | `directory` or `file`; deliberately no implicit guessing.                                                        |
+| `overwrite`        | No       | Default `true`: replace differing files. `false` fails on a differing existing file; identical files still skip. |
+
+With `destination_type=directory`, a source directory's **contents** go directly under `remote_path`
+(not an extra source folder); a single source file goes to `remote_path\<source filename>`. With
+`destination_type=file`, the source must be a single file and `remote_path` is its exact destination
+filename, allowing renaming.
+
+```powershell
+$hub = "http://127.0.0.1:7748"
+$body = @{
+    target = "dev/raki-windows-8_windows"
+    local_path = "C:\data\my-project"
+    remote_path = "C:\.temp\my-project"
+    destination_type = "directory"
+} | ConvertTo-Json
+
+$job = Invoke-RestMethod -Method Post "$hub/v1/files/sync" -ContentType "application/json" -Body $body
+Invoke-RestMethod "$hub/v1/jobs/$($job.job_id)?wait_s=60"
+Invoke-RestMethod -Method Post "$hub/v1/jobs/$($job.job_id)/cancel"
+```
+
+To copy and rename one file:
+
+```powershell
+$body = @{
+    target = "dev/raki-windows-8_windows"
+    local_path = "C:\data\settings.json"
+    remote_path = "C:\.temp\my-project\appsettings.json"
+    destination_type = "file"
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post "$hub/v1/files/sync" -ContentType "application/json" -Body $body
+```
+
+For curl, save the JSON to `sync.json`, then send it without PowerShell argument-quoting issues:
+
+```powershell
+curl.exe -i -s -H "Content-Type: application/json" --data-binary '@sync.json' http://127.0.0.1:7748/v1/files/sync
+```
+
+The initial response uses the normal job shape; a completed example is:
+
+```json
+{
+  "job_id": "9f3c2a1b7d4e",
+  "target": "dev/raki-windows-8_windows",
+  "type": "sync",
+  "state": "succeeded",
+  "done": true,
+  "exit_code": 0,
+  "local_path": "C:\\data\\my-project",
+  "remote_path": "C:\\.temp\\my-project",
+  "destination_type": "directory",
+  "progress": {
+    "phase": "completed",
+    "files_total": 3,
+    "files_done": 3,
+    "files_copied": 1,
+    "files_skipped": 2,
+    "directories_total": 2,
+    "bytes_total": 300,
+    "bytes_done": 300,
+    "bytes_copied": 100,
+    "current_path": null
+  },
+  "result": {
+    "phase": "completed",
+    "files_total": 3,
+    "files_done": 3,
+    "files_copied": 1,
+    "files_skipped": 2,
+    "directories_total": 2,
+    "bytes_total": 300,
+    "bytes_done": 300,
+    "bytes_copied": 100,
+    "current_path": null
+  }
+}
+```
+
+- Poll the returned job id until `done=true`; the initial response can already be terminal for tiny
+  jobs. `phase` progresses through `queued`, `scanning`, `preparing`, `uploading`, and `completed`.
+  Queued jobs may have only the phase; totals become available after local scanning.
+- Missing directories (including parents) and empty source directories are created. Hidden files are
+  included; there are no implicit excludes, so avoid syncing entire repositories containing secrets
+  unless that is intentional.
+- Identical files are compared using SHA-256 and skipped without uploading their contents.
+  Remote-only files are **never deleted**. This is a one-shot copy/update, not a mirror or watcher.
+- Updated listeners keep completed-upload receipts in private state, not destination folders. Sync
+  also migrates valid legacy `.complete` receipts for identical files it skips. Upgrade the listener
+  to enable this cleanup; interrupted `.part` uploads remain resumable.
+- `files_done` counts completed copies plus skips. `bytes_done` includes the sizes of skipped files
+  plus current upload progress; `bytes_copied` counts completed uploaded file payloads, not network
+  overhead. File timestamps, ACLs, and permissions are not preserved.
+- Source trees are bounded to **10,000 entries** (files plus directories, including the root
+  directory) and **1 MiB serialized manifest JSON**. File contents are hashed/transferred in bounded
+  chunks, not loaded wholly into memory. Paths are limited to 4,096 characters at the API.
+- Symlinks, Windows junctions/reparse points, special files, incompatible destination names, case
+  collisions on Windows, and file/directory conflicts are rejected. Do not concurrently modify
+  either tree: this is not a filesystem snapshot or an atomic tree transaction.
+- Basic argument/source errors return HTTP 400/404; unknown targets return 404 and a full queue
+  returns 429. Enumeration, remote path, link, comparison, transfer, or source-mutation errors after
+  acceptance produce a failed/error job with `error` and partial progress/result.
+- Cancellation is best effort: it interrupts the remote preparation command or checks local
+  scanning/chunk/between-file boundaries. It may wait for an in-flight hash or Relay request. Remote
+  directory/hash preparation has a 600-second execution limit.
+- On failure/cancellation, already completed files and created directories remain; matching partial
+  uploads can resume on a later request. There is no rollback and no automatic retry. Poll/cancel
+  works after the initial HTTP connection closes; jobs themselves remain in memory under the normal
+  hub retention policy.
+- `format=text` is supported for submission and polling. Submission is always asynchronous (no
+  `wait_s` argument); use the existing job endpoint's `wait_s` for long polling.
+
 ## Console
 
 Like `privy server`, the hub shows everything it does in its console:
@@ -314,13 +485,24 @@ Relay request.
 
 ## Security
 
-- The hub has no authentication. Any process on this machine that can reach its port, including a
-  web page open in your browser, can run code on every listener with the listener account's
-  privileges. Run the hub only on a workstation that you alone use.
+- The hub has no authentication. Native processes on this machine can run code on every listener
+  with the listener account's privileges and export Relay credentials. Run the hub only on a
+  workstation that you alone use.
+- Every route (REST, MCP, discovery, health, and streams) requires exactly one `Host` header naming
+  `127.0.0.1`, `localhost`, or `[::1]` on the hub's actual port. Supplied `Origin` headers must
+  match the exact HTTP origin, including host and port. Untrusted, missing, malformed, or duplicate
+  Host headers, invalid/duplicate/cross-origin Origin headers, and browser requests marked
+  `Sec-Fetch-Site: cross-site` are rejected with HTTP 403 before dispatch.
+- These checks block DNS rebinding and cross-origin browser requests, not local native clients that
+  can forge headers. Open `http://127.0.0.1:7748/` directly in your browser; local curl and MCP
+  clients work without Origin headers. Different hostnames, other local browser application ports,
+  and remote URLs are deliberately not allowed. No CORS permissions are granted.
 - It binds to `127.0.0.1` by default. `--host` with another address exposes remote execution to
-  everyone who can reach that address; the hub warns at startup.
-- Keys stay in `relays.json` and hub memory. They are never returned by the API or MCP tools and
-  never logged; each Relay request uses a freshly minted one-hour SAS token.
+  anyone who can reach that address and forge local headers; the hub warns at startup. Binding more
+  widely does not relax the Host/Origin policy.
+- Keys stay out of normal API responses, discovery documents, and MCP tools. Only the explicit REST
+  credentials export returns keys/tokens; its response is never logged. Each Relay request normally
+  uses a freshly minted one-hour SAS token (or the configured pre-minted token).
 - `audit.jsonl` records each job's target, origin (`rest` or `mcp`), language, the first 4 KiB of
   code with its SHA-256, and the outcome.
 - Approve `run`, `broadcast`, and transfers in your MCP client unless you trust what it will do.

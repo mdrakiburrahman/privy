@@ -1,7 +1,8 @@
 """HTTP server for the hub: routing, live streams, and one console line per call.
 
 The hub has no authentication: anyone who can reach its address can run code on
-every target, so it binds to loopback unless told otherwise.
+every target with forged local headers. It binds to loopback by default and
+checks Host and Origin to block DNS rebinding and cross-origin browser calls.
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 import time
 from collections.abc import Iterable, Iterator, Mapping
@@ -36,13 +38,20 @@ MAX_BODY_BYTES = 8 * 1024 * 1024
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 _UNSPECIFIED_HOSTS = ("0.0.0.0", "::", "")
 _LABEL_CHARS = 300
+_LOCAL_AUTHORITY_RE = re.compile(r"(localhost|127\.0\.0\.1|\[::1\])(?::([0-9]{1,5}))?", re.IGNORECASE)
 
 
 class Headers(Mapping[str, str]):
     """Case-insensitive, read-only view of request headers."""
 
     def __init__(self, items: Iterable[tuple[str, str]]) -> None:
-        self._values = {name.lower(): value for name, value in items}
+        self._all: dict[str, list[str]] = {}
+        for name, value in items:
+            self._all.setdefault(name.lower(), []).append(value)
+        self._values = {name: values[-1] for name, values in self._all.items()}
+
+    def get_all(self, name: str) -> list[str]:
+        return list(self._all.get(name.lower(), ()))
 
     def __getitem__(self, name: str) -> str:
         return self._values[name.lower()]
@@ -89,6 +98,16 @@ def _describe_mcp(body: bytes) -> str:
     return _printable(message["method"])
 
 
+def _local_authority(value: str, port: int) -> tuple[str, int] | None:
+    match = _LOCAL_AUTHORITY_RE.fullmatch(value)
+    if match is None:
+        return None
+    actual_port = int(match[2]) if match[2] is not None else 80
+    if actual_port != port:
+        return None
+    return match[1].lower(), actual_port
+
+
 class HubApp:
     """Everything the hub does with one HTTP request, independent of sockets."""
 
@@ -102,7 +121,42 @@ class HubApp:
         self.port = port
         self.rest.base_url = f"http://127.0.0.1:{port}"
 
+    def validate_request(self, target: str, headers: Mapping[str, str]) -> HttpResponse | None:
+        """Block rebinding and cross-origin browsers, not ordinary local HTTP clients."""
+        request_headers = headers if isinstance(headers, Headers) else Headers(headers.items())
+        hosts = request_headers.get_all("Host")
+        authority = _local_authority(hosts[0], self.port) if len(hosts) == 1 else None
+        if authority is None:
+            return error_response(403, "forbidden_host", "Host must be a loopback host on the hub's port")
+        origins = request_headers.get_all("Origin")
+        if origins:
+            match = re.fullmatch(r"http://(.+)", origins[0], re.IGNORECASE)
+            if len(origins) != 1 or match is None or _local_authority(match[1], self.port) != authority:
+                return error_response(403, "forbidden_origin", "Origin must match the hub request's origin")
+        sites = request_headers.get_all("Sec-Fetch-Site")
+        if len(sites) > 1 or (sites and sites[0].strip().lower() == "cross-site"):
+            return error_response(403, "forbidden_origin", "Cross-site browser requests are not allowed")
+        try:
+            parsed = urlsplit(target)
+        except ValueError:
+            return error_response(403, "forbidden_host", "Invalid request target")
+        if (
+            any(ord(char) <= 32 or ord(char) == 127 for char in target)
+            or parsed.fragment
+            or target.startswith("//")
+            or (
+                not target.startswith("/")
+                and (parsed.scheme != "http" or _local_authority(parsed.netloc, self.port) != authority)
+            )
+        ):
+            return error_response(403, "forbidden_host", "Request target must match the hub request's origin")
+        return None
+
     def handle(self, method: str, target: str, headers: Mapping[str, str], body: bytes) -> HttpResponse:
+        headers = headers if isinstance(headers, Headers) else Headers(headers.items())
+        rejected = self.validate_request(target, headers)
+        if rejected is not None:
+            return rejected
         parsed = urlsplit(target)
         path = parsed.path or "/"
         if path == "/healthz":
@@ -119,7 +173,11 @@ class HubApp:
     @staticmethod
     def describe(method: str, target: str, body: bytes) -> str:
         """The console label of a call: what was asked, with its arguments."""
-        if method == "POST" and (urlsplit(target).path or "/") == MCP_PATH:
+        try:
+            path = urlsplit(target).path or "/"
+        except ValueError:
+            path = None
+        if method == "POST" and path == MCP_PATH:
             return "MCP " + _describe_mcp(body)
         label = f"REST {method} {_printable(unquote(target))}"
         return f"{label} {_describe_body(body)}" if body else label
@@ -158,6 +216,12 @@ class _Handler(BaseHTTPRequestHandler):
         self.server.app.log_call(self.command, self.path, body, response, time.monotonic() - started)
 
     def _read_and_handle(self) -> tuple[bytes, HttpResponse]:
+        headers = Headers(self.headers.items())
+        rejected = self.server.app.validate_request(self.path, headers)
+        if rejected is not None:
+            self.close_connection = True
+            rejected.headers["Connection"] = "close"
+            return b"", rejected
         if self.headers.get("Transfer-Encoding"):
             self.close_connection = True
             return b"", error_response(
@@ -174,7 +238,7 @@ class _Handler(BaseHTTPRequestHandler):
             )
         body = self.rfile.read(length) if length else b""
         try:
-            return body, self.server.app.handle(self.command, self.path, Headers(self.headers.items()), body)
+            return body, self.server.app.handle(self.command, self.path, headers, body)
         except Exception:  # noqa: BLE001 - keep the server alive
             log.exception("unhandled error for %s %s", self.command, self.path)
             return body, error_response(500, "internal_error", "internal error; see the hub console")

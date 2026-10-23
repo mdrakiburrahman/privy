@@ -21,6 +21,11 @@ REQUIRED_RELAY_VARS = (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolated_transfer_receipts(tmp_path, monkeypatch):
+    monkeypatch.setattr("privy.transfer._completion_directory", lambda: tmp_path / "receipts")
+
+
 def _relay_creds_from_env() -> dict[str, str] | None:
     missing = [name for name in REQUIRED_RELAY_VARS if not os.environ.get(name)]
     if missing:

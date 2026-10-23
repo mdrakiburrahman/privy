@@ -36,6 +36,8 @@ from privy.hub.registry import (
     language_from,
     machine_name,
 )
+from privy.hub.sync import validate_source
+from privy.transfer import TransferError
 
 LANGUAGES = ("python", "bash", "powershell")
 MODES = ("subprocess", "inprocess")
@@ -482,6 +484,41 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
 )
 OPERATIONS_BY_NAME = {operation.name: operation for operation in OPERATIONS}
+SYNC_OPERATION = Operation(
+    "sync_files",
+    "Sync a local file or folder into a machine (REST only)",
+    "Asynchronously copy an absolute hub-local file or folder to an absolute target path. "
+    "destination_type=directory copies folder contents or places a single file under its basename; "
+    "destination_type=file uses an exact filename and requires a single source file. "
+    "Create missing directories, skip SHA-256-identical files, replace changed files by default, "
+    "and never delete remote-only files. Links and special files are rejected. "
+    "At most 10,000 manifest entries and 1 MiB serialized metadata. "
+    "Returns 202 and a job Location; poll/cancel with existing job endpoints. "
+    "Failure/cancellation leaves completed files intact; no whole-tree rollback. REST only, not an MCP tool.",
+    (
+        _TARGET,
+        Param(
+            "local_path",
+            "string",
+            "Absolute source file or folder on the hub machine.",
+            True,
+            max_length=4096,
+        ),
+        Param("remote_path", "string", "Absolute destination on the target machine.", True, max_length=4096),
+        Param(
+            "destination_type",
+            "string",
+            "Interpret remote_path explicitly.",
+            True,
+            enum=("directory", "file"),
+        ),
+        Param(
+            "overwrite", "boolean", "Replace changed files; identical files are always skipped.", default=True
+        ),
+    ),
+    read_only=False,
+    destructive=True,
+)
 #: Operations that wait for jobs and can report progress while they do.
 PROGRESS_OPERATIONS = frozenset(
     {"run", "get_job", "broadcast", "get_broadcast", "upload_file", "download_file"}
@@ -606,6 +643,24 @@ class HubService:
         args = OPERATIONS_BY_NAME["run"].parse(raw_args or {})
         with _translated_errors():
             return self._start_exec(origin=origin, **args)
+
+    def start_sync(self, raw_args: Mapping[str, Any], *, origin: str) -> dict[str, Any]:
+        if any(value is None for value in raw_args.values()):
+            raise _invalid("sync arguments must not be null")
+        args = SYNC_OPERATION.parse(raw_args)
+        if not args["target"].strip():
+            raise _invalid("target must not be empty")
+        if not args["remote_path"].strip() or "\0" in args["remote_path"] or "\0" in args["local_path"]:
+            raise _invalid("local_path and remote_path must be non-empty paths without null bytes")
+        try:
+            local = validate_source(args["local_path"], args["destination_type"])
+        except TransferError as exc:
+            status = 404 if exc.code == "local_source_unavailable" else 400
+            raise HubError(str(exc), status=status, code=exc.code) from None
+        args["local_path"] = str(local)
+        with _translated_errors():
+            job = self.jobs.start_sync(self.registry.resolve(args.pop("target")), origin=origin, **args)
+        return self._job_view(job, 0)
 
     def job(self, job_id: str) -> HubJob:
         with _translated_errors():

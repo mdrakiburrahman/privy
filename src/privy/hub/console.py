@@ -68,7 +68,7 @@ def job_started(job: HubJob, host: str | None) -> None:
         title = f"▶ RUN {job.id}  {_where(job.target, host)}"
     else:
         spec = job.spec
-        arrow = "->" if job.type == "upload" else "<-"
+        arrow = "->" if job.type in ("upload", "sync") else "<-"
         lines = [
             f"│   via={job.origin}  overwrite={spec['overwrite']}",
             f"│   local {spec['local_path']} {arrow} remote {spec['remote_path']}",
@@ -112,6 +112,12 @@ def job_finished(job: HubJob) -> None:
         for name, buffer in (("stdout", job.stdout), ("stderr", job.stderr)):
             lines.append(f"│ {name}:")
             lines.append(indent(_tail(buffer.tail(MAX_LOG_BYTES), buffer.total), "│   "))
+    elif job.type == "sync" and job.transfer:
+        lines.append(
+            f"│ {job.transfer['files_copied']} copied, {job.transfer['files_skipped']} skipped, "
+            f"{job.transfer['files_done']}/{job.transfer['files_total']} files, "
+            f"{job.transfer['bytes_copied']} bytes copied"
+        )
     elif job.transfer:
         lines.append(f"│ {job.transfer.get('size')} bytes  sha256={job.transfer.get('sha256')}")
         if job.transfer.get("resumed_from"):
