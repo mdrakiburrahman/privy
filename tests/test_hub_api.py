@@ -85,6 +85,8 @@ def test_quickstart_lists_online_machines_with_runnable_examples(hub):
         'curl.exe -sN "http://localhost:9999/v1/jobs?stream=true&target=dev/box1_windows" '
         "--data-binary 'Get-Date; hostname'"
     ) in text
+    # A bare @file is PowerShell's splatting operator, so the advice must quote it.
+    assert "`--data-binary '@script.ps1'`" in text and "--data-binary @" not in text
     assert hub.call("GET", "/llms.txt", headers={"Host": "localhost:9999"}).text == text
 
 

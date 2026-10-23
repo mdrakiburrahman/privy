@@ -73,7 +73,8 @@ curl.exe -sN "http://127.0.0.1:7748/v1/jobs?stream=true&target=devbox01" --data-
 - Disconnecting from a stream does not stop the job. `GET /v1/jobs/{job_id}/stream` replays its
   output and follows it.
 - For multi-line scripts or code with quotes, save the code to a file and send
-  `--data-binary @script.ps1`. Windows PowerShell 5.1 mangles quotes in arguments to `curl.exe`.
+  `--data-binary '@script.ps1'`. Windows PowerShell 5.1 mangles quotes in arguments to `curl.exe`,
+  and keep the quotes around `@script.ps1`: in PowerShell a bare `@` is the splatting operator.
 
 ### Latency
 
