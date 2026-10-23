@@ -326,6 +326,26 @@ def _echo_chunk(echo_id: str, stream: str, data: bytes | None) -> None:
         _ECHO_DROPPED += 1
 
 
+def echo_output(echo_id: str, stream: str, data: bytes | None) -> None:
+    """Echo output lines prefixed with ``[echo_id]`` when echo is enabled.
+
+    ``data=None`` flushes a pending partial line. Never blocks the caller.
+    """
+    _echo_chunk(echo_id, stream, data)
+
+
+def echo_barrier(timeout: float = 1.0) -> None:
+    """Wait until everything queued for echo so far has been written."""
+    if not _ECHO_ENABLED:
+        return
+    written = threading.Event()
+    try:
+        _ECHO_QUEUE.put_nowait(("", "", written))
+    except queue.Full:
+        return
+    written.wait(timeout)
+
+
 def _echo_write(stream: str, echo_id: str, lines: list[bytes]) -> None:
     target = sys.stderr if stream == "stderr" else sys.stdout
     prefix = f"[{echo_id}] "
@@ -343,6 +363,9 @@ def _echo_loop() -> None:
     reported = 0
     while True:
         echo_id, stream, data = _ECHO_QUEUE.get()
+        if isinstance(data, threading.Event):
+            data.set()
+            continue
         key = (echo_id, stream)
         if data is None:
             rest = partial.pop(key, b"")

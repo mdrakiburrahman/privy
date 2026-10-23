@@ -166,10 +166,12 @@ privy hub serve --port 7748
 privy hub status --refresh
 ```
 
-`privy hub serve` exposes every listener hydrated in `relays.json` through a loopback REST API and
-MCP endpoint, and logs its activity at INFO by default. `--home` (or `PRIVY_HUB_HOME`) selects the
-folder holding `relays.json`, the API token, and the audit log. `privy hub status` prints each
-target's live status and exits `1` when the hub is unreachable. See [Hub](HUB.md).
+`privy hub serve` exposes every listener hydrated in `relays.json` through a REST API and MCP
+endpoint without authentication, bound to loopback, and logs every call, probe, command, and its
+live output at INFO by default (`--no-echo-output` hides the output lines). `--home` (or
+`PRIVY_HUB_HOME`) selects the folder holding `relays.json` and the audit log. `GET /` on the hub is
+a quickstart for AI assistants. `privy hub status` prints each target's live status and exits `1`
+when the hub is unreachable. See [Hub](HUB.md).
 
 ## Output and exit behavior
 

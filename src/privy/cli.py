@@ -739,21 +739,24 @@ each command's mode/timeout and may set max_parallel (default: 32).""",
         "hub",
         help="run a local control plane for many listeners",
         description=(
-            "Serve a loopback REST API and Model Context Protocol endpoint that discover, probe, and "
-            "run code on every listener hydrated in relays.json. The hub never calls Azure Resource "
-            "Manager; it signs short-lived tokens from the hydrated keys."
+            "Serve a REST API and Model Context Protocol endpoint that discover, probe, and run code "
+            "on every listener hydrated in relays.json, with live output. The hub has no "
+            "authentication and binds to loopback. It never calls Azure Resource Manager; it signs "
+            "short-lived tokens from the hydrated keys."
         ),
         epilog="""Files in the hub home directory:
   relays.json     hydrated relay keys (see docs/SCHEDULED_TASKS.md); reloaded when it changes
-  hub-token       bearer token for the API, created on first start
-  hub-state.json  URL and pid of the running hub (no secrets)
+  hub-state.json  URL and pid of the running hub
   audit.jsonl     every command and transfer the hub was asked to run
 
-Endpoints (all but /healthz require 'Authorization: Bearer <hub-token>'):
-  GET  /v1             capabilities and usage instructions
-  GET  /openapi.json   OpenAPI 3.1 description of the REST API
+Endpoints (no authentication):
+  GET  /               quickstart for LLMs and people: machines online now, examples
+  POST /v1/jobs        run code; ?stream=true streams the output live
+  GET  /openapi.json   OpenAPI 3.1 description with examples
   POST /mcp            MCP endpoint exposing the same operations as tools
   GET  /healthz        liveness check
+
+Point an LLM at http://127.0.0.1:7748/ and ask it to run something.
 """,
     )
     hub_parser.set_defaults(_help_parser=hub_parser)
@@ -766,14 +769,20 @@ Endpoints (all but /healthz require 'Authorization: Bearer <hub-token>'):
     hub_serve = hub_sub.add_parser(
         "serve",
         help="serve the hub until interrupted",
-        description="Bind the hub API to a loopback port and serve it until Ctrl-C.",
+        description=(
+            "Bind the hub to a loopback port and serve it until Ctrl-C. The console shows every call, "
+            "probe, command, and its live output."
+        ),
     )
     _add_common_args(hub_serve)
     _add_hub_home_arg(hub_serve)
     hub_serve.add_argument(
         "--host",
         default="127.0.0.1",
-        help="interface to bind; anything but loopback exposes remote execution to the network",
+        help=(
+            "interface to bind; the hub has no authentication, so anything but loopback lets every "
+            "host that can reach it run code on all targets"
+        ),
     )
     hub_serve.add_argument(
         "--port", type=_port, default=HUB_DEFAULT_PORT, help="TCP port (0 picks a free one)"
@@ -791,12 +800,22 @@ Endpoints (all but /healthz require 'Authorization: Bearer <hub-token>'):
         default=30.0,
         help="seconds a probed listener status is reused",
     )
-    hub_serve.add_argument(
-        "--allow-origin",
-        action="append",
-        default=[],
-        metavar="ORIGIN",
-        help="browser origin allowed to call the API (repeatable; by default every Origin is refused)",
+    hub_echo = hub_serve.add_mutually_exclusive_group()
+    hub_echo.add_argument(
+        "--echo-output",
+        dest="echo_output",
+        action="store_true",
+        default=None,
+        help=(
+            "print every job's stdout/stderr on the hub console as it arrives, prefixed with the job "
+            "id and hybrid connection (default; env: PRIVY_ECHO_OUTPUT=0 disables)"
+        ),
+    )
+    hub_echo.add_argument(
+        "--no-echo-output",
+        dest="echo_output",
+        action="store_false",
+        help="show only the request and result boxes, not live output",
     )
     hub_serve.set_defaults(func=_cmd_hub_serve)
 
@@ -962,27 +981,35 @@ def _cmd_token_mint(args: argparse.Namespace) -> int:
     return 0
 
 
-_LOOPBACK_BIND_HOSTS = ("127.0.0.1", "localhost", "::1")
-
-
 def _hub_home(args: argparse.Namespace) -> Path:
     from privy.hub.home import default_home
 
     return Path(args.home).expanduser() if args.home else default_home()
 
 
-def _cmd_hub_serve(args: argparse.Namespace) -> int:
-    from privy.hub.app import build_hub
-    from privy.hub.home import TOKEN_FILENAME
+def _tolerant_console() -> None:
+    """Never let a character the console cannot encode (from remote output) break logging."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="backslashreplace")
+        except (OSError, ValueError):
+            pass
 
+
+def _cmd_hub_serve(args: argparse.Namespace) -> int:
+    from privy.executor import set_echo_output
+    from privy.hub.app import LOOPBACK_HOSTS, build_hub
+    from privy.hub.home import LEGACY_TOKEN_FILENAME
+
+    echo_output = _resolve_echo_output(args)
     if max(args.verbose, getattr(args, "verbose_sub", 0)) == 0:
         # The hub usually runs in a visible console; show its activity by default.
         logging.getLogger("privy").setLevel(logging.INFO)
-    if args.host not in _LOOPBACK_BIND_HOSTS:
-        print(
-            f"privy: warning: binding {args.host} exposes remote execution beyond this machine",
-            file=sys.stderr,
-        )
+    _tolerant_console()
+    set_echo_output(echo_output)
     home = _hub_home(args)
     try:
         runtime = build_hub(
@@ -992,7 +1019,6 @@ def _cmd_hub_serve(args: argparse.Namespace) -> int:
             relays_file=Path(args.relays_file).expanduser() if args.relays_file else None,
             max_jobs=args.max_jobs,
             probe_ttl_s=args.probe_ttl_s,
-            allowed_origins=args.allow_origin,
             version=__version__,
         )
     except OSError as exc:
@@ -1002,6 +1028,15 @@ def _cmd_hub_serve(args: argparse.Namespace) -> int:
     summary = runtime.service.summary()
     url = runtime.url
     log.info("privy hub %s listening on %s (home %s)", __version__, url, home)
+    if args.host not in LOOPBACK_HOSTS:
+        log.warning(
+            "The hub has no authentication and listens on %s: anyone who can reach it can run code "
+            "on every target.",
+            args.host,
+        )
+    legacy_token = home / LEGACY_TOKEN_FILENAME
+    if legacy_token.exists():
+        log.info("%s is no longer used (the hub has no authentication); it is safe to delete.", legacy_token)
     if summary["relays_file"]["exists"]:
         log.info(
             "Serving %d relay(s) with %d target(s) from %s",
@@ -1011,8 +1046,9 @@ def _cmd_hub_serve(args: argparse.Namespace) -> int:
         )
     else:
         log.info("Waiting for %s to be hydrated; serving no targets until then.", runtime.relays_file)
-    log.info("REST %s/v1, OpenAPI %s/openapi.json, MCP %s/mcp", url, url, url)
-    log.info("Clients authenticate with 'Authorization: Bearer <%s>'.", home / TOKEN_FILENAME)
+    log.info("Point an LLM at %s/ (quickstart, no authentication); MCP: %s/mcp", url, url)
+    if not echo_output:
+        log.info("Live command output is not shown (--no-echo-output); result boxes still are.")
     try:
         runtime.serve_forever()
     except KeyboardInterrupt:
@@ -1025,21 +1061,16 @@ def _cmd_hub_serve(args: argparse.Namespace) -> int:
 def _cmd_hub_status(args: argparse.Namespace) -> int:
     import requests
 
-    from privy.hub.home import read_state, read_token
+    from privy.hub.home import read_state
 
     home = _hub_home(args)
     state = read_state(home) or {}
     url = (args.url or state.get("url") or f"http://127.0.0.1:{HUB_DEFAULT_PORT}").rstrip("/")
     try:
-        token = read_token(home)
-    except OSError as exc:
-        raise CliError(f"no hub token in {home}; start 'privy hub serve' first or pass --home") from exc
-    try:
         requests.get(f"{url}/healthz", timeout=5).raise_for_status()
         response = requests.get(
             f"{url}/v1/targets",
             params={"refresh": "true" if args.refresh else "false"},
-            headers={"Authorization": f"Bearer {token}"},
             timeout=180,
         )
         payload = response.json()
@@ -1071,17 +1102,16 @@ def _cmd_hub_status(args: argparse.Namespace) -> int:
     )
     rows = [("TARGET", "STATUS", "HOST", "OS", "USER", "PRIVY")]
     for target in payload["targets"]:
-        listener = target.get("listener") or {}
-        version = listener.get("privy_version")
-        if listener and not listener.get("details_available"):
+        version = target.get("privy_version")
+        if target["status"] == "online" and target.get("details"):
             version = "older"
         rows.append(
             (
                 target["id"],
                 target["status"],
-                listener.get("hostname") or "-",
-                listener.get("os") or "-",
-                listener.get("user") or "-",
+                target.get("host") or "-",
+                target.get("os") or "-",
+                target.get("user") or "-",
                 version or "-",
             )
         )
@@ -1089,6 +1119,7 @@ def _cmd_hub_status(args: argparse.Namespace) -> int:
         widths = [max(len(str(row[index])) for row in rows) for index in range(len(rows[0]))]
         for row in rows:
             print("  ".join(str(cell).ljust(width) for cell, width in zip(row, widths)).rstrip())
+    print(f"Point an LLM at {url}/ to use these machines.")
     return 0
 
 
