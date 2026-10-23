@@ -24,6 +24,7 @@ a = Analysis(
         "privy.hub.responses",
         "privy.hub.rest",
         "privy.hub.service",
+        "privy.hub.sync",
         "privy.info",
         "privy.protocol",
         "privy.proxy",

@@ -262,6 +262,7 @@ class RelaysStore:
         self._signature: tuple[int, int] | None = None
         self._last_check: float | None = None
         self._snapshot = RelaysSnapshot(self.path, (), False, None)
+        self._last_valid: RelaysSnapshot | None = None
 
     def snapshot(self) -> RelaysSnapshot:
         with self._lock:
@@ -277,6 +278,12 @@ class RelaysStore:
             self._refresh(self._clock())
             return self._snapshot
 
+    def credentials_snapshot(self) -> tuple[RelaysSnapshot | None, RelaysSnapshot]:
+        """Last validated credentials and current file status, without changing target availability."""
+        self.snapshot()
+        with self._lock:
+            return self._last_valid, self._snapshot
+
     def _refresh(self, now: float) -> None:
         self._last_check = now
         try:
@@ -289,6 +296,7 @@ class RelaysStore:
             self._snapshot = RelaysSnapshot(self.path, (), False, time.time())
             return
         except OSError as exc:
+            self._signature = None
             self._snapshot = RelaysSnapshot(
                 self.path,
                 self._snapshot.relays,
@@ -305,6 +313,8 @@ class RelaysStore:
         try:
             relays = read_relays_file(self.path)
         except (RelaysFileError, OSError) as exc:
+            if isinstance(exc, OSError):
+                self._signature = None
             log.warning("Ignoring invalid relays file %s: %s", self.path, exc)
             self._snapshot = RelaysSnapshot(
                 self.path,
@@ -315,6 +325,7 @@ class RelaysStore:
             )
             return
         self._snapshot = RelaysSnapshot(self.path, relays, True, time.time())
+        self._last_valid = self._snapshot
         log.info(
             "Loaded %d relay(s) with %d target(s) from %s",
             len(relays),

@@ -5,6 +5,7 @@ both. ``POST /v1/jobs`` and ``POST /v1/broadcasts`` also accept the code as the
 raw request body when ``target`` (``targets``) is in the query string: the
 easiest form to type in a shell. ``format=text`` answers with a plain-text
 rendering instead of JSON, and ``stream=true`` streams a job's output live.
+The REST-only ``GET /v1/relays`` credentials export is always JSON.
 """
 
 from __future__ import annotations
@@ -20,12 +21,24 @@ from privy.hub import guide, render
 from privy.hub.jobs import HubJob
 from privy.hub.mcp import MCP_PATH, SUPPORTED_VERSIONS
 from privy.hub.responses import TEXT_TYPE, HttpResponse, error_response
-from privy.hub.service import INSTRUCTIONS, OPERATIONS, OPERATIONS_BY_NAME, HubError, HubService, Param
+from privy.hub.service import (
+    INSTRUCTIONS,
+    OPERATIONS,
+    OPERATIONS_BY_NAME,
+    SYNC_OPERATION,
+    HubError,
+    HubService,
+    Param,
+)
 
 #: How often a live stream re-checks a job that produces no output.
 STREAM_POLL_S = 1.0
 #: The one route that is not a service operation: a job's output as a live text stream.
 STREAM_JOB = "stream_job"
+RELAYS_PATH = "/v1/relays"
+RELAYS_OPERATION = "get_relay_credentials"
+RELAYS_TITLE = "Get normalized Relay credentials per target (REST only)"
+REST_OPERATIONS = {**OPERATIONS_BY_NAME, SYNC_OPERATION.name: SYNC_OPERATION}
 
 _PATH_PARAM_RE = re.compile(r"\{(\w+)\}")
 _HOST_RE = re.compile(r"[A-Za-z0-9.\-]+(:\d{1,5})?|\[[0-9A-Fa-f:.]+\](:\d{1,5})?")
@@ -74,6 +87,7 @@ ROUTES: tuple[Route, ...] = (
     Route("GET", "/v1/broadcasts/{broadcast_id}", "get_broadcast"),
     Route("POST", "/v1/files/upload", "upload_file"),
     Route("POST", "/v1/files/download", "download_file"),
+    Route("POST", "/v1/files/sync", SYNC_OPERATION.name),
 )
 
 _COMPILED = tuple((route, route.regex) for route in ROUTES)
@@ -220,6 +234,7 @@ class RestApi:
             "/v1": lambda: HttpResponse(200, self.capabilities(base_url)),
             "/v1/": lambda: HttpResponse(200, self.capabilities(base_url)),
             "/openapi.json": lambda: HttpResponse(200, openapi_document(self.service, base_url)),
+            RELAYS_PATH: lambda: self.credentials(query),
         }
         if path in documents:
             if method not in ("GET", "HEAD"):
@@ -238,6 +253,38 @@ class RestApi:
         if allowed:
             return _method_not_allowed(allowed)
         return error_response(404, "not_found", f"no route for {method} {path}; GET / explains the API")
+
+    def credentials(self, query: Mapping[str, list[str]]) -> HttpResponse:
+        if set(query) - {"format"} or _last(query, "format", "json") != "json":
+            return error_response(400, "invalid_argument", "this endpoint accepts only format=json")
+        loaded, current = self.service.registry.store.credentials_snapshot()
+        if loaded is None:
+            return error_response(
+                503, "credentials_unavailable", "No valid relays configuration has been loaded"
+            )
+        targets = []
+        for target in loaded.targets:
+            credentials = (
+                {"token": target.token}
+                if target.token is not None
+                else {"keyrule": target.keyrule, "key": target.key}
+            )
+            targets.append(
+                {
+                    "id": target.id,
+                    "relay": target.relay,
+                    "namespace": target.namespace,
+                    "path": target.path,
+                    **credentials,
+                }
+            )
+        stale = not current.file_exists or current.error is not None
+        payload: dict[str, Any] = {"targets": targets, "stale": stale}
+        if stale:
+            payload["warning"] = (
+                "The relays file is unavailable or invalid; using the last valid credentials."
+            )
+        return HttpResponse(200, payload)
 
     def _dispatch(
         self,
@@ -266,15 +313,23 @@ class RestApi:
             if stream:
                 OPERATIONS_BY_NAME[route.operation].parse(args)
                 return _stream_response(self.service.job(args["job_id"]))
-            result = self.service.invoke(route.operation, args, origin="rest")
+            if route.operation == SYNC_OPERATION.name:
+                result = self.service.start_sync(args, origin="rest")
+            else:
+                result = self.service.invoke(route.operation, args, origin="rest")
         except HubError as exc:
             error = exc.to_dict()
             if text:
                 return HttpResponse(exc.status, text=render.render_error(error), note=exc.code)
             return HttpResponse(exc.status, {"error": error}, note=exc.code)
+        status = 202 if route.operation == SYNC_OPERATION.name else 200
+        response_headers = {"Location": f"/v1/jobs/{result['job_id']}"} if status == 202 else {}
         if text:
-            return HttpResponse(200, text=render.render(route.operation, result, transport="rest"))
-        return HttpResponse(200, result)
+            operation = "get_job" if route.operation == SYNC_OPERATION.name else route.operation
+            return HttpResponse(
+                status, text=render.render(operation, result, transport="rest"), headers=response_headers
+            )
+        return HttpResponse(status, result, headers=response_headers)
 
     @staticmethod
     def _arguments(
@@ -284,7 +339,7 @@ class RestApi:
         headers: Mapping[str, str],
         body: bytes,
     ) -> dict[str, Any]:
-        operation = OPERATIONS_BY_NAME.get(route.operation)
+        operation = REST_OPERATIONS.get(route.operation)
         arrays = {param.name for param in operation.params if param.type == "array"} if operation else set()
         presentation = {"format", "stream"} if route.streams or route.operation == STREAM_JOB else {"format"}
         args: dict[str, Any] = {}
@@ -335,6 +390,12 @@ class RestApi:
             "quickstart": f"{base_url}/",
             "openapi": f"{base_url}/openapi.json",
             "health": f"{base_url}/healthz",
+            "relay_credentials": {
+                "endpoint": f"{base_url}{RELAYS_PATH}",
+                "method": "GET",
+                "description": RELAYS_TITLE,
+                "rest_only": True,
+            },
             "mcp": {
                 "endpoint": f"{base_url}{MCP_PATH}",
                 "transport": "streamable-http",
@@ -347,8 +408,7 @@ class RestApi:
                     "title": _title(route),
                     "method": route.method,
                     "path": route.path,
-                    "read_only": route.operation == STREAM_JOB
-                    or OPERATIONS_BY_NAME[route.operation].read_only,
+                    "read_only": route.operation == STREAM_JOB or REST_OPERATIONS[route.operation].read_only,
                 }
                 for route in ROUTES
             ],
@@ -358,7 +418,7 @@ class RestApi:
 
 
 def _title(route: Route) -> str:
-    return _STREAM_TITLE if route.operation == STREAM_JOB else OPERATIONS_BY_NAME[route.operation].title
+    return _STREAM_TITLE if route.operation == STREAM_JOB else REST_OPERATIONS[route.operation].title
 
 
 # ---- OpenAPI ------------------------------------------------------------------
@@ -430,7 +490,7 @@ def _operation_spec(route: Route, base_url: str, example: guide.Example) -> dict
             },
         }
     else:
-        operation = OPERATIONS_BY_NAME[route.operation]
+        operation = REST_OPERATIONS[route.operation]
         path_names = set(route.path_params)
         parameters: list[dict[str, Any]] = []
         for param in operation.params:
@@ -462,6 +522,16 @@ def _operation_spec(route: Route, base_url: str, example: guide.Example) -> dict
             "parameters": parameters,
             "responses": {"200": _response(samples), "default": {"$ref": "#/components/responses/Error"}},
         }
+        if route.operation == SYNC_OPERATION.name:
+            accepted = spec["responses"].pop("200")
+            accepted.update(
+                description="Accepted sync job; poll Location for progress or POST Location/cancel",
+                headers={
+                    "Location": {"schema": {"type": "string"}, "description": "Relative job status URL"}
+                },
+            )
+            accepted["content"]["application/json"]["schema"] = {"$ref": "#/components/schemas/SyncJob"}
+            spec["responses"]["202"] = accepted
         body_params = [param for param in operation.params if param.name not in path_names]
         if route.method == "POST" and body_params:
             content: dict[str, Any] = {
@@ -500,7 +570,8 @@ def _info_description(base_url: str, example: guide.Example) -> str:
         f'    curl.exe -sN "{base_url}/v1/jobs?stream=true&target={example.machine}" '
         f"--data-binary '{example.code}'\n\n"
         f"GET {base_url}/ is a quickstart listing the machines online now. Every operation accepts "
-        "format=text for a compact plain-text answer.\n\n" + INSTRUCTIONS
+        "format=text for a compact plain-text answer (except /v1/relays, which is JSON-only).\n\n"
+        + INSTRUCTIONS
     )
 
 
@@ -538,6 +609,77 @@ def openapi_document(service: HubService, base_url: str) -> dict[str, Any]:
             "responses": {"200": {"description": "Capabilities document"}},
         }
     }
+    paths[RELAYS_PATH] = {
+        "get": {
+            "operationId": RELAYS_OPERATION,
+            "summary": RELAYS_TITLE,
+            "description": "Exports long-lived keys or pre-minted tokens from the configured relays file. "
+            "Inherits namespace credentials and applies per-connection overrides. Does not probe listeners. "
+            "On reload failure, serves the last valid credentials with stale=true and a warning. "
+            "JSON-only; not exposed as an MCP tool. Local Host and same-origin browser checks apply.",
+            "parameters": [
+                {
+                    **_FORMAT_PARAM,
+                    "description": "Only JSON is supported for credential export.",
+                    "schema": {"type": "string", "enum": ["json"], "default": "json"},
+                }
+            ],
+            "responses": {
+                "200": {
+                    "description": "Normalized credentials; sensitive, never cache",
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["targets", "stale"],
+                                "properties": {
+                                    "stale": {"type": "boolean"},
+                                    "warning": {"type": "string"},
+                                    "targets": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "required": ["id", "relay", "namespace", "path"],
+                                            "properties": {
+                                                name: {"type": "string"}
+                                                for name in (
+                                                    "id",
+                                                    "relay",
+                                                    "namespace",
+                                                    "path",
+                                                    "keyrule",
+                                                    "key",
+                                                    "token",
+                                                )
+                                            },
+                                            "oneOf": [
+                                                {
+                                                    "required": ["keyrule", "key"],
+                                                    "not": {"required": ["token"]},
+                                                },
+                                                {
+                                                    "required": ["token"],
+                                                    "not": {
+                                                        "anyOf": [
+                                                            {"required": ["keyrule"]},
+                                                            {"required": ["key"]},
+                                                        ]
+                                                    },
+                                                },
+                                            ],
+                                        },
+                                    },
+                                },
+                            }
+                        }
+                    },
+                },
+                "403": {"$ref": "#/components/responses/Error"},
+                "503": {"$ref": "#/components/responses/Error"},
+                "default": {"$ref": "#/components/responses/Error"},
+            },
+        }
+    }
     paths["/healthz"] = {
         "get": {
             "operationId": "health",
@@ -564,6 +706,63 @@ def openapi_document(service: HubService, base_url: str) -> dict[str, Any]:
         "servers": [{"url": base_url}],
         "components": {
             "schemas": {
+                "SyncProgress": {
+                    "type": "object",
+                    "required": ["phase"],
+                    "properties": {
+                        "phase": {
+                            "type": "string",
+                            "enum": ["queued", "scanning", "preparing", "uploading", "completed"],
+                        },
+                        "current_path": {"type": ["string", "null"]},
+                        **{
+                            name: {"type": "integer", "minimum": 0}
+                            for name in (
+                                "files_total",
+                                "files_done",
+                                "files_copied",
+                                "files_skipped",
+                                "directories_total",
+                                "bytes_total",
+                                "bytes_done",
+                                "bytes_copied",
+                            )
+                        },
+                    },
+                },
+                "SyncJob": {
+                    "type": "object",
+                    "required": [
+                        "job_id",
+                        "target",
+                        "type",
+                        "state",
+                        "done",
+                        "local_path",
+                        "remote_path",
+                        "destination_type",
+                        "progress",
+                    ],
+                    "properties": {
+                        "job_id": {"type": "string"},
+                        "target": {"type": "string"},
+                        "type": {"const": "sync"},
+                        "state": {
+                            "type": "string",
+                            "enum": ["queued", "running", "succeeded", "failed", "cancelled", "error"],
+                        },
+                        "done": {"type": "boolean"},
+                        "local_path": {"type": "string"},
+                        "remote_path": {"type": "string"},
+                        "destination_type": {"type": "string", "enum": ["directory", "file"]},
+                        "progress": {"$ref": "#/components/schemas/SyncProgress"},
+                        "result": {"$ref": "#/components/schemas/SyncProgress"},
+                        "error": {"type": "string"},
+                        "exit_code": {"type": "integer"},
+                        "duration_ms": {"type": "integer"},
+                        "next_step": {"type": "string"},
+                    },
+                },
                 "Error": {
                     "type": "object",
                     "properties": {
@@ -578,7 +777,7 @@ def openapi_document(service: HubService, base_url: str) -> dict[str, Any]:
                         }
                     },
                     "required": ["error"],
-                }
+                },
             },
             "responses": {
                 "Error": {

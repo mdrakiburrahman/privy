@@ -742,7 +742,8 @@ each command's mode/timeout and may set max_parallel (default: 32).""",
             "Serve a REST API and Model Context Protocol endpoint that discover, probe, and run code "
             "on every listener hydrated in relays.json, with live output. The hub has no "
             "authentication and binds to loopback. It never calls Azure Resource Manager; it signs "
-            "short-lived tokens from the hydrated keys."
+            "short-lived tokens from the hydrated keys. All routes require a local Host header; "
+            "browser requests must be same-origin."
         ),
         epilog="""Files in the hub home directory:
   relays.json     hydrated relay keys (see docs/SCHEDULED_TASKS.md); reloaded when it changes
@@ -752,6 +753,8 @@ each command's mode/timeout and may set max_parallel (default: 32).""",
 Endpoints (no authentication):
   GET  /               quickstart for LLMs and people: machines online now, examples
   POST /v1/jobs        run code; ?stream=true streams the output live
+  GET  /v1/relays      export credentials per target (sensitive JSON, REST only)
+  POST /v1/files/sync  sync a local file/folder into a target (202 + job, REST only)
   GET  /openapi.json   OpenAPI 3.1 description with examples
   POST /mcp            MCP endpoint exposing the same operations as tools
   GET  /healthz        liveness check
@@ -780,8 +783,8 @@ Point an LLM at http://127.0.0.1:7748/ and ask it to run something.
         "--host",
         default="127.0.0.1",
         help=(
-            "interface to bind; the hub has no authentication, so anything but loopback lets every "
-            "host that can reach it run code on all targets"
+            "interface to bind; local Host and same-origin checks always apply, but remote clients "
+            "can forge headers to run code and export keys; keep loopback"
         ),
     )
     hub_serve.add_argument(
@@ -1030,8 +1033,8 @@ def _cmd_hub_serve(args: argparse.Namespace) -> int:
     log.info("privy hub %s listening on %s (home %s)", __version__, url, home)
     if args.host not in LOOPBACK_HOSTS:
         log.warning(
-            "The hub has no authentication and listens on %s: anyone who can reach it can run code "
-            "on every target.",
+            "The hub has no authentication and listens on %s: local Host and same-origin checks still "
+            "apply, but remote clients can forge headers to run code on every target and export keys.",
             args.host,
         )
     legacy_token = home / LEGACY_TOKEN_FILENAME
