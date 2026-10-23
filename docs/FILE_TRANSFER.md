@@ -54,6 +54,15 @@ A checksum failure removes the corrupt partial. An interrupted valid partial rem
 the next matching upload. A small completion marker tied to the destination file identity makes the
 final operation idempotent if the Relay response is lost after commit.
 
+Completed uploads do not leave `.complete` files beside the destination. Receipts live in the
+listener account's private state directory: `%LOCALAPPDATA%\privy\transfers\completed` on Windows,
+or `$XDG_STATE_HOME/privy/transfers/completed` (default `~/.local/state/privy/transfers/completed`)
+elsewhere. Only one receipt is retained per destination. Interrupted `.part` files remain beside the
+destination for resuming. After upgrading a listener, subsequent uploads and hub syncs migrate
+matching legacy `.complete` receipts and remove validated obsolete receipts for the files touched;
+unrelated files are never deleted. Older listeners retain their existing receipt behavior until
+upgraded.
+
 ## Download contract
 
 1. The listener returns source size, a snapshot ID, and a unique download session without hashing

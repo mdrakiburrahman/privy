@@ -803,26 +803,58 @@ def _download_identity(source: Path, stat: os.stat_result) -> str:
     return hashlib.sha256(f"{source}\0{_stat_key(stat)}".encode()).hexdigest()
 
 
+def _completion_directory() -> Path:
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    return base / "privy" / "transfers" / "completed"
+
+
 def _completion_marker_path(destination: Path, transfer_id: str) -> Path:
+    # One receipt per destination; a replacement invalidates the previous upload's receipt.
+    identity = hashlib.sha256(str(destination).encode("utf-8")).hexdigest()
+    return _completion_directory() / f"{identity}.json"
+
+
+def _legacy_completion_marker_path(destination: Path, transfer_id: str) -> Path:
     return destination.parent / f".{destination.name}.privy-upload-{transfer_id[:16]}.complete"
 
 
 def _is_completed_upload(destination: Path, transfer_id: str, size: int, digest: str) -> bool:
-    marker = _completion_marker_path(destination, transfer_id)
-    if not destination.is_file() or not marker.is_file():
+    if not destination.is_file():
         return False
-    try:
-        value = json.loads(marker.read_text(encoding="utf-8"))
-        marker_stat = tuple(value["stat_key"])
-        destination_stat = _stat_key(destination.stat())
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        return False
-    return (
-        value.get("transfer_id") == transfer_id
-        and value.get("size") == size
-        and value.get("sha256") == digest
-        and marker_stat == destination_stat
-    )
+    cached = _completion_marker_path(destination, transfer_id)
+    legacy = _legacy_completion_marker_path(destination, transfer_id)
+    for marker in (cached, legacy):
+        if marker.is_symlink() or not marker.is_file():
+            continue
+        try:
+            value = json.loads(marker.read_text(encoding="utf-8"))
+            valid = (
+                isinstance(value, dict)
+                and value.get("transfer_id") == transfer_id
+                and value.get("size") == size
+                and value.get("sha256") == digest
+                and tuple(value.get("stat_key", ())) == _stat_key(destination.stat())
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+            continue
+        if valid:
+            if marker == legacy:
+                _write_completion_marker(
+                    destination, transfer_id, size, digest, _stat_key(destination.stat())
+                )
+            _remove_stale_completion_markers(destination, keep=cached)
+            return True
+    return False
+
+
+def _migrate_upload_receipt(destination: Path, size: int, digest: str) -> None:
+    destination = destination.resolve()
+    transfer_id, _ = _upload_identity(destination, size, digest)
+    with _path_lock(destination):
+        _is_completed_upload(destination, transfer_id, size, digest)
 
 
 def _write_completion_marker(
@@ -833,6 +865,7 @@ def _write_completion_marker(
     stat_key: tuple[int, int, int, int],
 ) -> Path:
     marker = _completion_marker_path(destination, transfer_id)
+    marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = marker.with_name(f"{marker.name}.{uuid.uuid4().hex}.tmp")
     payload = {
         "transfer_id": transfer_id,
@@ -868,18 +901,34 @@ def _completed_upload_response(
 
 
 def _remove_stale_completion_markers(destination: Path, *, keep: Path) -> None:
-    prefix = f".{destination.name}.privy-upload-"
+    pattern = re.compile(rf"^\.{re.escape(destination.name)}\.privy-upload-[0-9a-f]{{16}}\.complete$")
     for candidate in destination.parent.iterdir():
-        if (
-            candidate == keep
-            or not candidate.name.startswith(prefix)
-            or not candidate.name.endswith(".complete")
-        ):
+        if candidate == keep or not pattern.fullmatch(candidate.name) or candidate.is_symlink():
             continue
         try:
+            value = json.loads(candidate.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                continue
+            size, digest = value.get("size"), value.get("sha256")
+            if (
+                type(size) is not int
+                or size < 0
+                or not isinstance(digest, str)
+                or not _SHA256_RE.fullmatch(digest)
+            ):
+                continue
+            transfer_id, _ = _upload_identity(destination, size, digest)
+            if value.get("transfer_id") != transfer_id or candidate != _legacy_completion_marker_path(
+                destination, transfer_id
+            ):
+                continue
             candidate.unlink()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
         except OSError as exc:
-            log.warning("Could not remove stale upload marker %s: %s", candidate, exc)
+            raise TransferError(
+                "receipt_cleanup_failed", f"could not remove upload receipt {candidate}: {exc}"
+            ) from exc
 
 
 def _commit_partial(

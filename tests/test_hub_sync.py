@@ -1,6 +1,8 @@
 """Sync the real generated helper and transfer handler against isolated local directories."""
 
 import ast
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -11,6 +13,7 @@ import pytest
 import requests
 from hub_fakes import Hub, exec_result, write_relays
 
+from privy import transfer
 from privy.hub import sync as sync_module
 from privy.hub.app import build_hub
 from privy.hub.sync import sync, validate_source
@@ -101,6 +104,28 @@ def test_sync_skips_identical_and_replaces_changed_files(tmp_path):
     assert client.uploads == [str(destination / "changed")]
     assert (destination / "same").stat().st_mtime_ns == before
     assert (destination / "changed").read_bytes() == b"new"
+
+
+def test_sync_skipped_file_migrates_legacy_receipt_without_leaving_sidecars(tmp_path):
+    source = tmp_path / "source"
+    source.write_bytes(b"same")
+    destination = tmp_path / "remote"
+    result = upload_file(lambda raw: handle_transfer_request(raw).to_json(), source, destination)
+    receipt = transfer._completion_marker_path(destination.resolve(), result.transfer_id)
+    legacy = destination.with_name(f".remote.privy-upload-{result.transfer_id[:16]}.complete")
+    receipt.replace(legacy)
+
+    def run_remote(code):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            exec(code, {})
+        return output.getvalue()
+
+    result, client, _ = run_sync(source, destination, "file", run_remote=run_remote)
+
+    assert result["files_skipped"] == 1 and client.uploads == []
+    assert receipt.is_file() and not legacy.exists()
+    assert destination.read_bytes() == b"same"
 
 
 @pytest.mark.parametrize("destination_type", ["directory", "file"])

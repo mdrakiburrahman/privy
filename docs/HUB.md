@@ -442,6 +442,9 @@ The initial response uses the normal job shape; a completed example is:
   unless that is intentional.
 - Identical files are compared using SHA-256 and skipped without uploading their contents.
   Remote-only files are **never deleted**. This is a one-shot copy/update, not a mirror or watcher.
+- Updated listeners keep completed-upload receipts in private state, not destination folders. Sync
+  also migrates valid legacy `.complete` receipts for identical files it skips. Upgrade the listener
+  to enable this cleanup; interrupted `.part` uploads remain resumable.
 - `files_done` counts completed copies plus skips. `bytes_done` includes the sizes of skipped files
   plus current upload progress; `bytes_copied` counts completed uploaded file payloads, not network
   overhead. File timestamps, ACLs, and permissions are not preserved.

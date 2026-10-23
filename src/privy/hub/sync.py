@@ -118,6 +118,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from privy import transfer
 
 def no_links(path):
     for item in (path, *path.parents):
@@ -176,6 +177,9 @@ def prepare(document):
             if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
                 raise ValueError("destination changed during comparison: " + str(destination))
             if hasher.hexdigest() == entry["sha256"]:
+                migrate = getattr(transfer, "_migrate_upload_receipt", None)
+                if migrate is not None:
+                    migrate(destination, entry["size"], entry["sha256"])
                 same.append(index)
                 continue
         if not document["overwrite"]:
