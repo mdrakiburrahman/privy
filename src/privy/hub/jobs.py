@@ -754,7 +754,10 @@ class JobManager:
                 job.cond.notify_all()
 
         def run_remote(code: str) -> str:
-            request = ExecRequest(kind="python", code=code, mode="subprocess", timeout_s=600)
+            # Frozen Windows listeners may have no external Python installation.
+            request = ExecRequest(
+                kind="python", code=f"exec({code!r}, {{}})", mode="inprocess", timeout_s=600
+            )
             with job.cond:
                 job.client, job.request, job.remote_job_id = client, request, None
             check_cancel()

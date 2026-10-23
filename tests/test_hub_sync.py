@@ -21,6 +21,7 @@ class LocalClient:
     def __init__(self):
         self.uploads = []
         self.commands = []
+        self.requests = []
 
     def remote(self, code):
         self.commands.append(code)
@@ -30,6 +31,7 @@ class LocalClient:
         return result.stdout
 
     def send(self, request, *, on_submit, **kwargs):
+        self.requests.append(request)
         on_submit("sync-helper")
         return exec_result(stdout=self.remote(request.code).encode())
 
@@ -410,6 +412,8 @@ def test_rest_sync_job_reports_counts_and_renders_text(tmp_path, monkeypatch):
     assert view["destination_type"] == "directory"
     assert view["result"]["files_copied"] == 1 and view["progress"]["files_done"] == 1
     assert (destination / "file").read_bytes() == b"contents"
+    assert client.requests[0].mode == "inprocess"
+    assert client.requests[0].code.startswith("exec(")
     text = hub.call("GET", f"/v1/jobs/{job_id}?format=text").text
     assert "1 copied" in text and "None bytes" not in text
     audit = [json.loads(line) for line in hub.audit_path.read_text().splitlines()]

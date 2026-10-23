@@ -347,6 +347,8 @@ resumable and SHA-256 verified, and they refuse to replace a destination unless 
 `Location: /v1/jobs/<job_id>`. Paths refer to the hub's filesystem and the listener's filesystem,
 not to the HTTP caller's machine. This endpoint is REST-only; it uses the existing listener's
 Python execution and resumable, SHA-256-verified upload, with no listener upgrade required.
+Remote preparation uses the listener's embedded Python in an isolated namespace, so a frozen
+Windows listener does not need an external `python.exe` installation.
 
 | Argument | Required | Meaning |
 | --- | --- | --- |
