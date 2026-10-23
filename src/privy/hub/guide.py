@@ -167,7 +167,8 @@ def quickstart(service: HubService, base_url: str) -> str:
         "```",
         "",
         "- The first line names the job; the last line reports the state and exit code.",
-        "- For multi-line scripts or code with quotes, save it to a file and send `--data-binary @script.ps1`.",
+        "- For multi-line scripts or code with quotes, save it to a file and send "
+        "`--data-binary '@script.ps1'`. Keep the quotes: in PowerShell a bare `@` is the splatting operator.",
         "- Disconnecting does not stop the job. Reattach with "
         f"`curl.exe -sN {base_url}/v1/jobs/<job_id>/stream`; stop it with "
         f"`curl.exe -s -X POST {base_url}/v1/jobs/<job_id>/cancel`.",
