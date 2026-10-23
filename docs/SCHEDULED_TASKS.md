@@ -126,6 +126,82 @@ function Test-PrivyHelp([string]$ExePath, [string]$RtPath) {
     }
 }
 
+function Get-DefenderBlock([string]$Path, [datetime]$Since) {
+    # Microsoft Defender logs event 1121 when an attack surface reduction rule stops a program.
+    try {
+        $events = Get-WinEvent -FilterHashtable @{
+            LogName   = "Microsoft-Windows-Windows Defender/Operational"
+            Id        = 1121
+            StartTime = $Since
+        } -ErrorAction Stop
+    }
+    catch {
+        return $null
+    }
+    $name = [regex]::Escape([IO.Path]::GetFileName($Path))
+    $blocked = $events | Where-Object { $_.Message -match "Path:[^\r\n]*\\$name" } | Select-Object -First 1
+    if (-not $blocked) { return $null }
+    $rule = "unknown"
+    if ($blocked.Message -match "(?m)^\s*ID:\s*([0-9A-Fa-f-]{36})") { $rule = $Matches[1].ToUpperInvariant() }
+    $names = @{
+        "C1DB55AB-C21A-4637-BB3F-A12568109D35" = "Use advanced protection against ransomware"
+        "01443614-CD74-433A-B99E-2ECDC07BFC25" = "Block executable files from running unless they meet a prevalence, age, or trusted list criterion"
+    }
+    if ($names.ContainsKey($rule)) { return "'$($names[$rule])' ($rule)" }
+    return $rule
+}
+
+function Wait-PrivyAllowed([string]$ExePath, [string]$RtPath, [datetime]$Since) {
+    # privy.exe is unsigned. Microsoft Defender's ransomware protection refuses to let Windows
+    # PowerShell or cmd.exe start a newly downloaded copy ("Access is denied"), but lets PowerShell 7
+    # start it, and once it has run it starts from anywhere. Without pwsh.exe, wait for Defender.
+    $pwsh = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $waitStart = Get-Date
+    $announced = $false
+    $oldTemp = $env:TEMP
+    $oldTmp = $env:TMP
+    try {
+        $env:TEMP = $RtPath
+        $env:TMP = $RtPath
+        while ($true) {
+            if ($pwsh) {
+                try { & $pwsh.Path -NoProfile -NonInteractive -Command "& '$($ExePath -replace "'", "''")' --version" *> $null } catch { }
+            }
+            $refused = $null
+            try {
+                & $ExePath --version *> $null
+            }
+            catch {
+                # NativeCommandError means it started and wrote to stderr.
+                if ($_.FullyQualifiedErrorId -notlike "NativeCommandError*") {
+                    $refused = $_.Exception.Message
+                    if ($_.Exception.InnerException) { $refused = $_.Exception.InnerException.Message }
+                }
+            }
+            if (-not $refused) {
+                if ($announced) {
+                    Write-Host "Microsoft Defender allowed the new privy.exe after $([int]((Get-Date) - $waitStart).TotalSeconds) seconds."
+                }
+                return
+            }
+            if (((Get-Date) - $waitStart).TotalMinutes -ge 15) {
+                throw "Windows still refuses to start $ExePath after 15 minutes ($refused). Install PowerShell 7 (pwsh.exe) and run this script again, or ask your IT administrator to allow privy.exe."
+            }
+            if (-not $announced) {
+                $rule = Get-DefenderBlock -Path $ExePath -Since $Since
+                if ($rule) { $refused += "; attack surface reduction rule $rule" }
+                Write-Host "Microsoft Defender refuses to start the new privy.exe ($refused). Waiting up to 15 minutes..."
+                $announced = $true
+            }
+            Start-Sleep -Seconds 15
+        }
+    }
+    finally {
+        $env:TEMP = $oldTemp
+        $env:TMP = $oldTmp
+    }
+}
+
 $config = Get-ChildItem 'C:\Program Files\Microsoft Dev Box Agent\*\*\appsettings.Production.json' -File |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
@@ -172,14 +248,24 @@ if ([string]::IsNullOrWhiteSpace($RelayKey)) {
 }
 
 $exePath  = Join-Path $WorkDir "privy.exe"
+$staged   = Join-Path $WorkDir "privy.new.exe"
 $envFile  = Join-Path $WorkDir "relay.$RelayPath.env.ps1"
 $launcher = Join-Path $WorkDir "start-privy-console.ps1"
 $psExe    = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+$installStart = Get-Date
 
 New-Item -ItemType Directory -Force -Path $WorkDir, $RuntimeDir | Out-Null
 
-if ($UpdateBinary) {
-    # Stop the running listener so its executable can be replaced with the latest release.
+if ($UpdateBinary -or -not (Test-ExeHeader $exePath) -or -not (Test-PrivyHelp -ExePath $exePath -RtPath $RuntimeDir)) {
+    # Stage the new executable next to the old one; a running listener keeps serving meanwhile.
+    Download-Privy -Uri $PrivyUrl -Path $staged
+    Unblock-File -Path $staged -ErrorAction SilentlyContinue
+    Wait-PrivyAllowed -ExePath $staged -RtPath $RuntimeDir -Since $installStart
+    if (-not (Test-PrivyHelp -ExePath $staged -RtPath $RuntimeDir)) {
+        throw "The downloaded privy.exe cannot run --help. Likely endpoint policy/quarantine issue."
+    }
+
+    # Stop the running listener so its executable can be replaced.
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
         Stop-ScheduledTask -TaskName $TaskName
     }
@@ -194,29 +280,12 @@ if ($UpdateBinary) {
     if (Test-Path -LiteralPath $exePath) {
         throw "$exePath is still in use; close the privy console window and run this script again."
     }
+    # A rename keeps the file that Microsoft Defender has just allowed.
+    Move-Item -LiteralPath $staged -Destination $exePath
 }
-
-if (-not (Test-ExeHeader $exePath)) {
-    if (Test-Path $exePath) { Remove-Item -Force $exePath -ErrorAction SilentlyContinue }
-    Download-Privy -Uri $PrivyUrl -Path $exePath
-}
-
-Unblock-File -Path $exePath -ErrorAction SilentlyContinue
-Remove-Item -Path "$exePath`:Zone.Identifier" -ErrorAction SilentlyContinue
 
 Get-ChildItem -Path $RuntimeDir -Directory -Filter "_MEI*" -ErrorAction SilentlyContinue |
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-
-if (-not (Test-PrivyHelp -ExePath $exePath -RtPath $RuntimeDir)) {
-    Remove-Item -Force $exePath -ErrorAction SilentlyContinue
-    Download-Privy -Uri $PrivyUrl -Path $exePath
-    Unblock-File -Path $exePath -ErrorAction SilentlyContinue
-    Remove-Item -Path "$exePath`:Zone.Identifier" -ErrorAction SilentlyContinue
-
-    if (-not (Test-PrivyHelp -ExePath $exePath -RtPath $RuntimeDir)) {
-        throw "privy.exe still cannot run --help after re-download. Likely endpoint policy/quarantine issue."
-    }
-}
 
 $envContent = @"
 `$env:PRIVY_RELAY_NAMESPACE = '$(Escape-SingleQuoted $RelayNamespace)'
@@ -267,8 +336,15 @@ Run it from an elevated PowerShell session (the task runs with highest privilege
 ```
 
 Re-running the script is safe. It keeps the existing executable unless it is missing or broken. Pass
-`-UpdateBinary` to stop the listener, download the latest release, and restart it. Listeners
-upgraded to privy 0.2.0 or later report their host name, OS, user, and runtimes to the hub.
+`-UpdateBinary` to download the latest release and restart the listener with it. Listeners upgraded
+to privy 0.2.0 or later report their host name, OS, user, and runtimes to the hub.
+
+`privy.exe` is unsigned, so Microsoft Defender's ransomware protection refuses to let Windows
+PowerShell start a newly downloaded copy ("Access is denied"). PowerShell 7 may start it, and once
+it has run it starts from anywhere. The script therefore downloads to `privy.new.exe` while the
+current listener keeps running, starts the new file once with `pwsh.exe` (or, without PowerShell 7,
+waits up to 15 minutes for Defender to allow it), and only then stops the listener, renames the file
+into place, and restarts the task.
 
 The credentials file in `C:\.temp\privy` holds a key with Manage rights on that Hybrid Connection.
 Folders created under `C:\` let every authenticated user modify their contents, so on shared
@@ -546,41 +622,122 @@ function Stop-PrivyFromPath([string]$Path) {
     throw "$Path is still in use; close the privy console window and run this script again."
 }
 
+function Get-DefenderBlock([string]$Path, [datetime]$Since) {
+    # Microsoft Defender logs event 1121 when an attack surface reduction rule stops a program.
+    try {
+        $events = Get-WinEvent -FilterHashtable @{
+            LogName   = "Microsoft-Windows-Windows Defender/Operational"
+            Id        = 1121
+            StartTime = $Since
+        } -ErrorAction Stop
+    }
+    catch {
+        return $null
+    }
+    $name = [regex]::Escape([IO.Path]::GetFileName($Path))
+    $blocked = $events | Where-Object { $_.Message -match "Path:[^\r\n]*\\$name" } | Select-Object -First 1
+    if (-not $blocked) { return $null }
+    $rule = "unknown"
+    if ($blocked.Message -match "(?m)^\s*ID:\s*([0-9A-Fa-f-]{36})") { $rule = $Matches[1].ToUpperInvariant() }
+    $names = @{
+        "C1DB55AB-C21A-4637-BB3F-A12568109D35" = "Use advanced protection against ransomware"
+        "01443614-CD74-433A-B99E-2ECDC07BFC25" = "Block executable files from running unless they meet a prevalence, age, or trusted list criterion"
+    }
+    if ($names.ContainsKey($rule)) { return "'$($names[$rule])' ($rule)" }
+    return $rule
+}
+
+function Wait-PrivyAllowed([string]$ExePath, [string]$RtPath, [datetime]$Since) {
+    # privy.exe is unsigned. Microsoft Defender's ransomware protection refuses to let Windows
+    # PowerShell or cmd.exe start a newly downloaded copy ("Access is denied"), but lets PowerShell 7
+    # start it, and once it has run it starts from anywhere. Without pwsh.exe, wait for Defender.
+    $pwsh = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $waitStart = Get-Date
+    $announced = $false
+    $oldTemp = $env:TEMP
+    $oldTmp = $env:TMP
+    try {
+        $env:TEMP = $RtPath
+        $env:TMP = $RtPath
+        while ($true) {
+            if ($pwsh) {
+                try { & $pwsh.Path -NoProfile -NonInteractive -Command "& '$($ExePath -replace "'", "''")' --version" *> $null } catch { }
+            }
+            $refused = $null
+            try {
+                & $ExePath --version *> $null
+            }
+            catch {
+                # NativeCommandError means it started and wrote to stderr.
+                if ($_.FullyQualifiedErrorId -notlike "NativeCommandError*") {
+                    $refused = $_.Exception.Message
+                    if ($_.Exception.InnerException) { $refused = $_.Exception.InnerException.Message }
+                }
+            }
+            if (-not $refused) {
+                if ($announced) {
+                    Write-Host "Microsoft Defender allowed the new privy.exe after $([int]((Get-Date) - $waitStart).TotalSeconds) seconds."
+                }
+                return
+            }
+            if (((Get-Date) - $waitStart).TotalMinutes -ge 15) {
+                throw "Windows still refuses to start $ExePath after 15 minutes ($refused). Install PowerShell 7 (pwsh.exe) and run this script again, or ask your IT administrator to allow privy.exe."
+            }
+            if (-not $announced) {
+                $rule = Get-DefenderBlock -Path $ExePath -Since $Since
+                if ($rule) { $refused += "; attack surface reduction rule $rule" }
+                Write-Host "Microsoft Defender refuses to start the new privy.exe ($refused). Waiting up to 15 minutes..."
+                $announced = $true
+            }
+            Start-Sleep -Seconds 15
+        }
+    }
+    finally {
+        $env:TEMP = $oldTemp
+        $env:TMP = $oldTmp
+    }
+}
+
 $exePath  = Join-Path $WorkDir "privy.exe"
+$staged   = Join-Path $WorkDir "privy.new.exe"
 $launcher = Join-Path $WorkDir "start-privy-hub-console.ps1"
 $psExe    = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+$installStart = Get-Date
 
 New-Item -ItemType Directory -Force -Path $WorkDir, $RuntimeDir | Out-Null
 Protect-Directory $WorkDir
+
+# Stage a new executable next to the old one; the running hub keeps serving meanwhile.
+$replace = $true
+if ($LocalBinary) {
+    Copy-Item -LiteralPath $LocalBinary -Destination $staged -Force
+}
+elseif ($UpdateBinary -or -not (Test-ExeHeader $exePath) -or -not (Test-PrivyHub -ExePath $exePath -RtPath $RuntimeDir)) {
+    Download-Privy -Uri $PrivyUrl -Path $staged
+}
+else {
+    $replace = $false
+}
+if ($replace) {
+    Unblock-File -Path $staged -ErrorAction SilentlyContinue
+    Wait-PrivyAllowed -ExePath $staged -RtPath $RuntimeDir -Since $installStart
+    if (-not (Test-PrivyHub -ExePath $staged -RtPath $RuntimeDir)) {
+        throw "The new privy.exe cannot run 'hub --help'. It may predate privy 0.2.0, or endpoint policy blocked it."
+    }
+}
 
 # Stop a running hub so its executable can be replaced.
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Stop-ScheduledTask -TaskName $TaskName
 }
 Stop-PrivyFromPath $exePath
-
-if ($LocalBinary) {
-    Copy-Item -LiteralPath $LocalBinary -Destination $exePath -Force
+if ($replace) {
+    # A rename keeps the file that Microsoft Defender has just allowed.
+    Move-Item -LiteralPath $staged -Destination $exePath -Force
 }
-elseif ($UpdateBinary -or -not (Test-ExeHeader $exePath)) {
-    Download-Privy -Uri $PrivyUrl -Path $exePath
-}
-Unblock-File -Path $exePath -ErrorAction SilentlyContinue
-Remove-Item -Path "$exePath`:Zone.Identifier" -ErrorAction SilentlyContinue
 
 Get-ChildItem -Path $RuntimeDir -Directory -Filter "_MEI*" -ErrorAction SilentlyContinue |
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-
-if (-not (Test-PrivyHub -ExePath $exePath -RtPath $RuntimeDir)) {
-    if ($LocalBinary) {
-        throw "$LocalBinary cannot run 'hub --help'; build privy 0.2.0 or later."
-    }
-    Download-Privy -Uri $PrivyUrl -Path $exePath
-    Unblock-File -Path $exePath -ErrorAction SilentlyContinue
-    if (-not (Test-PrivyHub -ExePath $exePath -RtPath $RuntimeDir)) {
-        throw "privy.exe cannot run 'hub --help'. It may predate privy 0.2.0, or endpoint policy blocked it."
-    }
-}
 
 $launcherContent = @"
 `$ErrorActionPreference = 'Stop'
@@ -637,7 +794,9 @@ Write-Host "  copilot mcp add --transport http --timeout 180000 privy-hub http:/
 .\Install-PrivyHubTask.ps1
 ```
 
-- `-UpdateBinary` downloads the latest release over the installed executable.
+- `-UpdateBinary` downloads the latest release and swaps it in. Like the listener script, it stages
+  the download as `privy.new.exe` and clears it with Microsoft Defender through `pwsh.exe` while the
+  running hub keeps serving.
 - `-LocalBinary <path>` installs a locally built `privy.exe` instead of downloading one.
 - `-Port` changes the loopback port (default `7748`).
 
