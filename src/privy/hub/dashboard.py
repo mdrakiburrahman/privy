@@ -596,11 +596,21 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
         status_sub = (
             row["reason"] or os_line or (row["listener_version"] and f"privy {row['listener_version']}")
         )
-        terms = (row["label"], row["id"], row["status"], row["host"], row["user"], row["os"], status_sub)
+        up = row["status"] == ONLINE
+        terms = (
+            row["label"],
+            row["id"],
+            row["status"],
+            "up" if up else "down",
+            row["host"],
+            row["user"],
+            row["os"],
+            status_sub,
+        )
         body.append(
             f'<tr data-href="{esc(link("/ui/logs", target=row["id"]))}" '
             f'data-q="{esc(" ".join(str(term) for term in terms if term).lower())}" '
-            f'data-up="{1 if row["status"] == ONLINE else 0}">'
+            f'data-up="{1 if up else 0}">'
             f'<td class="idx">{i:02d}</td>'
             f'<td data-v="{esc(row["label"].lower())}">{hyco_cell(row)}</td>'
             f'<td data-v="{esc(row["status"])}">{state_label(row["status"])}'

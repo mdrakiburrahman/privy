@@ -299,6 +299,8 @@ def test_hycos_page_has_a_search_box_with_per_row_search_keys(hub):
     text = html_of(hub.call("GET", "/ui/hycos", headers=BROWSER))
     assert 'id="hycoq"' in text and 'data-s="up"' in text and 'data-s="down"' in text
     keys = dict(re.findall(r'data-href="[^"]*target=([^"&]+)[^"]*" data-q="([^"]*)" data-up="[01]"', text))
-    assert "box2_windows" in keys["dev%2Fbox2_windows"] and "offline" in keys["dev%2Fbox2_windows"]
+    offline = keys["dev%2Fbox2_windows"].split()  # offline HYCOs are listed and searchable too
+    assert {"box2_windows", "offline", "down"} <= set(offline)
+    assert "up" in keys["dev%2Fbox1_windows"].split()
     assert "gpu1_linux" in keys["contoso-lab%2Fgpu1_linux"]
     assert re.search(r'target=dev%2Fbox2_windows" data-q="[^"]*" data-up="0"', text)
