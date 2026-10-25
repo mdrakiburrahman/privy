@@ -751,7 +751,9 @@ each command's mode/timeout and may set max_parallel (default: 32).""",
   audit.jsonl     every command and transfer the hub was asked to run
 
 Endpoints (no authentication):
-  GET  /               quickstart for LLMs and people: machines online now, examples
+  GET  /               quickstart for LLMs (Markdown); browsers get the dashboard
+  GET  /ui             control-plane dashboard: HYCO usage, jobs, terminal logs
+  GET  /v1/stats       in-memory usage metrics per HYCO (JSON)
   POST /v1/jobs        run code; ?stream=true streams the output live
   GET  /v1/relays      export credentials per target (sensitive JSON, REST only)
   POST /v1/files/sync  sync a local file/folder into a target (202 + job, REST only)

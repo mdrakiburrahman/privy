@@ -12,6 +12,7 @@ BodyWriter = Callable[[Callable[[bytes], None]], None]
 
 JSON_TYPE = "application/json; charset=utf-8"
 TEXT_TYPE = "text/plain; charset=utf-8"
+HTML_TYPE = "text/html; charset=utf-8"
 EVENT_STREAM_TYPE = "text/event-stream; charset=utf-8"
 
 
@@ -35,6 +36,8 @@ class HttpResponse:
     stream: BodyWriter | None = None
     #: Extra outcome shown on the hub's console line for this call.
     note: str | None = None
+    #: Which client surface made the call (``rest``, ``mcp``, ``ui``, ``health``); derived when unset.
+    surface: str | None = None
 
     def body(self) -> bytes:
         if self.text is not None:

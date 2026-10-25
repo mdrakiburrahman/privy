@@ -27,6 +27,7 @@ from privy.hub.jobs import (
     JobManager,
     utc_iso,
 )
+from privy.hub.metrics import HubMetrics
 from privy.hub.registry import (
     ONLINE,
     UNKNOWN,
@@ -610,11 +611,15 @@ class HubService:
         jobs: JobManager,
         version: str,
         started_at: float | None = None,
+        metrics: HubMetrics | None = None,
     ) -> None:
         self.registry = registry
         self.jobs = jobs
         self.version = version
         self.started_at = time.time() if started_at is None else started_at
+        self.metrics = metrics if metrics is not None else HubMetrics()
+        jobs.on_job = self.metrics.job_added
+        registry.on_probe = self.metrics.probe
         self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
             operation.name: getattr(self, f"_op_{operation.name}") for operation in OPERATIONS
         }

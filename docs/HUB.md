@@ -169,23 +169,25 @@ Re-run the listener installer with `-UpdateBinary` to upgrade them.
 No route needs authentication. `GET /v1` describes the hub as JSON, and `GET /openapi.json` is a
 complete OpenAPI 3.1 description with examples.
 
-| Method and path                     | Operation                                                                  |
-| ----------------------------------- | -------------------------------------------------------------------------- |
-| `GET /` and `GET /llms.txt`         | Quickstart (Markdown) with the machines online now                         |
-| `GET /v1/relays`                    | Export normalized Relay credentials per target (sensitive JSON; REST only) |
-| `GET /v1/targets`                   | `list_targets` (`refresh`, `online_only`, `relay`, `probe`)                |
-| `GET /v1/targets/{target}`          | `get_target`                                                               |
-| `POST /v1/jobs`                     | `run`; `stream=true` streams the output                                    |
-| `GET /v1/jobs`                      | `list_jobs`                                                                |
-| `GET /v1/jobs/{job_id}`             | `get_job` (`wait_s`, `max_output_bytes`, `stdout_offset`, `stderr_offset`) |
-| `GET /v1/jobs/{job_id}/stream`      | The job's output from the start, then live until it finishes               |
-| `GET /v1/jobs/{job_id}/output`      | `read_job_output` (`stream`, `offset`, `limit`)                            |
-| `POST /v1/jobs/{job_id}/cancel`     | `cancel_job`                                                               |
-| `POST /v1/broadcasts`               | `broadcast`                                                                |
-| `GET /v1/broadcasts/{broadcast_id}` | `get_broadcast`                                                            |
-| `POST /v1/files/upload`             | `upload_file`                                                              |
-| `POST /v1/files/download`           | `download_file`                                                            |
-| `POST /v1/files/sync`               | `sync_files`: async file/folder contents update (REST only; 202 + job URL) |
+| Method and path                     | Operation                                                                    |
+| ----------------------------------- | ---------------------------------------------------------------------------- |
+| `GET /` and `GET /llms.txt`         | Quickstart (Markdown) with the machines online now; `/` serves browsers HTML |
+| `GET /ui`                           | Dashboard (HTML); see [Dashboard](#dashboard)                                |
+| `GET /v1/stats`                     | Usage metrics per HYCO from the hub's memory (`range` = `1h`, `24h`, `7d`)   |
+| `GET /v1/relays`                    | Export normalized Relay credentials per target (sensitive JSON; REST only)   |
+| `GET /v1/targets`                   | `list_targets` (`refresh`, `online_only`, `relay`, `probe`)                  |
+| `GET /v1/targets/{target}`          | `get_target`                                                                 |
+| `POST /v1/jobs`                     | `run`; `stream=true` streams the output                                      |
+| `GET /v1/jobs`                      | `list_jobs`                                                                  |
+| `GET /v1/jobs/{job_id}`             | `get_job` (`wait_s`, `max_output_bytes`, `stdout_offset`, `stderr_offset`)   |
+| `GET /v1/jobs/{job_id}/stream`      | The job's output from the start, then live until it finishes                 |
+| `GET /v1/jobs/{job_id}/output`      | `read_job_output` (`stream`, `offset`, `limit`)                              |
+| `POST /v1/jobs/{job_id}/cancel`     | `cancel_job`                                                                 |
+| `POST /v1/broadcasts`               | `broadcast`                                                                  |
+| `GET /v1/broadcasts/{broadcast_id}` | `get_broadcast`                                                              |
+| `POST /v1/files/upload`             | `upload_file`                                                                |
+| `POST /v1/files/download`           | `download_file`                                                              |
+| `POST /v1/files/sync`               | `sync_files`: async file/folder contents update (REST only; 202 + job URL)   |
 
 Arguments go in the query string, in a JSON body (`Content-Type: application/json`), or both. For
 `POST /v1/jobs` and `POST /v1/broadcasts`, putting `target` (or `targets`) in the query string makes
@@ -200,6 +202,25 @@ Invoke-RestMethod "$hub/v1/targets?online_only=true&format=text"
 $job = Invoke-RestMethod -Method Post "$hub/v1/jobs?target=devbox01&wait_s=5" -Body 'Get-ChildItem C:\'
 Invoke-RestMethod "$hub/v1/jobs/$($job.job_id)?wait_s=60"
 ```
+
+### Dashboard
+
+Open `http://127.0.0.1:7748/` (or `/ui`) in a browser for the hub's control plane. Clients that
+don't ask for `text/html` still get the Markdown quickstart at `/`.
+
+| Page        | Shows                                                                                        |
+| ----------- | -------------------------------------------------------------------------------------------- |
+| `/ui`       | Key numbers (jobs, success rate, latency, bytes moved), activity over time, busiest HYCOs    |
+| `/ui/hycos` | Every relay HYCO with job counts, a sparkline over the chosen range, status, and last use    |
+| `/ui/jobs`  | Recent jobs, filterable by `state`                                                           |
+| `/ui/logs`  | Per-HYCO commands and output as collapsible terminals, like `kubectl logs`; live jobs follow |
+
+Add `?range=1h`, `24h`, or `7d` to change the window. `GET /ui/jobs/{job_id}/log` returns one job's
+command and output as plain text. `GET /v1/stats` returns the same numbers as JSON.
+
+Everything is kept in the hub's memory and is lost on restart. Each job keeps its command and up to
+its output buffer limit (older output is trimmed). On startup the hub rebuilds job history (without
+output) from `audit.jsonl`. Memory grows with the number of jobs until the hub restarts.
 
 ### Export Relay credentials
 

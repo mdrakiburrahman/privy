@@ -210,6 +210,8 @@ def quickstart(service: HubService, base_url: str) -> str:
         f"| Sync a file or folder (REST only) | `POST {base_url}/v1/files/sync` with JSON: "
         "`target`, `local_path`, `remote_path`, `destination_type` (`directory` or `file`) |",
         f"| Every endpoint, parameter, and example | `GET {base_url}/openapi.json` |",
+        f"| Usage metrics per HYCO (JSON) | `GET {base_url}/v1/stats?range=24h` |",
+        f"| Dashboard for people (HTML: usage, jobs, logs) | `{base_url}/ui` |",
         "",
         "## Rules of thumb",
         "",
