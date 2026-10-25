@@ -133,6 +133,7 @@ class JobEntry:
             return result
         with job.cond:
             transfer = dict(job.transfer or {})
+            progress = job.progress
             result.update(
                 state=job.state,
                 exit_code=job.exit_code,
@@ -140,7 +141,7 @@ class JobEntry:
                 duration_ms=job.duration_ms(),
                 started_at=job.started_at,
                 finished_at=job.finished_at,
-                progress=job.progress,
+                progress={"bytes_done": progress[0], "bytes_total": progress[1]} if progress else None,
                 stdout_bytes=job.stdout.total,
                 stderr_bytes=job.stderr.total,
             )

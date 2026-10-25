@@ -184,6 +184,29 @@ JS = r"""
     });
     const p = ($("#podq") ? $("#podq").value : "").toLowerCase();
     $$(".pods a").forEach(a => { a.hidden = !!p && !a.textContent.toLowerCase().includes(p); });
+    filterHycos();
+  }
+  function filterHycos() {
+    const box = $("#hycoq"), table = $("#hycos");
+    if (!box || !table) return;
+    const terms = box.value.toLowerCase().split(/\s+/).filter(Boolean);
+    const st = $(".seg.st a.on"), s = st ? st.dataset.s : "all";
+    let shown = 0, up = 0, total = 0;
+    $$("tbody tr", table).forEach(tr => {
+      total++;
+      const hay = tr.dataset.q || "", isUp = tr.dataset.up === "1";
+      const ok = terms.every(t => hay.includes(t)) && (s === "all" || (s === "up") === isUp);
+      tr.hidden = !ok;
+      if (ok) { shown++; if (isUp) up++; }
+    });
+    const n = $("#hycocount");
+    if (n) n.textContent = (shown === total ? shown + " HYCOs" : shown + " of " + total + " shown") +
+      " \u00B7 " + up + " up \u00B7 " + (shown - up) + " down";
+    const none = $("#hyconone"); if (none) none.hidden = shown > 0;
+    const url = new URL(location.href);
+    if (box.value) url.searchParams.set("q", box.value); else url.searchParams.delete("q");
+    if (s !== "all") url.searchParams.set("status", s); else url.searchParams.delete("status");
+    if (url.href !== location.href) history.replaceState(null, "", url);
   }
   function tail(pre) { pre.scrollTop = pre.scrollHeight; }
 
@@ -225,6 +248,9 @@ JS = r"""
   }
   function init() {
     const f = $("#follow"); if (f) f.checked = store("privy.follow", true);
+    const params = new URLSearchParams(location.search), hq = $("#hycoq");
+    if (hq && params.get("q")) hq.value = params.get("q");
+    if (params.get("status")) $$(".seg.st a").forEach(a => a.classList.toggle("on", a.dataset.s === params.get("status")));
     restoreSort();
     applyFilters();
     $$("details.term[open] pre").forEach(tail);
@@ -245,7 +271,7 @@ JS = r"""
       const scroll = new Map($$("details.term[id] pre").map(p => [p.closest("details").id,
         p.scrollHeight - p.scrollTop - p.clientHeight < 30 ? -1 : p.scrollTop]));
       const values = new Map($$("#main input[id]").map(i => [i.id, i.type === "checkbox" ? i.checked : i.value]));
-      const kind = $(".seg.kind a.on");
+      const kind = $(".seg.kind a.on"), st = $(".seg.st a.on");
       for (const id of ["main", "nav", "topchips", "appinfo"]) {
         const a = document.getElementById(id), b = doc.getElementById(id);
         if (a && b) a.replaceChildren(...b.childNodes);
@@ -254,6 +280,7 @@ JS = r"""
       open.forEach((v, id) => { const n = document.getElementById(id); if (n && n.tagName === "DETAILS") n.open = v; });
       values.forEach((v, id) => { const i = document.getElementById(id); if (!i) return; if (i.type === "checkbox") i.checked = v; else i.value = v; });
       if (kind) $$(".seg.kind a").forEach(a => a.classList.toggle("on", a.dataset.k === kind.dataset.k));
+      if (st) $$(".seg.st a").forEach(a => a.classList.toggle("on", a.dataset.s === st.dataset.s));
       restoreSort();
       applyFilters();
       $$("details.term[id] pre").forEach(p => {
@@ -271,10 +298,12 @@ JS = r"""
     if (th) { sortTable(th); return; }
     const seg = e.target.closest(".seg.kind a");
     if (seg) { e.preventDefault(); $$(".seg.kind a").forEach(a => a.classList.toggle("on", a === seg)); applyFilters(); return; }
+    const sseg = e.target.closest(".seg.st a");
+    if (sseg) { e.preventDefault(); $$(".seg.st a").forEach(a => a.classList.toggle("on", a === sseg)); applyFilters(); return; }
     const tr = e.target.closest("tr[data-href]");
     if (tr && !e.target.closest("a") && !getSelection().toString()) location.href = tr.dataset.href;
   });
-  document.addEventListener("input", e => { if (e.target.matches("#grep, #podq")) applyFilters(); });
+  document.addEventListener("input", e => { if (e.target.matches("#grep, #podq, #hycoq")) applyFilters(); });
   document.addEventListener("change", e => {
     const t = e.target;
     if (t.id === "expand") $$("details.term").forEach(d => { d.open = t.checked; });
