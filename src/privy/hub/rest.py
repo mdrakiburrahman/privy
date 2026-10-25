@@ -17,9 +17,10 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote
 
-from privy.hub import guide, render
+from privy.hub import dashboard, guide, render
 from privy.hub.jobs import HubJob
 from privy.hub.mcp import MCP_PATH, SUPPORTED_VERSIONS
+from privy.hub.metrics import DEFAULT_RANGE, RANGES, public_report
 from privy.hub.responses import TEXT_TYPE, HttpResponse, error_response
 from privy.hub.service import (
     INSTRUCTIONS,
@@ -41,6 +42,7 @@ RELAYS_TITLE = "Get normalized Relay credentials per target (REST only)"
 REST_OPERATIONS = {**OPERATIONS_BY_NAME, SYNC_OPERATION.name: SYNC_OPERATION}
 
 _PATH_PARAM_RE = re.compile(r"\{(\w+)\}")
+_UI_LOG_RE = re.compile(r"/ui/jobs/([^/]+)/log")
 _HOST_RE = re.compile(r"[A-Za-z0-9.\-]+(:\d{1,5})?|\[[0-9A-Fa-f:.]+\](:\d{1,5})?")
 _TRUE = ("true", "1", "yes", "on", "")
 _FALSE = ("false", "0", "no", "off")
@@ -228,9 +230,16 @@ class RestApi:
         body: bytes,
     ) -> HttpResponse:
         base_url = self.base_url_for(headers)
+        ui = dashboard.PAGES
         documents: dict[str, Callable[[], HttpResponse]] = {
-            "/": lambda: HttpResponse(200, text=guide.quickstart(self.service, base_url)),
+            "/": lambda: self.home(query, headers, base_url),
             "/llms.txt": lambda: HttpResponse(200, text=guide.quickstart(self.service, base_url)),
+            "/ui/": lambda: dashboard.render(self.service, "overview", query, base_url),
+            **{
+                path: (lambda page=page: dashboard.render(self.service, page, query, base_url))
+                for page, (path, _) in ui.items()
+            },
+            "/v1/stats": lambda: self.stats(query),
             "/v1": lambda: HttpResponse(200, self.capabilities(base_url)),
             "/v1/": lambda: HttpResponse(200, self.capabilities(base_url)),
             "/openapi.json": lambda: HttpResponse(200, openapi_document(self.service, base_url)),
@@ -240,6 +249,11 @@ class RestApi:
             if method not in ("GET", "HEAD"):
                 return _method_not_allowed(["GET", "HEAD"])
             return documents[path]()
+        log_match = _UI_LOG_RE.fullmatch(path)
+        if log_match is not None:
+            if method not in ("GET", "HEAD"):
+                return _method_not_allowed(["GET", "HEAD"])
+            return dashboard.raw_log(self.service, unquote(log_match.group(1)))
 
         allowed: list[str] = []
         for route, regex in _COMPILED:
@@ -253,6 +267,22 @@ class RestApi:
         if allowed:
             return _method_not_allowed(allowed)
         return error_response(404, "not_found", f"no route for {method} {path}; GET / explains the API")
+
+    def home(self, query: Mapping[str, list[str]], headers: Mapping[str, str], base_url: str) -> HttpResponse:
+        """The dashboard for browsers, the Markdown quickstart for everything else (curl, LLMs)."""
+        if "text/html" in (headers.get("Accept") or "").lower():
+            return dashboard.render(self.service, "overview", query, base_url)
+        response = HttpResponse(200, text=guide.quickstart(self.service, base_url))
+        response.headers["Vary"] = "Accept"
+        return response
+
+    def stats(self, query: Mapping[str, list[str]]) -> HttpResponse:
+        value = _last(query, "range", DEFAULT_RANGE)
+        if set(query) - {"range"} or value not in RANGES:
+            return error_response(
+                400, "invalid_argument", f"this endpoint accepts only range ({', '.join(RANGES)})"
+            )
+        return HttpResponse(200, public_report(dashboard.build_report(self.service, value)))
 
     def credentials(self, query: Mapping[str, list[str]]) -> HttpResponse:
         if set(query) - {"format"} or _last(query, "format", "json") != "json":
@@ -390,6 +420,8 @@ class RestApi:
             "quickstart": f"{base_url}/",
             "openapi": f"{base_url}/openapi.json",
             "health": f"{base_url}/healthz",
+            "dashboard": f"{base_url}/ui",
+            "stats": f"{base_url}/v1/stats",
             "relay_credentials": {
                 "endpoint": f"{base_url}{RELAYS_PATH}",
                 "method": "GET",
@@ -595,12 +627,48 @@ def openapi_document(service: HubService, base_url: str) -> dict[str, Any]:
         "/": _document(
             "quickstart",
             "Quickstart",
-            "Markdown guide: the machines online now and copy-paste examples. Start here.",
+            "Markdown guide: the machines online now and copy-paste examples. Start here. "
+            "Browsers (Accept: text/html) get the HTML dashboard instead.",
         ),
         "/llms.txt": _document("llms_txt", "Quickstart (llms.txt)", "The same guide as GET /."),
     }
     for route in ROUTES:
         paths.setdefault(route.path, {})[route.method.lower()] = _operation_spec(route, base_url, example)
+    paths["/ui"] = {
+        "get": {
+            "operationId": "dashboard",
+            "summary": "Control-plane dashboard (HTML)",
+            "description": "Overview, per-HYCO usage with sparklines, jobs, and terminal-style logs. "
+            "Sub-pages: /ui/hycos, /ui/jobs, /ui/logs, /ui/jobs/{job_id}/log (plain text). "
+            "All data is held in the hub's memory.",
+            "parameters": [
+                {
+                    "name": "range",
+                    "in": "query",
+                    "schema": {"type": "string", "enum": list(RANGES), "default": DEFAULT_RANGE},
+                }
+            ],
+            "responses": {"200": {"description": "HTML page", "content": {"text/html": {}}}},
+        }
+    }
+    paths["/v1/stats"] = {
+        "get": {
+            "operationId": "stats",
+            "summary": "Hub usage metrics",
+            "description": "In-memory KPIs and per-HYCO job counts over time (the data behind the dashboard).",
+            "parameters": [
+                {
+                    "name": "range",
+                    "in": "query",
+                    "schema": {"type": "string", "enum": list(RANGES), "default": DEFAULT_RANGE},
+                }
+            ],
+            "responses": {
+                "200": {"description": "Metrics report", "content": {"application/json": {}}},
+                "400": {"$ref": "#/components/responses/Error"},
+            },
+        }
+    }
     paths["/v1"] = {
         "get": {
             "operationId": "capabilities",

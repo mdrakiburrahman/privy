@@ -387,8 +387,11 @@ class JobManager:
         max_retained: int = DEFAULT_MAX_RETAINED,
         output_limit_bytes: int = DEFAULT_OUTPUT_LIMIT_BYTES,
         audit: AuditLog | None = None,
+        on_job: Callable[[HubJob], None] | None = None,
     ) -> None:
         self._registry = registry
+        #: Called with every job the hub starts (the dashboard's history).
+        self.on_job = on_job
         self._slots = threading.BoundedSemaphore(max_running)
         self.max_running = max_running
         self._max_queued = max_queued if max_queued is not None else max_running * 8
@@ -622,6 +625,8 @@ class JobManager:
             self._jobs[job.id] = job
         try:
             self._audit.record("job.start", **self._audit_fields(job, include_spec=True))
+            if self.on_job is not None:
+                self.on_job(job)
             thread = threading.Thread(
                 target=self._run,
                 args=(job, body),

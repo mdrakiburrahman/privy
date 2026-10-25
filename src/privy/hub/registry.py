@@ -151,6 +151,8 @@ class TargetRegistry:
         self._max_probe_workers = max_probe_workers
         self._cache: dict[str, ProbeResult] = {}
         self._cache_lock = threading.Lock()
+        #: Called after every fresh probe (the dashboard's uptime and latency).
+        self.on_probe: Callable[[Target, ProbeResult], None] | None = None
 
     # ---- lookup -----------------------------------------------------------
 
@@ -248,6 +250,11 @@ class TargetRegistry:
 
     # ---- probing ----------------------------------------------------------
 
+    @property
+    def probe_ttl_s(self) -> float:
+        """How long a probe result is reused before the listener is asked again."""
+        return self._probe_ttl_s
+
     def cached(self, target: Target) -> ProbeResult | None:
         with self._cache_lock:
             result = self._cache.get(target.id)
@@ -263,6 +270,8 @@ class TargetRegistry:
         with self._cache_lock:
             self._cache[target.id] = result
         console.probe(target, result)
+        if self.on_probe is not None:
+            self.on_probe(target, result)
         return result
 
     def probe_many(self, targets: Sequence[Target], *, refresh: bool = False) -> dict[str, ProbeResult]:

@@ -26,7 +26,7 @@ from privy.hub.home import AUDIT_FILENAME, RELAYS_FILENAME, ensure_home, write_s
 from privy.hub.jobs import DEFAULT_MAX_RUNNING, AuditLog, JobManager
 from privy.hub.mcp import MCP_PATH, McpEndpoint
 from privy.hub.registry import DEFAULT_PROBE_TTL_S, TargetRegistry
-from privy.hub.responses import HttpResponse, error_response
+from privy.hub.responses import HTML_TYPE, HttpResponse, error_response
 from privy.hub.rest import RestApi
 from privy.hub.service import HubService
 
@@ -161,14 +161,22 @@ class HubApp:
         path = parsed.path or "/"
         if path == "/healthz":
             if method not in ("GET", "HEAD"):
-                return error_response(405, "method_not_allowed", "use GET", {"Allow": "GET, HEAD"})
-            return HttpResponse(
-                200, {"status": "ok", "service": "privy-hub", "version": self.service.version}
-            )
+                response = error_response(405, "method_not_allowed", "use GET", {"Allow": "GET, HEAD"})
+            else:
+                response = HttpResponse(
+                    200, {"status": "ok", "service": "privy-hub", "version": self.service.version}
+                )
+            response.surface = "health"
+            return response
         if path == MCP_PATH:
-            return self.mcp.handle(method, headers, body)
+            response = self.mcp.handle(method, headers, body)
+            response.surface = "mcp"
+            return response
         query = parse_qs(parsed.query, keep_blank_values=True)
-        return self.rest.handle(method, path, query, headers, body)
+        response = self.rest.handle(method, path, query, headers, body)
+        ui = headers.get("X-Privy-UI") or path == "/ui" or path.startswith("/ui/")
+        response.surface = "ui" if ui or response.media_type() == HTML_TYPE else "rest"
+        return response
 
     @staticmethod
     def describe(method: str, target: str, body: bytes) -> str:
@@ -183,7 +191,13 @@ class HubApp:
         return f"{label} {_describe_body(body)}" if body else label
 
     def log_call(self, method: str, target: str, body: bytes, response: HttpResponse, seconds: float) -> None:
+        surface = response.surface or "rest"
+        self.service.metrics.call(surface, response.status, seconds)
         outcome = f"{response.status} {response.note}" if response.note else str(response.status)
+        if surface == "ui" and response.status < 400:
+            # The dashboard refreshes itself every few seconds; keep the console for real work.
+            log.debug("%s -> %s (%.3fs)", self.describe(method, target, body), outcome, seconds)
+            return
         console.call(self.describe(method, target, body), outcome, seconds)
 
 
@@ -347,6 +361,7 @@ def build_hub(
     registry = TargetRegistry(store, client_factory=client_factory, probe_ttl_s=probe_ttl_s)
     jobs = JobManager(registry, max_running=max_jobs, audit=AuditLog(home / AUDIT_FILENAME))
     service = HubService(registry=registry, jobs=jobs, version=version)
+    service.metrics.restore(home / AUDIT_FILENAME)
     app = HubApp(service, port=port)
     server = HubHTTPServer((host, port), app)
     app.set_port(server.server_address[1])
