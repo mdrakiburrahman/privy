@@ -1,13 +1,16 @@
 import json
 import re
+import threading
 import time
 
 import pytest
 from hub_fakes import FakeListener, Hub, blocking_run, exec_result
 
 from privy.client import RelayHTTPError
+from privy.hub import dashboard
 from privy.hub.dashboard import fmt_bytes, fmt_ms, sparkline
 from privy.hub.metrics import HubMetrics, public_report
+from privy.transfer import TransferResult
 
 NO_LISTENER = '{"error":{"code":"EndpointNotFound","message":"There are no listeners connected"}}'
 OFFLINE = RelayHTTPError("x", status_code=404, detail=NO_LISTENER)
@@ -244,3 +247,60 @@ def test_hycos_are_labelled_by_hybrid_connection(hub):
     assert labels[BOX1] == BOX1  # box1_windows also exists on another relay
     assert labels[BOX2] == "box2_windows"
     assert '<b class="nw">box2_windows</b>' in html_of(hub.call("GET", "/ui/hycos"))
+
+
+# ---- live transfers (regression: /ui/logs 500ed while a transfer was mid-flight) ---------
+
+
+def test_live_transfer_with_progress_renders_on_every_page(tmp_path):
+    started, release = threading.Event(), threading.Event()
+
+    def transfer(direction, source, destination, overwrite, progress):
+        progress(1024, 4096)
+        started.set()
+        release.wait(5)
+        return TransferResult(direction, str(source), str(destination), 4096, "b" * 64, "t")
+
+    hub = Hub(tmp_path, {BOX1: FakeListener(transfer=transfer)})
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"x" * 4096)
+    try:
+        job = hub.call(
+            "POST",
+            "/v1/files/upload",
+            {"target": BOX1, "local_path": str(source), "remote_path": "/tmp/source.bin", "wait_s": 0},
+        ).payload
+        assert started.wait(5)
+        assert wait_for(lambda: hub.jobs.get(job["job_id"]).progress == (1024, 4096))
+        for path in ("/ui/logs", f"/ui/logs?target={BOX1}", "/ui/logs?target=*", "/ui/jobs", "/ui"):
+            text = html_of(hub.call("GET", path, headers=BROWSER))
+            if path.startswith("/ui/logs"):
+                assert "1.0 KiB of 4.0 KiB" in text
+        assert hub.call("GET", "/v1/stats").status == 200
+    finally:
+        release.set()
+    assert wait_for(lambda: hub.jobs.get(job["job_id"]).done)
+    assert "could not render" not in html_of(hub.call("GET", "/ui/logs?target=*", headers=BROWSER))
+
+
+def test_one_unrenderable_job_does_not_break_the_logs_page(hub, monkeypatch):
+    job_id = run(hub, BOX1, "hostname")
+
+    def boom(*args, **kwargs):
+        raise ValueError("bad job")
+
+    monkeypatch.setattr(dashboard, "terminal", boom)
+    text = html_of(hub.call("GET", f"/ui/logs?target={BOX1}", headers=BROWSER))
+    assert "could not render this job: ValueError" in text
+    assert f"/ui/jobs/{job_id}/log" in text
+
+
+def test_hycos_page_has_a_search_box_with_per_row_search_keys(hub):
+    text = html_of(hub.call("GET", "/ui/hycos", headers=BROWSER))
+    assert 'id="hycoq"' in text and 'data-s="up"' in text and 'data-s="down"' in text
+    keys = dict(re.findall(r'data-href="[^"]*target=([^"&]+)[^"]*" data-q="([^"]*)" data-up="[01]"', text))
+    offline = keys["dev%2Fbox2_windows"].split()  # offline HYCOs are listed and searchable too
+    assert {"box2_windows", "offline", "down"} <= set(offline)
+    assert "up" in keys["dev%2Fbox1_windows"].split()
+    assert "gpu1_linux" in keys["contoso-lab%2Fgpu1_linux"]
+    assert re.search(r'target=dev%2Fbox2_windows" data-q="[^"]*" data-up="0"', text)

@@ -8,6 +8,7 @@ auto-refresh, and live log following.
 from __future__ import annotations
 
 import html
+import logging
 import os
 import secrets
 import threading
@@ -20,6 +21,8 @@ from privy.hub.dashboard_assets import CSS, JS
 from privy.hub.metrics import BAD_STATES, DEFAULT_RANGE, RANGES, JobEntry
 from privy.hub.registry import ONLINE, UNKNOWN, ProbeResult
 from privy.hub.responses import HTML_TYPE, TEXT_TYPE, HttpResponse, error_response
+
+log = logging.getLogger(__name__)
 
 #: How long a page waits for listeners whose status is stale before rendering what it has.
 PROBE_WAIT_S = 3.0
@@ -593,8 +596,21 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
         status_sub = (
             row["reason"] or os_line or (row["listener_version"] and f"privy {row['listener_version']}")
         )
+        up = row["status"] == ONLINE
+        terms = (
+            row["label"],
+            row["id"],
+            row["status"],
+            "up" if up else "down",
+            row["host"],
+            row["user"],
+            row["os"],
+            status_sub,
+        )
         body.append(
-            f'<tr data-href="{esc(link("/ui/logs", target=row["id"]))}">'
+            f'<tr data-href="{esc(link("/ui/logs", target=row["id"]))}" '
+            f'data-q="{esc(" ".join(str(term) for term in terms if term).lower())}" '
+            f'data-up="{1 if up else 0}">'
             f'<td class="idx">{i:02d}</td>'
             f'<td data-v="{esc(row["label"].lower())}">{hyco_cell(row)}</td>'
             f'<td data-v="{esc(row["status"])}">{state_label(row["status"])}'
@@ -614,8 +630,14 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
             f"<td>{esc(origin_text)}</td>"
             f'<td class="r" data-v="{row["last_used_ts"] or 0}">{esc(fmt_ago(row["last_used_ts"], now))}</td></tr>'
         )
+    toolbar = (
+        '<div class="toolbar"><input type="search" id="hycoq" placeholder="search HYCOs, e.g. _windows or '
+        'raki- linux (all terms must match)…" autocomplete="off"><span class="seg st"><a class="on" data-s="all">'
+        'all</a><a data-s="up">up</a><a data-s="down">down</a></span><span class="chip" id="hycocount"></span></div>'
+    )
     table = (
-        f'<div class="table"><table id="hycos"><thead>{head}</thead><tbody>{"".join(body)}</tbody></table></div>'
+        f'{toolbar}<div class="table"><table id="hycos"><thead>{head}</thead><tbody>{"".join(body)}</tbody></table>'
+        '</div><div class="empty" id="hyconone" hidden>No relay HYCOs match this search.</div>'
         if rows
         else '<div class="empty">No relays are hydrated yet. Run Sync-PrivyHubRelays.ps1 or edit relays.json.</div>'
     )
@@ -656,6 +678,23 @@ def _prompt(entry: JobEntry, host: str, user: str) -> str:
     return "".join(
         f'{prompt if i == 0 else more}<span class="cm">{esc(line)}</span>\n' for i, line in enumerate(lines)
     )
+
+
+def safe_terminal(entry: JobEntry, host: str | None, user: str | None, *, open_: bool, now: float) -> str:
+    """A job's terminal, or an error card for it, so one bad job can't break the whole page."""
+    try:
+        return terminal(entry, host, user, open_=open_, now=now)
+    except Exception as error:
+        log.exception("Could not render the terminal for job %s", entry.id)
+        log_url = f"/ui/jobs/{quote(entry.id, safe='')}/log"
+        return (
+            f'<details class="term bad" id="j-{esc(entry.id)}" data-job="{esc(entry.id)}" data-kind="'
+            f'{"exec" if entry.type == "exec" else "files"}"><summary><span class="lights"><i></i><i></i><i></i></span>'
+            f'<span class="ttl">{esc(entry.type)}</span><span class="cmdp">$ {esc(" ".join(entry.command.split())[:200])}'
+            f'</span><span class="meta-r"><a href="{esc(log_url)}" title="raw log">raw</a></span></summary>'
+            f'<pre class="screen"><span class="err">could not render this job: {esc(type(error).__name__)}'
+            "</span>\n</pre></details>"
+        )
 
 
 def terminal(entry: JobEntry, host: str | None, user: str | None, *, open_: bool, now: float) -> str:
@@ -701,9 +740,14 @@ def terminal(entry: JobEntry, host: str | None, user: str | None, *, open_: bool
         sync = view.get("sync")
         progress = view.get("progress")
         if sync:
-            detail = ", ".join(f"{name.replace('_', ' ')} {value:,}" for name, value in sync.items())
+            detail = ", ".join(
+                f"{name.replace('_', ' ')} {value:,}"
+                if isinstance(value, int)
+                else f"{name.replace('_', ' ')} {value}"
+                for name, value in sync.items()
+            )
         elif progress:
-            detail = f"{fmt_bytes(progress.get('done'))} of {fmt_bytes(progress.get('total'))}"
+            detail = f"{fmt_bytes(progress.get('bytes_done'))} of {fmt_bytes(progress.get('bytes_total'))}"
         else:
             detail = fmt_bytes(view["bytes_moved"]) + " moved"
         screen.append(f'<span class="ex">⇅ {esc(detail)}</span>\n')
@@ -765,7 +809,7 @@ def logs_page(
     entries = sorted(entries, key=lambda entry: entry.created_at, reverse=True)
     shown = entries[:limit]
     terms = "".join(
-        terminal(
+        safe_terminal(
             entry,
             (by_id.get(entry.target_id) or {}).get("host"),
             (by_id.get(entry.target_id) or {}).get("user"),
