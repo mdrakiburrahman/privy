@@ -34,6 +34,7 @@ def collect_listener_info(
     *,
     started_at: float | None = None,
     proxy_enabled: bool = False,
+    terminal_capabilities: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Describe this listener process and host. Never runs submitted code."""
     from privy import __version__
@@ -69,6 +70,7 @@ def collect_listener_info(
             "streaming": True,
             "file_transfer": True,
             "http_proxy": proxy_enabled,
+            "terminal": terminal_capabilities,
         },
         "jobs": job_counts(),
         "uptime_s": None if started_at is None else max(0, int(now - started_at)),

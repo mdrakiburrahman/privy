@@ -405,6 +405,10 @@ class JobManager:
 
     # ---- starting work ----------------------------------------------------
 
+    @property
+    def audit(self) -> AuditLog:
+        return self._audit
+
     def start_exec(
         self,
         target: Target,

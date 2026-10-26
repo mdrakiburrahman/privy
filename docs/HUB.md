@@ -44,46 +44,76 @@ For an always-on hub, install the `PrivyHub` logon task described in
 
 ## Remote Exec workspace
 
-Open **Remote Exec** in the dashboard sidebar at `/ui/exec`, or click the small **Remote** terminal
-action beside an online Relay HYCO. The action selects that exact HYCO, including its relay
-namespace; it never starts a command by itself.
+Open **Remote Exec** in the sidebar at `/ui/exec`, choose a machine and **PowerShell** or **Bash**,
+and select **Connect shell**. Clicking a HYCO's **Remote** action opens a shell on that exact
+target. All sidebar links have consistent decorative outline icons and accessible text labels.
 
-Search online machines, choose a language, write a multiline script, and select **Run script** or
-press **Ctrl+Enter** (**Cmd+Enter** on macOS). The workspace checks the selected listener again
-before submission. Only languages with an advertised, installed subprocess runtime appear:
-PowerShell, Bash, and Python where available. Python advertised only for the listener's shared
-notebook/in-process interpreter is deliberately not offered: it cannot provide fresh-process
-isolation. Older listeners with no runtime information show no verified languages; **Refresh
-targets** requests capability discovery without running a script.
+This is a **real persistent interactive terminal**, like `kubectl exec -it`: Windows uses ConPTY and
+Linux uses a controlling POSIX PTY. Variables, functions, environment changes, and `cd` persist
+within the connected shell. Prompts, interactive programs, terminal resizing, **Ctrl+C**, shell
+history, and **Tab** completion operate remotely. Completion quality comes from the remote shell and
+its configuration, not fake browser snippets. Terminal stdout and stderr share the PTY, just as in a
+local terminal.
 
-Each run starts a **fresh process**, not an interactive terminal. Working directory and variables do
-not persist; include `cd` and subsequent commands in the same script. Programs that prompt for input
-are not supported. **Tab** accepts an active local suggestion or inserts indentation; **Ctrl+Space**
-opens language snippets and matching recent scripts. Arrow keys select suggestions, **Escape**
-closes them, and **Shift+Tab** leaves the editor. Suggestions do not run commands and are not
-semantic IntelliSense or remote path completion.
+Only online listeners advertising compatible `capabilities.terminal` metadata appear in the picker
+or receive a **Remote** action. Runtime/OS detection alone is not sufficient. Upgrade the listener
+to add this capability; older listeners remain usable through existing jobs, file, and Python APIs.
+The terminal UI never offers Python. Capability is checked again before opening.
 
-Output follows in separate stdout/stderr panels using explicit byte offsets, without consuming
-another client's read cursor. Long output is bounded in the browser; **Full log** opens all output
-still retained by the hub. The state badge shows completion and exit status. **Cancel job** requests
-remote cancellation; closing or navigating away does not cancel a job. After a connection failure,
-use **Reconnect**, not a second submission. The URL includes the job identifier so reloading can
-reattach without executing again.
+**Disconnect**, shell `exit`, switching targets/shells, navigation away, and browser refresh close
+the session and its owned process tree. Refresh opens a new shell when the URL names a capable
+target; it does not restore variables from the old process. The listener independently expires
+sessions after **60 minutes without terminal input**, even if the browser or hub disappears. Output,
+background commands, automatic terminal-query responses, refresh, and polling do not reset that
+timer. A command running for an hour without user input is therefore terminated. Navigation uses a
+best-effort close notification; listener-side expiry is the fallback if it cannot arrive.
 
-**Recent runs** is scoped to the selected HYCO and shows retained subprocess jobs. **Open output**
-reattaches without running code; **Load script** puts an existing script in the editor for an
-explicit rerun. Oversized scripts cannot be loaded partially. Drafts survive target/language changes
-and automatic refresh in memory only; reloading the page discards unsent drafts. Executed scripts
-remain subject to the existing hub audit/history policy, so do not paste secrets.
+On a connection interruption, use **Reconnect** to resume the same live shell, or **Disconnect** to
+close it. The hub never silently starts a replacement. Input carries sequence acknowledgements:
+reconnecting can retry an uncertain numbered input without delivering it twice. Lost output beyond
+the bounded replay window is explicitly reported. The browser retains 3000 scrollback lines and each
+listener session retains at most 1 MiB of replay output; this is not a durable transcript.
 
-The workspace uses the existing job API and unchanged listeners. All assets remain self-contained
-under the dashboard CSP, with the same loopback and same-origin protections as other hub operations.
+Terminal lifecycle metadata is audited, but raw keystrokes, passwords, and ownership tokens are not
+added to the hub's command/audit history. The remote shell itself may keep its normal history.
+Existing one-shot jobs and their audit/history behavior are unchanged.
 
-For development, `./scripts/check_hub_browser.sh` runs the Chromium regression suite against an
-isolated fake-listener hub on port 7750, including editing, completion, refresh, rerun,
-cancellation, reconnection, output escaping, and responsive layout. It requires Chromium's system
-libraries (`uv run --with playwright==1.64.1 python -m playwright install-deps chromium` on a new
-Linux host). This suite is also a PR CI gate; it does not contact real listeners.
+### Terminal protocol and packaging
+
+The Relay protocol uses `kind="terminal"`, `protocol_version=1`, and `open`, `read`, `write`,
+`resize`, or `close`. Listener capability metadata is
+`{"version":1,"shells":["powershell","bash"],"idle_ttl_s":3600}`, filtered to installed shells with
+a native backend. Windows requires ConPTY (Windows build 17763+) and the conditionally packaged
+`pywinpty` dependency; Linux uses standard-library PTY facilities and the system `setsid` utility.
+No pipe-only fallback is offered. Windows advertises PowerShell only: Git Bash/ConPTY can lose the
+first character after resizing, so it is deliberately not advertised as a reliable interactive
+shell. Linux offers Bash and PowerShell when installed. The Windows dependency is bounded below
+pywinpty 3.1 because its changed ConPTY behavior failed the native resize regression.
+
+The browser uses same-origin JSON-only `POST /v1/terminals` to open, then
+`POST /v1/terminals/{session_id}/{read|write|resize|close}`. Creation includes `target`, `shell`, an
+opaque per-page `owner`, an idempotent `request_id`, `cols`, and `rows`. Follow-up requests include
+the same owner; closing a pending creation also includes the target. Input uses `seq` starting at
+zero and `data_b64`; reads use an absolute byte `offset`, `max_bytes`, and bounded `wait_s`.
+Responses include state, output offset, acknowledged input sequence, and idle time remaining.
+Session ownership tokens belong in JSON bodies, not query strings or logs.
+
+Listeners allow four simultaneous terminals, bound each input/read chunk to 32768 bytes, validate
+dimensions, and independently clean up sessions on expiry and orderly shutdown. Terminal RPCs do not
+change the legacy execution protocol or expose a new MCP command-execution mode.
+
+xterm.js and its fit addon are pinned, vendored with their licenses, and included in wheels and
+binaries. `python scripts/vendor_terminal_assets.py` reproduces them after verifying upstream
+SHA-512 digests. A checked, narrowly scoped renderer patch uses CSSOM color properties instead of
+style attributes; xterm's document override applies the page nonce to its generated styles. The
+dashboard CSP remains strict, with no CDN or `unsafe-inline` dependency.
+
+For development, `./scripts/check_hub_browser.sh` runs real Chromium and native Bash PTY checks
+through a credential-free fake Relay transport on isolated port 7750. It exercises persistent
+state/cwd, prompts, completion, Ctrl+C, resize, capability gating, reload/navigation cleanup, and
+CSP console errors. Chromium system libraries are required
+(`uv run --with playwright==1.64.1 python -m playwright install-deps chromium` on a new Linux host).
+This suite is also a PR CI gate. Native Windows tests cover the ConPTY adapter and packaging.
 
 ## Use it from an LLM
 

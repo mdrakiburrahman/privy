@@ -93,6 +93,7 @@ class FakeListener:
         run: Callable[..., ExecResult] = echo_run,
         transfer: Callable[..., TransferResult] | None = None,
         hostname: str = "box",
+        terminal: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         if info is None and not legacy:
             info = {
@@ -114,6 +115,8 @@ class FakeListener:
         self.cancelled: list[str] = []
         self.cancel_event = threading.Event()
         self.started = threading.Event()
+        self.terminal = terminal
+        self.terminal_requests: list[dict[str, Any]] = []
 
 
 class FakeRelayClient:
@@ -129,6 +132,12 @@ class FakeRelayClient:
     def send(self, request, *, async_job=None, on_output=None, on_submit=None) -> ExecResult:
         self.listener.requests.append(request)
         return self.listener.run(request, on_output, on_submit, self.listener)
+
+    def terminal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.listener.terminal_requests.append(payload)
+        if self.listener.terminal is None:
+            raise AssertionError("terminal requested from an unsupported fake listener")
+        return self.listener.terminal({**payload, "kind": "terminal", "protocol_version": 1})
 
     def cancel(self, request, job_id: str) -> ExecResult:
         self.listener.cancelled.append(job_id)
