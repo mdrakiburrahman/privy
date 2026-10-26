@@ -205,7 +205,8 @@
     message();
     status("Connecting");
     $("exec-session-label").textContent = `${labels[shell]} / ${target.id}`;
-    terminal.reset();
+    await new Promise(resolve => terminal.write("\x1bc", resolve));
+    if (session !== s || leaving || s.phase !== "connecting") return;
     const url = new URL(location.href);
     url.searchParams.set("target", target.id);
     url.searchParams.set("shell", shell);

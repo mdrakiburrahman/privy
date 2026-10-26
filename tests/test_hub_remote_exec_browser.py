@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import re
 import threading
+import re
 import time
 
 import pytest
@@ -113,6 +113,7 @@ def test_real_shell_state_cwd_prompts_interrupt_and_unicode(browser_workspace):
     page, _, _, _, errors = browser_workspace
     expect = browser_api.expect
     connect(page)
+    expect(output(page)).not_to_contain_text("Connect to a terminal-capable listener")
     command(page, "PS1='privy> '; PRIVY_STATE=delight; cd /tmp")
     command(page, 'printf \'STATE=%s:%s\\n\' "$PRIVY_STATE" "$PWD"')
     expect(output(page)).to_contain_text("STATE=delight:/tmp")
