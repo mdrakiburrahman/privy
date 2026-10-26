@@ -39,6 +39,14 @@ def browser_workspace(tmp_path):
             page = browser.new_page(viewport={"width": 1500, "height": 1100})
             errors = []
             page.on("pageerror", lambda error: errors.append(str(error)))
+            page.on(
+                "console",
+                lambda message: (
+                    errors.append(message.text)
+                    if message.type == "error" and "Content Security Policy" in message.text
+                    else None
+                ),
+            )
             yield page, hub, windows, linux, errors
             browser.close()
     finally:
