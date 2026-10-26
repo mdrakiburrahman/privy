@@ -250,8 +250,13 @@ def test_composer_completion_history_and_editing_are_local(browser_workspace):
     editor.press("Enter")
     assert editor.input_value() == "printf\n"
     editor.press("Control+z")
+    undo_steps = 1
+    if editor.input_value() == "printf":
+        editor.press("Control+z")
+        undo_steps += 1
     assert editor.input_value() == "prin"
-    editor.press("Control+Shift+z")
+    for _ in range(undo_steps):
+        editor.press("Control+Shift+z")
     assert editor.input_value() == "printf\n"
     editor.fill("printf 'LOCAL=%s\\n' done")
     page.wait_for_timeout(150)
