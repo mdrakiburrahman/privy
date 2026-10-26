@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import re
 import threading
 import time
@@ -9,6 +11,7 @@ import time
 import pytest
 from hub_fakes import FakeListener, Hub
 
+from privy.client import RelayHTTPError
 from privy.hub.app import HubHTTPServer
 from privy.terminal import TerminalManager
 
@@ -207,4 +210,283 @@ def test_unknown_and_runtime_disappearing_never_fall_back(browser_workspace):
     assert not manager._sessions and not linux.requests
     page.locator("#exec-disconnect").click()
     expect(page.locator("#exec-state")).to_have_text("Disconnected")
+    assert not errors
+
+
+def compose(page, text):
+    page.locator("#exec-command").fill(text)
+    page.locator("#exec-command").press("Control+Enter")
+
+
+def test_composer_submits_multiline_once_in_the_same_shell(browser_workspace):
+    page, _, linux, manager, errors = browser_workspace
+    connect(page)
+    browser_api.expect(page.locator("#exec-command")).to_be_focused()
+    before = len([item for item in linux.terminal_requests if item["action"] == "write"])
+    compose(
+        page,
+        "PRIVY_COMPOSED='λ-é'\ncomposer_function() { printf 'FUNCTION=%s\\n' \"$PRIVY_COMPOSED\"; }\ncd /tmp",
+    )
+    browser_api.expect(page.locator("#exec-delivery")).to_contain_text("Delivered")
+    compose(page, "composer_function; printf 'DIRECTORY=%s\\n' \"$PWD\"")
+    browser_api.expect(output(page)).to_contain_text("FUNCTION=λ-é")
+    browser_api.expect(output(page)).to_contain_text("DIRECTORY=/tmp")
+    writes = [item for item in linux.terminal_requests if item["action"] == "write"][before:]
+    commands = [item for item in writes if item["user_input"]]
+    assert len(commands) == 2
+    assert len(manager._sessions) == 1 and not linux.requests and not errors
+    assert all(len(base64.b64decode(item["data_b64"])) <= 16384 for item in commands)
+
+
+def test_composer_completion_history_and_editing_are_local(browser_workspace):
+    page, _, linux, _, errors = browser_workspace
+    connect(page)
+    editor = page.locator("#exec-command")
+    baseline = len([item for item in linux.terminal_requests if item["action"] == "write"])
+    editor.fill("prin")
+    browser_api.expect(page.locator("#exec-suggestions")).to_be_visible()
+    editor.press("Tab")
+    assert editor.input_value() == "printf"
+    editor.press("Enter")
+    assert editor.input_value() == "printf\n"
+    editor.press("Control+z")
+    undo_steps = 1
+    if editor.input_value() == "printf":
+        editor.press("Control+z")
+        undo_steps += 1
+    assert editor.input_value() == "prin"
+    for _ in range(undo_steps):
+        editor.press("Control+Shift+z")
+    assert editor.input_value() == "printf\n"
+    editor.fill("printf 'LOCAL=%s\\n' done")
+    page.wait_for_timeout(150)
+    assert len([item for item in linux.terminal_requests if item["action"] == "write"]) == baseline
+    editor.press("Control+Enter")
+    browser_api.expect(output(page)).to_contain_text("LOCAL=done")
+    page.locator("#exec-history-prev").click()
+    assert editor.input_value() == "printf 'LOCAL=%s\\n' done"
+    assert not errors
+
+
+@pytest.mark.parametrize(
+    "draft",
+    ["x" * 8193, "λ" * 4097, "echo \x1b[31mhidden", "echo \x00bad"],
+    ids=["ascii-limit", "utf8-limit", "escape", "nul"],
+)
+def test_composer_rejects_oversize_and_hidden_control_input(browser_workspace, draft):
+    page, _, linux, _, _ = browser_workspace
+    connect(page)
+    before = len([item for item in linux.terminal_requests if item["action"] == "write"])
+    compose(page, draft)
+    browser_api.expect(page.locator("#exec-delivery")).to_contain_text(re.compile("8 KiB|control"))
+    assert len([item for item in linux.terminal_requests if item["action"] == "write"]) == before
+    assert page.locator("#exec-command").input_value() == draft
+
+
+def test_composer_local_latency_is_independent_of_delayed_delivery(browser_workspace):
+    page, _, linux, _, errors = browser_workspace
+    connect(page)
+    gate = threading.Event()
+    original = linux.terminal
+
+    def delayed(payload):
+        if payload["action"] == "read":
+            time.sleep(1)
+        if payload["action"] == "write" and payload.get("user_input"):
+            assert gate.wait(5)
+        return original(payload)
+
+    linux.terminal = delayed
+    try:
+        compose(page, "printf 'DELAYED=%s\\n' done")
+        page.locator("#exec-command").press("Control+Enter")
+        browser_api.expect(page.locator("#exec-run")).to_be_disabled()
+        page.wait_for_timeout(1100)
+        measurements = page.locator("#exec-command").evaluate("""async editor => {
+          const samples = [];
+          for (let i = 0; i < 40; i++) {
+            const before = performance.now();
+            editor.value = i % 2 ? "prin" : "ech";
+            editor.dispatchEvent(new Event("input", {bubbles:true}));
+            await new Promise(requestAnimationFrame);
+            samples.push(performance.now() - before);
+          }
+          samples.sort((a,b)=>a-b);
+          return {p95:samples[Math.ceil(samples.length*.95)-1], max:samples.at(-1)};
+        }""")
+        print("Composer local render latency:", json.dumps(measurements))
+        assert measurements["p95"] <= 50
+        browser_api.expect(page.locator("#exec-suggestions")).to_be_visible()
+    finally:
+        gate.set()
+    browser_api.expect(output(page)).to_contain_text("DELAYED=done")
+    commands = [item for item in linux.terminal_requests if item["action"] == "write" and item["user_input"]]
+    assert len(commands) == 1 and not errors
+
+
+def test_composer_lost_ack_requires_explicit_reconnect_without_duplicate_execution(browser_workspace):
+    page, _, linux, _, errors = browser_workspace
+    connect(page)
+    original, lost = linux.terminal, False
+
+    def lose_ack(payload):
+        nonlocal lost
+        result = original(payload)
+        if payload["action"] == "write" and payload.get("user_input") and not lost:
+            lost = True
+            raise RelayHTTPError("controlled lost acknowledgement", timed_out=True)
+        return result
+
+    linux.terminal = lose_ack
+    compose(page, "PRIVY_COUNTER=$(( ${PRIVY_COUNTER:-0} + 1 )); printf 'COUNT=%s\\n' \"$PRIVY_COUNTER\"")
+    browser_api.expect(page.locator("#exec-state")).to_have_text("Connection interrupted")
+    browser_api.expect(page.locator("#exec-delivery")).to_contain_text("uncertain")
+    browser_api.expect(page.locator("#exec-run")).to_be_disabled()
+    page.locator("#exec-command").fill("printf 'NEW_DRAFT=%s\\n' kept")
+    page.locator("#exec-reconnect").click()
+    browser_api.expect(page.locator("#exec-state")).to_have_text("Connected")
+    browser_api.expect(page.locator("#exec-delivery")).to_contain_text("Delivered")
+    browser_api.expect(output(page)).to_contain_text("COUNT=1")
+    assert page.locator("#exec-command").input_value() == "printf 'NEW_DRAFT=%s\\n' kept"
+    commands = [item for item in linux.terminal_requests if item["action"] == "write" and item["user_input"]]
+    assert len(commands) == 2 and commands[0]["seq"] == commands[1]["seq"]
+    assert commands[0]["data_b64"] == commands[1]["data_b64"] and not errors
+
+
+def test_composer_read_failure_keeps_local_editing_and_existing_shell(browser_workspace):
+    page, _, linux, manager, errors = browser_workspace
+    connect(page)
+    original, failed = linux.terminal, False
+
+    def fail_read(payload):
+        nonlocal failed
+        if payload["action"] == "read" and not failed:
+            failed = True
+            raise RelayHTTPError("controlled read failure", status_code=502)
+        return original(payload)
+
+    linux.terminal = fail_read
+    browser_api.expect(page.locator("#exec-state")).to_have_text("Connection interrupted", timeout=10000)
+    page.locator("#exec-command").fill("prin")
+    page.locator("#exec-command").press("Tab")
+    assert page.locator("#exec-command").input_value() == "printf"
+    browser_api.expect(page.locator("#exec-run")).to_be_disabled()
+    page.locator("#exec-reconnect").click()
+    browser_api.expect(page.locator("#exec-state")).to_have_text("Connected")
+    compose(page, "printf 'RECOVERED=%s\\n' yes")
+    browser_api.expect(output(page)).to_contain_text("RECOVERED=yes")
+    assert len(manager._sessions) == 1 and not errors
+
+
+def test_composer_ime_does_not_submit_and_exact_utf8_limit_is_accepted(browser_workspace):
+    page, _, linux, _, errors = browser_workspace
+    connect(page)
+    editor = page.locator("#exec-command")
+    editor.fill("#" + "λ" * 4095 + "a")
+    editor.dispatch_event("compositionstart")
+    editor.press("Control+Enter")
+    assert not any(item["action"] == "write" and item["user_input"] for item in linux.terminal_requests)
+    editor.dispatch_event("compositionend")
+    editor.press("Control+Enter")
+    browser_api.expect(page.locator("#exec-delivery")).to_contain_text("Delivered")
+    commands = [item for item in linux.terminal_requests if item["action"] == "write" and item["user_input"]]
+    assert len(commands) == 1 and len(base64.b64decode(commands[0]["data_b64"])) <= 16384
+    assert not errors
+
+
+def test_composer_fallback_envelope_preserves_scope_quotes_tabs_and_syntax_errors(browser_workspace):
+    page, _, _, manager, errors = browser_workspace
+    connect(page)
+    command(page, "bind 'set enable-bracketed-paste off'")
+    page.wait_for_timeout(100)
+    compose(
+        page,
+        'PRIVY_QUOTED="it\'s a \\\\ path"\ncomposed_fn() {\n\tprintf \'VALUE=%s\\n\' "$PRIVY_QUOTED"\n}\ncd /tmp',
+    )
+    browser_api.expect(page.locator("#exec-delivery")).to_contain_text("Delivered")
+    compose(page, "composed_fn; printf 'CWD=%s\\n' \"$PWD\"")
+    browser_api.expect(output(page)).to_contain_text("VALUE=it's a \\ path")
+    browser_api.expect(output(page)).to_contain_text("CWD=/tmp")
+    browser_api.expect(page.locator("#exec-delivery")).to_contain_text("Delivered")
+    compose(page, "if then")
+    browser_api.expect(output(page)).to_contain_text("syntax error")
+    browser_api.expect(page.locator("#exec-delivery")).to_contain_text("Delivered")
+    compose(page, "composed_fn")
+    browser_api.expect(page.locator("#exec-delivery")).to_contain_text("Delivered")
+    assert len(manager._sessions) == 1 and not errors
+
+
+def test_composer_queues_after_unacknowledged_interactive_input(browser_workspace):
+    page, _, linux, _, errors = browser_workspace
+    connect(page)
+    gate, started = threading.Event(), threading.Event()
+    original = linux.terminal
+
+    def delayed(payload):
+        if payload["action"] == "write" and payload.get("user_input") and not started.is_set():
+            started.set()
+            assert gate.wait(5)
+        return original(payload)
+
+    linux.terminal = delayed
+    try:
+        terminal = page.locator(".xterm-helper-textarea")
+        terminal.focus()
+        terminal.press_sequentially("printf 'DIRECT=%s\\n' first")
+        terminal.press("Enter")
+        assert started.wait(2)
+        compose(page, "printf 'COMPOSED=%s\\n' second")
+        browser_api.expect(page.locator("#exec-delivery")).to_contain_text("Sending")
+        browser_api.expect(page.locator("#exec-run")).to_be_disabled()
+    finally:
+        gate.set()
+    browser_api.expect(output(page)).to_contain_text("DIRECT=first")
+    browser_api.expect(output(page)).to_contain_text("COMPOSED=second")
+    browser_api.expect(page.locator("#exec-delivery")).to_contain_text("Delivered")
+    assert not errors
+
+
+def test_composer_caret_movement_and_shift_selection_do_not_apply_stale_completion(browser_workspace):
+    page, _, _, _, errors = browser_workspace
+    connect(page)
+    editor = page.locator("#exec-command")
+    editor.fill("prin")
+    editor.press("ArrowLeft")
+    browser_api.expect(page.locator("#exec-suggestions")).to_be_hidden()
+    editor.fill("prin")
+    editor.press("Shift+ArrowUp")
+    browser_api.expect(page.locator("#exec-suggestions")).to_be_hidden()
+    assert editor.evaluate("e=>e.selectionStart!==e.selectionEnd")
+    editor.fill("prin")
+    editor.press("Control+Shift+ArrowUp")
+    browser_api.expect(page.locator("#exec-suggestions")).to_be_hidden()
+    assert editor.evaluate("e=>e.selectionStart!==e.selectionEnd")
+    assert not errors
+
+
+def test_composer_double_click_does_not_run_twice_after_fast_ack(browser_workspace):
+    page, _, linux, _, errors = browser_workspace
+    connect(page)
+    page.locator("#exec-command").fill("printf 'ONCE=%s\\n' yes")
+    page.locator("#exec-run").dispatch_event("click", {"detail": 1})
+    browser_api.expect(page.locator("#exec-delivery")).to_contain_text("Delivered")
+    page.locator("#exec-run").dispatch_event("click", {"detail": 2})
+    page.wait_for_timeout(100)
+    commands = [item for item in linux.terminal_requests if item["action"] == "write" and item["user_input"]]
+    assert len(commands) == 1 and not errors
+
+
+def test_composer_history_is_bounded_and_discarded_on_navigation(browser_workspace):
+    page, _, _, _, errors = browser_workspace
+    connect(page)
+    for index in range(52):
+        compose(page, f"# local-history-{index}")
+        browser_api.expect(page.locator("#exec-delivery")).to_contain_text("Delivered")
+    for _ in range(50):
+        page.locator("#exec-history-prev").click()
+    assert page.locator("#exec-command").input_value() == "# local-history-2"
+    browser_api.expect(page.locator("#exec-history-prev")).to_be_disabled()
+    page.reload()
+    browser_api.expect(page.locator("#exec-command")).to_have_value("")
+    browser_api.expect(page.locator("#exec-history-prev")).to_be_disabled()
     assert not errors

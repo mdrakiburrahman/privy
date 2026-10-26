@@ -13,7 +13,7 @@ from hub_fakes import FakeListener, Hub
 
 from privy.client import RelayClient, RelayHTTPError
 from privy.hub.app import HubApp
-from privy.hub.remote_exec import execution_choices
+from privy.hub.remote_exec import EXEC_JS, execution_choices
 
 BOX = "dev/box1_windows"
 LINUX = "contoso-lab/gpu1_linux"
@@ -152,6 +152,12 @@ def test_workspace_is_read_only_bundled_and_nonce_protected(workspace):
     assert "unsafe-inline" not in response.headers["Content-Security-Policy"]
     assert "cdn." not in response.text
     assert "documentOverride" in response.text
+    assert 'id="exec-command"' in response.text
+    assert 'aria-controls="exec-suggestions"' in response.text
+    assert 'id="exec-run"' in response.text
+    assert "Local suggestions are not remote file or module discovery" in response.text
+    assert "const PrivyComposer" in response.text
+    assert "localStorage" not in EXEC_JS
 
 
 def test_unknown_legacy_and_empty_target_selections_do_not_execute(workspace):

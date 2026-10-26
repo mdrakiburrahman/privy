@@ -51,9 +51,33 @@ target. All sidebar links have consistent decorative outline icons and accessibl
 This is a **real persistent interactive terminal**, like `kubectl exec -it`: Windows uses ConPTY and
 Linux uses a controlling POSIX PTY. Variables, functions, environment changes, and `cd` persist
 within the connected shell. Prompts, interactive programs, terminal resizing, **Ctrl+C**, shell
-history, and **Tab** completion operate remotely. Completion quality comes from the remote shell and
-its configuration, not fake browser snippets. Terminal stdout and stderr share the PTY, just as in a
+history, and **Tab** completion in the terminal operate remotely. Terminal completion quality comes
+from the remote shell and its configuration. Terminal stdout and stderr share the PTY, just as in a
 local terminal.
+
+The default **Command composer** edits locally, without waiting for Relay keystroke echoes. Its
+suggestions are a small, shell-aware local catalog, not IntelliSense over remote files, installed
+modules, or live variables. **Tab** accepts a visible suggestion, **Escape** dismisses it, and
+**Enter** adds a newline. **Ctrl+Enter** (or **Run**) submits the complete draft to the existing
+shell in one input batch; it does not create a new process. **Ctrl+Up/Down** or the history buttons
+recall at most 50 commands retained only in this page's memory. Switching target/shell clears the
+composer and history; navigation/refresh discards them. Drafts are not stored in localStorage.
+
+Use **Run at a shell prompt**. A foreground program can consume terminal input; the composer does
+not guess whether a shell is ready or queue commands for automatic execution. For interactive
+questions, passwords, native remote completion, and full-screen applications, select **Interactive
+input** or click the terminal. **Interrupt** sends Ctrl+C without replacing the shell. Delivery
+status confirms only a terminal acknowledgement, not command success or completion. You can continue
+editing a newer draft while delivery is pending. Uncertain delivery requires explicit **Reconnect**;
+Run is disabled until resolved to avoid accidental duplicate execution.
+
+Drafts are limited to 8 KiB of UTF-8; encoded submissions must fit a 16 KiB input batch. Hidden
+terminal control characters are rejected. Shell-advertised bracketed paste preserves native editing
+behavior. Ordinary single-line commands use native terminal input; a same-scope Bash `eval` or
+PowerShell `Invoke-Expression` envelope preserves multiline text and quoting when bracketed paste is
+unavailable. PowerShell's multiline fallback encodes the draft as UTF-8/base64, so the terminal may
+echo that envelope rather than the original script. The composer retains the readable draft. No
+command contents are added to hub logs by this feature.
 
 Only online listeners advertising compatible `capabilities.terminal` metadata appear in the picker
 or receive a **Remote** action. Runtime/OS detection alone is not sufficient. Upgrade the listener
@@ -63,10 +87,11 @@ The terminal UI never offers Python. Capability is checked again before opening.
 **Disconnect**, shell `exit`, switching targets/shells, navigation away, and browser refresh close
 the session and its owned process tree. Refresh opens a new shell when the URL names a capable
 target; it does not restore variables from the old process. The listener independently expires
-sessions after **60 minutes without terminal input**, even if the browser or hub disappears. Output,
-background commands, automatic terminal-query responses, refresh, and polling do not reset that
-timer. A command running for an hour without user input is therefore terminated. Navigation uses a
-best-effort close notification; listener-side expiry is the fallback if it cannot arrive.
+sessions after **60 minutes without terminal input**, even if the browser or hub disappears. Local
+composer editing is not terminal input and does not reset this timer. Output, background commands,
+automatic terminal-query responses, refresh, and polling do not reset that timer. A command running
+for an hour without user input is therefore terminated. Navigation uses a best-effort close
+notification; listener-side expiry is the fallback if it cannot arrive.
 
 On a connection interruption, use **Reconnect** to resume the same live shell, or **Disconnect** to
 close it. The hub never silently starts a replacement. Input carries sequence acknowledgements:
@@ -102,6 +127,12 @@ Listeners allow four simultaneous terminals, bound each input/read chunk to 3276
 dimensions, and independently clean up sessions on expiry and orderly shutdown. Terminal RPCs do not
 change the legacy execution protocol or expose a new MCP command-execution mode.
 
+The listener's control-loop thread owns both reads and small inline-response writes on its TLS
+WebSocket. Worker threads execute requests and return results through a bounded, connection-scoped
+outbox; large responses retain dedicated rendezvous sockets. This avoids concurrent TLS read/write
+stalls without changing protocol version 1. Updating only the hub provides the local composer; the
+control-socket reliability fix also requires upgrading the listener binary.
+
 xterm.js and its fit addon are pinned, vendored with their licenses, and included in wheels and
 binaries. `python scripts/vendor_terminal_assets.py` reproduces them after verifying upstream
 SHA-512 digests. A checked, narrowly scoped renderer patch uses CSSOM color properties instead of
@@ -110,8 +141,9 @@ dashboard CSP remains strict, with no CDN or `unsafe-inline` dependency.
 
 For development, `./scripts/check_hub_browser.sh` runs real Chromium and native Bash PTY checks
 through a credential-free fake Relay transport on isolated port 7750. It exercises persistent
-state/cwd, prompts, completion, Ctrl+C, resize, capability gating, reload/navigation cleanup, and
-CSP console errors. Chromium system libraries are required
+state/cwd, prompts, completion, Ctrl+C, resize, capability gating, reload/navigation cleanup, local
+editing latency, multiline submission, lost acknowledgements, read failures, and CSP console errors.
+Chromium system libraries are required
 (`uv run --with playwright==1.64.1 python -m playwright install-deps chromium` on a new Linux host).
 This suite is also a PR CI gate. Native Windows tests cover the ConPTY adapter and packaging.
 
