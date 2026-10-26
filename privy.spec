@@ -1,11 +1,17 @@
 # PyInstaller spec for the self-contained `privy` binary.
 # Build with: ./scripts/build_binary.sh
 
+import sys
+
+from PyInstaller.utils.hooks import collect_data_files
+
+terminal_data = collect_data_files("winpty", includes=["*.exe"]) if sys.platform == "win32" else []
+
 a = Analysis(
     ["src/privy/__main__.py"],
     pathex=["src"],
     binaries=[],
-    datas=[],
+    datas=[("src/privy/hub/assets", "privy/hub/assets"), *terminal_data],
     hiddenimports=[
         "privy.batch",
         "privy.cli",
@@ -30,6 +36,9 @@ a = Analysis(
         "privy.proxy",
         "privy.server",
         "privy.transfer",
+        "privy.terminal",
+        "privy.terminal_backends",
+        "privy.hub.terminals",
         "privy._logfmt",
         "privy._relay",
         "websocket",

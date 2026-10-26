@@ -22,6 +22,7 @@ from privy.hub.metrics import BAD_STATES, DEFAULT_RANGE, RANGES, JobEntry
 from privy.hub.registry import ONLINE, UNKNOWN, ProbeResult
 from privy.hub.remote_exec import EXEC_CSS, EXEC_JS, TERMINAL_ICON, workspace
 from privy.hub.responses import HTML_TYPE, TEXT_TYPE, HttpResponse, error_response
+from privy.hub.terminals import terminal_languages
 
 log = logging.getLogger(__name__)
 
@@ -119,6 +120,34 @@ def plural(count: int, word: str) -> str:
 
 
 # ---- SVG ------------------------------------------------------------------------
+
+
+def nav_icon(name: str) -> str:
+    if name == "exec":
+        return TERMINAL_ICON
+    shapes = {
+        "overview": '<rect x="3" y="3" width="7" height="7" rx="2"/>'
+        '<rect x="14" y="3" width="7" height="7" rx="2"/>'
+        '<rect x="3" y="14" width="7" height="7" rx="2"/>'
+        '<rect x="14" y="14" width="7" height="7" rx="2"/>',
+        "hycos": '<rect x="8" y="3" width="8" height="5" rx="1.5"/>'
+        '<rect x="2" y="16" width="8" height="5" rx="1.5"/>'
+        '<rect x="14" y="16" width="8" height="5" rx="1.5"/><path d="M12 8v4H6v4m6-4h6v4"/>',
+        "logs": '<path d="M7 3h8l4 4v14H5V5a2 2 0 0 1 2-2Z"/><path d="M14 3v5h5M8 12h8m-8 4h6"/>',
+        "jobs": '<rect x="3" y="7" width="18" height="14" rx="3"/>'
+        '<path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M3 12h18m-11 0v3h4v-3"/>',
+        "guide": '<path d="M12 5v15M3 4c4-1 6 0 9 2 3-2 5-3 9-2v15c-4-1-6 0-9 2-3-2-5-3-9-2Z"/>',
+        "stats": '<path d="M4 3v17h17M8 14l4-5 4 3 5-7"/>',
+        "openapi": '<path d="m8 6-6 6 6 6m8-12 6 6-6 6m-3-15-2 18"/>',
+        "targets": '<rect x="3" y="3" width="18" height="7" rx="2"/>'
+        '<rect x="3" y="14" width="18" height="7" rx="2"/>'
+        '<path d="M7 6.5h.01M7 17.5h.01M11 6.5h6m-6 11h6"/>',
+    }
+    return (
+        '<svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+        'stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" '
+        f'aria-hidden="true" focusable="false">{shapes[name]}</svg>'
+    )
 
 
 def sparkline(
@@ -235,7 +264,7 @@ def build_report(service: Any, range_name: str) -> dict[str, Any]:
     targets = list(service.registry.snapshot().targets)
     probes = gather_probes(service)
     counts = service.jobs.counts()
-    return service.metrics.report(
+    report = service.metrics.report(
         targets,
         probes,
         range_name=range_name,
@@ -243,6 +272,10 @@ def build_report(service: Any, range_name: str) -> dict[str, Any]:
         jobs_queued=counts["queued"],
         max_running=service.jobs.max_running,
     )
+    for row in report["targets"]:
+        probe = probes.get(row["id"])
+        row["terminal_shells"] = terminal_languages(probe.info if probe else None)
+    return report
 
 
 def _last(query: Mapping[str, list[str]], name: str, default: str = "") -> str:
@@ -290,16 +323,19 @@ def shell(
     }
     nav = "".join(
         f'<a href="{esc(link(path, range=rng if rng != DEFAULT_RANGE else None))}"'
-        f"{ON if name == page else ''}>{TERMINAL_ICON if name == 'exec' else ''}{esc(label)}"
+        f"{ON if name == page else ''}>{nav_icon(name)}{esc(label)}"
         + (f"<span>{fmt_int(nav_counts[name])}</span>" if name in nav_counts else "")
         + "</a>"
         for name, (path, label) in PAGES.items()
     )
-    api = (
-        '<a href="/llms.txt">Markdown guide</a>'
-        f'<a href="{esc(link("/v1/stats", range=rng))}">Stats JSON</a>'
-        '<a href="/openapi.json">OpenAPI</a>'
-        '<a href="/v1/targets">Targets JSON</a>'
+    api = "".join(
+        f'<a href="{esc(path)}">{nav_icon(name)}{esc(label)}</a>'
+        for name, path, label in (
+            ("guide", "/llms.txt", "Markdown guide"),
+            ("stats", link("/v1/stats", range=rng), "Stats JSON"),
+            ("openapi", "/openapi.json", "OpenAPI"),
+            ("targets", "/v1/targets", "Targets JSON"),
+        )
     )
     ranges = "".join(
         f'<a href="{esc(link(PAGES[page][0], **{**params, "range": name}))}"'
@@ -602,7 +638,7 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
         remote = (
             f'<a class="remote-link" href="{esc(link("/ui/exec", target=row["id"]))}" '
             f'aria-label="Remote execute on {esc(row["label"])}">{TERMINAL_ICON}Remote</a>'
-            if up
+            if up and row.get("terminal_shells")
             else ""
         )
         terms = (

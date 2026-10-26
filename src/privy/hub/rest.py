@@ -31,6 +31,7 @@ from privy.hub.service import (
     HubService,
     Param,
 )
+from privy.hub.terminals import TerminalBridge
 
 #: How often a live stream re-checks a job that produces no output.
 STREAM_POLL_S = 1.0
@@ -214,6 +215,7 @@ class RestApi:
 
     def __init__(self, service: HubService) -> None:
         self.service = service
+        self.terminals = TerminalBridge(service)
         self.base_url = "http://127.0.0.1"
 
     def base_url_for(self, headers: Mapping[str, str]) -> str:
@@ -230,6 +232,9 @@ class RestApi:
         body: bytes,
     ) -> HttpResponse:
         base_url = self.base_url_for(headers)
+        terminal_response = self.terminals.route(method, path, headers, body)
+        if terminal_response is not None:
+            return terminal_response
         ui = dashboard.PAGES
         documents: dict[str, Callable[[], HttpResponse]] = {
             "/": lambda: self.home(query, headers, base_url),
@@ -427,6 +432,13 @@ class RestApi:
                 "method": "GET",
                 "description": RELAYS_TITLE,
                 "rest_only": True,
+            },
+            "terminals": {
+                "endpoint": f"{base_url}/v1/terminals",
+                "protocol_version": 1,
+                "shells": ["powershell", "bash"],
+                "rest_only": True,
+                "requires": "listener capabilities.terminal version 1",
             },
             "mcp": {
                 "endpoint": f"{base_url}{MCP_PATH}",
@@ -748,6 +760,74 @@ def openapi_document(service: HubService, base_url: str) -> dict[str, Any]:
             },
         }
     }
+    for action in ("open", "read", "write", "resize", "close"):
+        path = "/v1/terminals" if action == "open" else f"/v1/terminals/{{session_id}}/{action}"
+        properties: dict[str, Any] = {"owner": {"type": "string", "minLength": 16, "maxLength": 128}}
+        required = ["owner"]
+        if action == "open":
+            properties.update(
+                {
+                    "target": {"type": "string"},
+                    "shell": {"type": "string", "enum": ["powershell", "bash"]},
+                    "request_id": {"type": "string", "minLength": 16, "maxLength": 128},
+                }
+            )
+            required += ["target", "shell", "request_id"]
+        if action in ("open", "resize"):
+            properties.update(
+                {
+                    "cols": {"type": "integer", "minimum": 2, "maximum": 500, "default": 80},
+                    "rows": {"type": "integer", "minimum": 2, "maximum": 300, "default": 24},
+                }
+            )
+        if action == "read":
+            properties.update(
+                {
+                    "offset": {"type": "integer", "minimum": 0, "default": 0},
+                    "wait_s": {"type": "number", "minimum": 0, "maximum": 2, "default": 1},
+                    "max_bytes": {"type": "integer", "minimum": 1, "maximum": 32768, "default": 32768},
+                }
+            )
+        if action == "write":
+            properties.update(
+                {
+                    "seq": {"type": "integer", "minimum": 0},
+                    "data_b64": {"type": "string", "maxLength": 43692},
+                    "user_input": {"type": "boolean", "default": True},
+                }
+            )
+            required += ["seq", "data_b64"]
+        if action == "close":
+            properties["target"] = {"type": "string", "description": "Required if closing a pending creation"}
+        spec = {
+            "operationId": f"terminal_{action}",
+            "summary": f"{action.title()} a native interactive terminal",
+            "description": "REST-only, owner-scoped terminal protocol v1. Requires an explicitly capable listener. "
+            "Uses real PowerShell/Bash PTY sessions, not one-shot jobs. Local Host and same-origin checks apply.",
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {"type": "object", "required": required, "properties": properties},
+                    }
+                },
+            },
+            "responses": {
+                "200": {
+                    "description": "Terminal state, output watermark, input acknowledgement, and idle time",
+                    "content": {"application/json": {"schema": {"type": "object"}}},
+                },
+                **{
+                    str(status): {"$ref": "#/components/responses/Error"}
+                    for status in (400, 403, 404, 409, 410, 415, 429, 502)
+                },
+            },
+        }
+        if action != "open":
+            spec["parameters"] = [
+                {"name": "session_id", "in": "path", "required": True, "schema": {"type": "string"}}
+            ]
+        paths[path] = {"post": spec}
     paths["/healthz"] = {
         "get": {
             "operationId": "health",

@@ -44,6 +44,7 @@ from privy.executor import execute, seed_inprocess_globals, set_echo_output
 from privy.info import LISTENER_INFO_KIND, collect_listener_info
 from privy.protocol import ExecRequest, ExecResponse
 from privy.proxy import PROXY_KIND, ProxyRequest, handle_proxy_request
+from privy.terminal import TerminalManager
 from privy.transfer import FILE_TRANSFER_KIND, handle_transfer_request
 
 CONTROL_CHANNEL_BODY_LIMIT = 64 * 1024
@@ -184,6 +185,7 @@ class RelayServer:
         self._proxy_target = proxy_target
         self._token_expires_at: int | None = None
         self._started_at = time.time()
+        self._terminals = TerminalManager()
 
         # Output of every job is copied to this process's stdout/stderr (prefixed
         # with the job id) as it is produced; pass False for shared/sensitive logs.
@@ -206,6 +208,7 @@ class RelayServer:
     def stop(self) -> None:
         """Signal the serve loop to exit after the current iteration."""
         self._stop.set()
+        self._terminals.close()
 
     def wait_until_listening(self, timeout: float | None = None) -> bool:
         """Block until the listener websocket is connected (useful for tests)."""
@@ -237,6 +240,7 @@ class RelayServer:
                         return
                     backoff = min(backoff * 2, 30.0)
         finally:
+            self._terminals.close()
             if self._pool is not None:
                 self._pool.shutdown(wait=False, cancel_futures=True)
                 self._pool = None
@@ -446,8 +450,11 @@ class RelayServer:
                     collect_listener_info(
                         started_at=self._started_at,
                         proxy_enabled=bool(self._proxy_target),
+                        terminal_capabilities=self._terminals.capabilities(),
                     )
                 )
+            if isinstance(raw_obj, dict) and raw_obj.get("kind") == "terminal":
+                return json.dumps(self._terminals.handle(raw_obj))
             if isinstance(raw_obj, dict) and raw_obj.get("kind") == FILE_TRANSFER_KIND:
                 log.info("FILE %s %s", raw_obj.get("action", "unknown"), raw_obj.get("path", ""))
                 return handle_transfer_request(payload_raw).to_json()

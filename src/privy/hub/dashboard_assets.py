@@ -5,7 +5,7 @@ CSS = """
 --accent-soft:#e8f5f1;--blue:#4975c8;--orange:#b76923;--orange-soft:#fff5e8;--red:#bb5160;--red-soft:#fdeef0;
 --purple:#7d65ba;--nav:#132c31;--nav-text:#b6c9cb;--code:#f7f9fb;
 --mono:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
-font-family:Inter,"Segoe UI",system-ui,-apple-system,sans-serif;color-scheme:light dark}
+--sans:Inter,"Segoe UI",system-ui,-apple-system,sans-serif;font-family:var(--sans);color-scheme:light dark}
 @media (prefers-color-scheme:dark){:root{--bg:#10181e;--paper:#17232b;--ink:#e2ebef;--muted:#a0b2bd;--faint:#7f929f;
 --line:#2d3c46;--accent:#67c7b7;--accent-soft:#1a3936;--blue:#90b3ef;--orange:#e5ae72;--orange-soft:#382c23;
 --red:#f09aa6;--red-soft:#3a2328;--purple:#b5a1e5;--nav:#0c2025;--code:#132029}}
@@ -20,9 +20,10 @@ display:flex;flex-direction:column;z-index:20}
 .nav-label{margin:36px 10px 12px;color:#739399;letter-spacing:1.6px;font-size:9px;font-weight:700}
 .sidebar nav{display:grid;gap:4px}
 .sidebar nav a{color:var(--nav-text);padding:9px 10px;border-radius:7px;font-size:12px;display:flex;
-justify-content:space-between}
+justify-content:flex-start;align-items:center;gap:9px}
+.sidebar nav svg{width:16px;height:16px;flex-shrink:0;stroke-linecap:round;stroke-linejoin:round}
 .sidebar nav a:hover,.sidebar nav a.on{background:#284247;color:#fff;text-decoration:none}
-.sidebar nav a span{font-size:9px;color:#97b5b6;background:#ffffff10;padding:1px 6px;border-radius:4px}
+.sidebar nav a span{font-size:9px;color:#97b5b6;background:#ffffff10;padding:1px 6px;border-radius:4px;margin-left:auto}
 .sidebar .app{margin-top:auto;padding:14px 10px 0;border-top:1px solid #ffffff17;font:9px/1.8 var(--mono);
 color:#7c9c9f;overflow-wrap:anywhere}
 .shell{margin-left:210px}.nw{white-space:nowrap}

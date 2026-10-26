@@ -498,6 +498,13 @@ class RelayClient:
 
     # ---- internals -----------------------------------------------------
 
+    def terminal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Exchange a versioned interactive terminal request without running a one-shot job."""
+        return self._post_json(
+            json.dumps({**payload, "kind": "terminal", "protocol_version": 1}),
+            http_timeout_s=20.0,
+        )
+
     def _send_raw(self, request: ExecRequest, *, http_timeout_s: float | None = None) -> ExecResponse:
         started = time.monotonic()
         payload = self._post_json(

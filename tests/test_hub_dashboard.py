@@ -304,3 +304,30 @@ def test_hycos_page_has_a_search_box_with_per_row_search_keys(hub):
     assert "up" in keys["dev%2Fbox1_windows"].split()
     assert "gpu1_linux" in keys["contoso-lab%2Fgpu1_linux"]
     assert re.search(r'target=dev%2Fbox2_windows" data-q="[^"]*" data-up="0"', text)
+
+
+@pytest.mark.parametrize("path", ["/ui", "/ui/hycos", "/ui/exec", "/ui/logs", "/ui/jobs"])
+def test_all_sidebar_links_have_consistent_decorative_icons(hub, path):
+    text = html_of(hub.call("GET", path, headers=BROWSER))
+    sidebar = re.search(r'<aside class="sidebar">([\s\S]*?)</aside>', text).group(1)
+    links = re.findall(r'<a href="([^"]*)"[^>]*>([\s\S]*?)</a>', sidebar)
+    assert len(links) == 9
+    for _, content in links:
+        assert content.count("<svg ") == 1
+        assert 'viewBox="0 0 24 24"' in content
+        assert 'aria-hidden="true"' in content
+        assert 'stroke="currentColor"' in content
+        assert re.sub(r"<[^>]*>", "", content).strip()
+    assert {href.split("?")[0] for href, _ in links} == {
+        "/ui",
+        "/ui/hycos",
+        "/ui/exec",
+        "/ui/logs",
+        "/ui/jobs",
+        "/llms.txt",
+        "/v1/stats",
+        "/openapi.json",
+        "/v1/targets",
+    }
+    assert "<span>4</span>" in sidebar
+    assert re.search(r'<a href="[^"]*" class="on"><svg', sidebar)

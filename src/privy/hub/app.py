@@ -188,6 +188,8 @@ class HubApp:
         if method == "POST" and path == MCP_PATH:
             return "MCP " + _describe_mcp(body)
         label = f"REST {method} {_printable(unquote(target))}"
+        if path and (path == "/v1/terminals" or path.startswith("/v1/terminals/")):
+            return label
         return f"{label} {_describe_body(body)}" if body else label
 
     def log_call(self, method: str, target: str, body: bytes, response: HttpResponse, seconds: float) -> None:
@@ -338,6 +340,7 @@ class HubRuntime:
         self.server.serve_forever(poll_interval=0.5)
 
     def shutdown(self) -> None:
+        self.app.rest.terminals.close()
         self.server.shutdown()
         self.server.server_close()
 

@@ -150,7 +150,93 @@ function Test-PrivyHub {
     if ($LASTEXITCODE -ne 0 -or $stream -notcontains $ListenerId -or $stream[-1] -notmatch ' state=succeeded exit=0 ') {
         throw "Windows binary hub stream did not carry the listener's output: $($stream -join ' | ')"
     }
+    Test-PrivyNativeTerminals -Url $url -TargetId $targetId
     Write-Host "Windows binary hub probed the listener and ran PowerShell on it through the Relay."
+}
+
+function Test-PrivyNativeTerminals {
+    param([string] $Url, [string] $TargetId)
+
+    $detail = Invoke-RestMethod -Uri "$Url/v1/targets/$([Uri]::EscapeDataString($TargetId))?refresh=true" -TimeoutSec 120
+    $capability = $detail.listener_info.capabilities.terminal
+    if ($capability.version -ne 1 -or "powershell" -notin $capability.shells) {
+        throw "Windows binary listener does not advertise native PowerShell terminals"
+    }
+    foreach ($shell in @("powershell", "bash")) {
+        if ($shell -notin $capability.shells) {
+            continue
+        }
+        $owner = [Guid]::NewGuid().ToString("N")
+        $id = [Guid]::NewGuid().ToString("N")
+        $base = "$Url/v1/terminals/$id"
+        try {
+            $open = @{ owner = $owner; request_id = $id; target = $TargetId; shell = $shell; cols = 90; rows = 28 }
+            $result = Invoke-RestMethod -Method Post -Uri "$Url/v1/terminals" -ContentType "application/json" -Body ($open | ConvertTo-Json) -TimeoutSec 120
+            if (-not $result.ok -or $result.state -ne "running") {
+                throw "Frozen $shell terminal did not start"
+            }
+            $commands = if ($shell -eq "powershell") {
+                @('$PrivyNative="persisted"', 'Write-Output ("NATIVE=" + $PrivyNative)')
+            }
+            else {
+                @('PRIVY_NATIVE=persisted', 'printf "NATIVE=%s\n" "$PRIVY_NATIVE"')
+            }
+            for ($seq = 0; $seq -lt $commands.Count; $seq++) {
+                $inputBody = @{
+                    owner = $owner; seq = $seq; user_input = $true
+                    data_b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($commands[$seq] + "`r"))
+                }
+                $result = Invoke-RestMethod -Method Post -Uri "$base/write" -ContentType "application/json" -Body ($inputBody | ConvertTo-Json) -TimeoutSec 120
+                if (-not $result.ok) {
+                    throw "Frozen $shell terminal rejected input"
+                }
+            }
+            $output = ""
+            $carry = ""
+            $offset = 0
+            $deadline = [DateTime]::UtcNow.AddSeconds(45)
+            while (-not $output.Contains("NATIVE=persisted") -and [DateTime]::UtcNow -lt $deadline) {
+                $read = @{ owner = $owner; offset = $offset; wait_s = 1 } | ConvertTo-Json
+                $result = Invoke-RestMethod -Method Post -Uri "$base/read" -ContentType "application/json" -Body $read -TimeoutSec 120
+                if (-not $result.ok) {
+                    throw "Frozen $shell terminal could not be read"
+                }
+                $chunk = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($result.data_b64))
+                $output += $chunk
+                $carry += $chunk
+                $queries = [regex]::Matches($carry, [regex]::Escape(([string][char]27 + "[6n"))).Count
+                if ($queries) {
+                    $reply = @{
+                        owner = $owner; seq = $seq; user_input = $false
+                        data_b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((([string][char]27 + "[1;1R") * $queries)))
+                    }
+                    $ack = Invoke-RestMethod -Method Post -Uri "$base/write" -ContentType "application/json" -Body ($reply | ConvertTo-Json) -TimeoutSec 120
+                    if (-not $ack.ok) {
+                        throw "Frozen $shell terminal rejected its device response"
+                    }
+                    $seq++
+                }
+                if ($carry.Length -gt 3) {
+                    $carry = $carry.Substring($carry.Length - 3)
+                }
+                $offset = $result.offset
+                if ($result.state -ne "running" -and -not $output.Contains("NATIVE=persisted")) {
+                    throw "Frozen $shell terminal exited before preserving state"
+                }
+            }
+            if (-not $output.Contains("NATIVE=persisted")) {
+                throw "Frozen $shell terminal did not preserve state across separate input requests"
+            }
+            Write-Host "Frozen $shell terminal preserved state through the Relay."
+        }
+        finally {
+            $close = @{ owner = $owner; target = $TargetId } | ConvertTo-Json
+            $result = Invoke-RestMethod -Method Post -Uri "$base/close" -ContentType "application/json" -Body $close -TimeoutSec 120
+            if (-not $result.ok) {
+                throw "Frozen $shell terminal cleanup failed"
+            }
+        }
+    }
 }
 
 Assert-PrivyWindowsX64Binary -Path $binary
