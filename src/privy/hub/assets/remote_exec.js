@@ -37,6 +37,17 @@
   const fit = new FitAddon.FitAddon();
   terminal.loadAddon(fit);
   terminal.open($("exec-terminal"));
+  const composer = PrivyComposer.create({
+    submit: submitCommand,
+    focusTerminal: () => terminal.focus(),
+    interrupt: () => {
+      const s = session;
+      if (s?.phase === "connected") {
+        try { enqueue(s, "\x03", true); }
+        catch (error) { message(error.message); }
+      }
+    }
+  });
   for (const name of ["keydown", "input", "paste"]) {
     $("exec-terminal").addEventListener(name, event => {
       if (event.isTrusted) {
@@ -59,6 +70,7 @@
     $("exec-disconnect").disabled = !session;
     $("exec-reconnect").hidden = !session || session.phase !== "interrupted";
     terminal.options.disableStdin = !session || session.phase !== "connected";
+    composer.availability(session?.phase === "connected", session?.phase === "interrupted");
   }
   function status(text, live = false) {
     $("exec-state").textContent = text;
@@ -69,6 +81,7 @@
     const target = targets.find(item => item.id === $("exec-target").value);
     $("exec-language").replaceChildren(...(target ? target.languages : []).map(shell => new Option(labels[shell], shell)));
     if (target) $("exec-language").value = target.languages.includes(preferred) ? preferred : target.default;
+    composer.context(target?.id || "", $("exec-language").value);
     $("exec-machine-note").textContent = target
       ? `${target.host || target.label} · ${target.os || "Remote host"} · Real interactive shell`
       : "No matching online terminal-capable listeners. Upgrade a listener to enable its Remote action.";
@@ -149,17 +162,19 @@
       while (session === s && s.phase === "connected" && (s.pending || s.queue.length)) {
         if (!s.pending) {
           const chunks = [];
-          let length = 0, activity = false;
+          let length = 0, activity = false, receipt = null;
           while (s.queue.length && length + s.queue[0].bytes.length <= 16384) {
             const chunk = s.queue.shift();
             chunks.push(chunk.bytes);
             length += chunk.bytes.length;
             activity ||= chunk.activity;
+            receipt ||= chunk.receipt;
+            if (receipt) break;
           }
           const bytes = new Uint8Array(length);
           let position = 0;
           for (const chunk of chunks) { bytes.set(chunk, position); position += chunk.length; }
-          s.pending = {bytes, activity};
+          s.pending = {bytes, activity, receipt};
         }
         const data = s.pending;
         const result = await request(s, "write", {
@@ -170,27 +185,36 @@
         s.queued -= data.bytes.length;
         s.seq = result.next_seq;
         updateIdle(s, result);
+        if (session === s && data.receipt) composer.delivered(data.receipt);
       }
     } catch (error) { interrupted(s, error); }
     finally { s.writing = false; }
   }
-  terminal.onData(data => {
-    const s = session;
-    if (!s || s.phase !== "connected") return;
+  function enqueue(s, data, activity, receipt = null) {
     const bytes = encoder.encode(data);
     if (s.queued + bytes.length > 262144) {
-      message("Input queue is full. Wait for the listener before pasting more text.");
-      return;
+      throw new Error("Input queue is full. Wait for the listener before sending more text.");
     }
     for (let begin = 0; begin < bytes.length;) {
       let end = Math.min(begin + 16384, bytes.length);
       while (end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--;
-      s.queue.push({bytes: bytes.slice(begin, end), activity: performance.now() - userGestureAt < 1000});
+      s.queue.push({bytes: bytes.slice(begin, end), activity, receipt});
       begin = end;
     }
     s.queued += bytes.length;
     clearTimeout(s.flushTimer);
     s.flushTimer = setTimeout(() => void flush(s), 16);
+  }
+  function submitCommand(text, receipt) {
+    const s = session;
+    if (!s || s.phase !== "connected") throw new Error("Connect to your shell before running a command.");
+    enqueue(s, PrivyComposer.encode(text, s.shell, terminal.modes.bracketedPasteMode), true, receipt);
+  }
+  terminal.onData(data => {
+    const s = session;
+    if (!s || s.phase !== "connected") return;
+    try { enqueue(s, data, performance.now() - userGestureAt < 1000); }
+    catch (error) { message(error.message); }
   });
   async function connect() {
     if (session || leaving) return;
@@ -221,7 +245,7 @@
       s.phase = "connected";
       updateIdle(s, result);
       status("Connected", true);
-      terminal.focus();
+      composer.focus();
       void readLoop(s);
     } catch (error) { interrupted(s, error); }
   }
@@ -258,7 +282,7 @@
     await flush(s);
     if (s.phase === "connected") {
       void readLoop(s);
-      terminal.focus();
+      composer.focus();
     }
   });
   $("exec-target").addEventListener("change", async () => {
@@ -271,6 +295,7 @@
   $("exec-language").addEventListener("change", async () => {
     const s = session;
     if (s && !await disconnect()) $("exec-language").value = s.shell;
+    composer.context($("exec-target").value, $("exec-language").value);
   });
   $("exec-search").addEventListener("input", () => {
     if (!session) renderTargets($("exec-target").value, $("exec-language").value);

@@ -13,9 +13,10 @@ Hybrid Connection pattern used in the reference ``relay-demo``:
       {"address": "wss://…"}}``; we open that sub-websocket and the request
       frame + body arrive there; we also send the response there.
 * For inline requests the *body* must be read on the control socket in arrival
-  order, but execution then moves to the thread pool and the response frame is
-  written back under a lock (each frame carries its ``requestId``, so replies
-  may complete out of order). Without this a single slow request — notably a
+  order, but execution then moves to the thread pool. Workers queue small
+  responses for the control-loop thread, which owns both TLS reads and writes
+  (each frame carries its ``requestId``, so replies may complete out of order).
+  Without this a single slow request — notably a
   long-polling ``action="poll"`` — would stall every other sender. For
   rendezvous requests we hand the whole exchange to the pool.
 """
@@ -24,6 +25,8 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
+import select
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -260,6 +263,7 @@ class RelayServer:
     def _serve_once(self) -> None:
         ws = websocket.create_connection(self._listen_url())
         ws.settimeout(self._recv_timeout_s)
+        responses: queue.Queue[tuple[Any, str]] = queue.Queue(maxsize=self._max_workers * 2)
         self._listening.set()
         remaining = max(0, (self._token_expires_at or 0) - int(time.time()))
         log.info(
@@ -271,6 +275,9 @@ class RelayServer:
 
         try:
             while not self._stop.is_set():
+                self._flush_control_responses(ws, responses)
+                if not self._control_readable(ws):
+                    continue
                 try:
                     raw = ws.recv()
                 except websocket.WebSocketTimeoutException:
@@ -294,7 +301,7 @@ class RelayServer:
                     # Inline mode: body (if any) comes on the same control
                     # socket, and the response goes back on it too. Read the
                     # body here (ordering matters), then execute off-thread.
-                    self._handle_inline(ws, req_meta)
+                    self._handle_inline(ws, req_meta, response_queue=responses)
                 else:
                     # Rendezvous mode: hand off to a worker which opens a
                     # dedicated sub-websocket per request, leaving the
@@ -314,7 +321,32 @@ class RelayServer:
     #   2) execute the request
     #   3) write a response frame (+ body frame) back on `opws`
 
-    def _handle_inline(self, ws: websocket.WebSocket, req_meta: dict[str, Any]) -> None:
+    def _control_readable(self, ws: websocket.WebSocket) -> bool:
+        sock = ws.sock
+        if sock is None:
+            raise websocket.WebSocketConnectionClosedException("control socket is closed")
+        pending = getattr(sock, "pending", None)
+        if pending is not None and pending():
+            return True
+        return bool(select.select([sock], [], [], max(0.001, min(self._recv_timeout_s, 0.025)))[0])
+
+    def _flush_control_responses(
+        self, ws: websocket.WebSocket, responses: queue.Queue[tuple[Any, str]]
+    ) -> None:
+        for _ in range(self._max_workers * 2):
+            try:
+                request_id, body = responses.get_nowait()
+            except queue.Empty:
+                break
+            self._send_response(ws, request_id, body)
+
+    def _handle_inline(
+        self,
+        ws: websocket.WebSocket,
+        req_meta: dict[str, Any],
+        *,
+        response_queue: queue.Queue[tuple[Any, str]] | None = None,
+    ) -> None:
         try:
             payload_raw = self._maybe_recv_body(ws, req_meta)
         except Exception as exc:  # noqa: BLE001
@@ -327,7 +359,11 @@ class RelayServer:
             try:
                 result = self._execute(payload_raw, request_id=request_id)
                 body = result if isinstance(result, str) else result.to_json()
-                self._send_inline_response(ws, req_meta, request_id, body)
+                if response_queue is not None and len(body.encode("utf-8")) <= CONTROL_CHANNEL_BODY_LIMIT:
+                    # SSL sockets must not send in a worker while the control loop receives.
+                    response_queue.put((request_id, body), timeout=self._recv_timeout_s)
+                else:
+                    self._send_inline_response(ws, req_meta, request_id, body)
             except Exception as exc:  # noqa: BLE001
                 log.error(
                     "inline request handler crashed (%s: %s)",
