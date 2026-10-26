@@ -42,6 +42,49 @@ every request, so startup is instant and works without an Azure login.
 For an always-on hub, install the `PrivyHub` logon task described in
 [Scheduled tasks](SCHEDULED_TASKS.md#2-install-the-hub-task).
 
+## Remote Exec workspace
+
+Open **Remote Exec** in the dashboard sidebar at `/ui/exec`, or click the small **Remote** terminal
+action beside an online Relay HYCO. The action selects that exact HYCO, including its relay
+namespace; it never starts a command by itself.
+
+Search online machines, choose a language, write a multiline script, and select **Run script** or
+press **Ctrl+Enter** (**Cmd+Enter** on macOS). The workspace checks the selected listener again
+before submission. Only languages with an advertised, installed subprocess runtime appear:
+PowerShell, Bash, and Python where available. Python advertised only for the listener's shared
+notebook/in-process interpreter is deliberately not offered: it cannot provide fresh-process
+isolation. Older listeners with no runtime information show no verified languages; **Refresh
+targets** requests capability discovery without running a script.
+
+Each run starts a **fresh process**, not an interactive terminal. Working directory and variables do
+not persist; include `cd` and subsequent commands in the same script. Programs that prompt for input
+are not supported. **Tab** accepts an active local suggestion or inserts indentation; **Ctrl+Space**
+opens language snippets and matching recent scripts. Arrow keys select suggestions, **Escape**
+closes them, and **Shift+Tab** leaves the editor. Suggestions do not run commands and are not
+semantic IntelliSense or remote path completion.
+
+Output follows in separate stdout/stderr panels using explicit byte offsets, without consuming
+another client's read cursor. Long output is bounded in the browser; **Full log** opens all output
+still retained by the hub. The state badge shows completion and exit status. **Cancel job** requests
+remote cancellation; closing or navigating away does not cancel a job. After a connection failure,
+use **Reconnect**, not a second submission. The URL includes the job identifier so reloading can
+reattach without executing again.
+
+**Recent runs** is scoped to the selected HYCO and shows retained subprocess jobs. **Open output**
+reattaches without running code; **Load script** puts an existing script in the editor for an
+explicit rerun. Oversized scripts cannot be loaded partially. Drafts survive target/language changes
+and automatic refresh in memory only; reloading the page discards unsent drafts. Executed scripts
+remain subject to the existing hub audit/history policy, so do not paste secrets.
+
+The workspace uses the existing job API and unchanged listeners. All assets remain self-contained
+under the dashboard CSP, with the same loopback and same-origin protections as other hub operations.
+
+For development, `./scripts/check_hub_browser.sh` runs the Chromium regression suite against an
+isolated fake-listener hub on port 7750, including editing, completion, refresh, rerun,
+cancellation, reconnection, output escaping, and responsive layout. It requires Chromium's system
+libraries (`uv run --with playwright==1.64.1 python -m playwright install-deps chromium` on a new
+Linux host). This suite is also a PR CI gate; it does not contact real listeners.
+
 ## Use it from an LLM
 
 Everything is plain HTTP:

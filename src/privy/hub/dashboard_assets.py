@@ -259,6 +259,10 @@ JS = r"""
 
   let busy = false;
   async function refresh() {
+    if ($("#remote-exec")) {
+      document.dispatchEvent(new Event("remote-exec-refresh"));
+      return;
+    }
     if (busy) return;
     busy = true;
     try {

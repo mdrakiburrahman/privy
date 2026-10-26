@@ -20,6 +20,7 @@ from urllib.parse import quote, urlencode
 from privy.hub.dashboard_assets import CSS, JS
 from privy.hub.metrics import BAD_STATES, DEFAULT_RANGE, RANGES, JobEntry
 from privy.hub.registry import ONLINE, UNKNOWN, ProbeResult
+from privy.hub.remote_exec import EXEC_CSS, EXEC_JS, TERMINAL_ICON, workspace
 from privy.hub.responses import HTML_TYPE, TEXT_TYPE, HttpResponse, error_response
 
 log = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ OPEN_NEWEST = 3
 PAGES = {
     "overview": ("/ui", "Overview"),
     "hycos": ("/ui/hycos", "Relay HYCOs"),
+    "exec": ("/ui/exec", "Remote Exec"),
     "logs": ("/ui/logs", "Logs"),
     "jobs": ("/ui/jobs", "Jobs"),
 }
@@ -288,7 +290,7 @@ def shell(
     }
     nav = "".join(
         f'<a href="{esc(link(path, range=rng if rng != DEFAULT_RANGE else None))}"'
-        f"{ON if name == page else ''}>{esc(label)}"
+        f"{ON if name == page else ''}>{TERMINAL_ICON if name == 'exec' else ''}{esc(label)}"
         + (f"<span>{fmt_int(nav_counts[name])}</span>" if name in nav_counts else "")
         + "</a>"
         for name, (path, label) in PAGES.items()
@@ -320,7 +322,7 @@ def shell(
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex"><title>{esc(title)} · privy hub</title>
-<style nonce="{nonce}">{CSS}</style></head>
+<style nonce="{nonce}">{CSS}{EXEC_CSS}</style></head>
 <body>
 <aside class="sidebar"><div class="brand"><b>privy hub</b><small>CONTROL PLANE</small></div>
 <div class="nav-label">VIEWS</div><nav id="nav">{nav}</nav>
@@ -333,7 +335,7 @@ def shell(
 <main class="main" id="main">
 {main}
 </main></div>
-<script nonce="{nonce}">{JS}</script>
+<script nonce="{nonce}">{JS}{EXEC_JS if page == "exec" else ""}</script>
 </body></html>
 """
 
@@ -597,6 +599,12 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
             row["reason"] or os_line or (row["listener_version"] and f"privy {row['listener_version']}")
         )
         up = row["status"] == ONLINE
+        remote = (
+            f'<a class="remote-link" href="{esc(link("/ui/exec", target=row["id"]))}" '
+            f'aria-label="Remote execute on {esc(row["label"])}">{TERMINAL_ICON}Remote</a>'
+            if up
+            else ""
+        )
         terms = (
             row["label"],
             row["id"],
@@ -612,7 +620,7 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
             f'data-q="{esc(" ".join(str(term) for term in terms if term).lower())}" '
             f'data-up="{1 if up else 0}">'
             f'<td class="idx">{i:02d}</td>'
-            f'<td data-v="{esc(row["label"].lower())}">{hyco_cell(row)}</td>'
+            f'<td data-v="{esc(row["label"].lower())}">{hyco_cell(row)}{remote}</td>'
             f'<td data-v="{esc(row["status"])}">{state_label(row["status"])}'
             f'<span class="sub">{esc(status_sub or "")}</span></td>'
             f"<td>{sparkline(row['series'], row['failed_series'])}</td>"
@@ -941,6 +949,9 @@ def render(service: Any, page: str, query: Mapping[str, list[str]], base_url: st
         title, main = "Overview", overview_page(service, report, now)
     elif page == "hycos":
         title, main = "Relay HYCOs", hycos_page(report, now)
+    elif page == "exec":
+        title, main = "Remote Exec", workspace(service, report, _last(query, "target"))
+        params = {"target": _last(query, "target") or None}
     elif page == "logs":
         target, main = logs_page(service, report, query, now)
         title = f"Logs · {target}"

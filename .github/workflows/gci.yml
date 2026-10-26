@@ -45,6 +45,9 @@ jobs:
       - name: Check source
         run: ./scripts/check_ci.sh
 
+      - name: Check Remote Exec in Chromium
+        run: ./scripts/check_hub_browser.sh
+
       - name: Build release artifacts
         run: ./scripts/build_release.sh
 
