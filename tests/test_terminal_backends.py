@@ -91,9 +91,11 @@ def test_native_shell_preserves_state_supports_interactive_input_interrupt_resiz
             send(manager, session, "printf 'STILL=%s\\n' \"$PRIVY_STATE\"\r")
             until(manager, session, b"STILL=hello", offset)
         else:
+            # Unix PowerShell must enter raw mode before CR keystrokes are sent.
+            _, offset = until(manager, session, b"> ")
             send(manager, session, "function prompt { 'PR'+'IVY> ' }; $PrivyState='hello'\r")
             send(manager, session, "Write-Output ('STATE=' + $PrivyState)\r")
-            _, offset = until(manager, session, b"STATE=hello")
+            _, offset = until(manager, session, b"STATE=hello", offset)
             assert call(manager, "resize", session_id=session, cols=110, rows=42)["ok"]
             send(manager, session, "$answer=Read-Host 'ANSWER'; Write-Output ('REPLY=' + $answer)\r")
             _, offset = until(manager, session, b"ANSWER: ", offset)
