@@ -304,7 +304,8 @@ EXEC_JS = r"""
       if (force) await api("/v1/targets?refresh=true");
       const response = await fetch(location.href, { headers: { "X-Privy-UI": "1" } });
       if (!response.ok) throw new Error("Could not refresh workspace: HTTP " + response.status);
-      const doc = new DOMParser().parseFromString(await response.text(), "text/html");
+      const markup = (await response.text()).replace(/<(style|script)\b[\s\S]*?<\/\1>/gi, "");
+      const doc = new DOMParser().parseFromString(markup, "text/html");
       const data = doc.getElementById("exec-data");
       if (!data) throw new Error("Workspace data missing; reload the page.");
       const next = JSON.parse(data.dataset.targets);
