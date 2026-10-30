@@ -8,6 +8,7 @@ auto-refresh, and live log following.
 from __future__ import annotations
 
 import html
+import json
 import logging
 import os
 import secrets
@@ -606,12 +607,55 @@ def overview_page(service: Any, report: dict[str, Any], now: float) -> str:
 # ---- relay HYCOs ----------------------------------------------------------------------
 
 
+def purpose_cell(row: dict[str, Any]) -> str:
+    purpose = row.get("purpose") or {}
+    if not purpose.get("latest"):
+        return ""
+    target = esc(row["id"])
+    start, end = purpose["start"], purpose["end"]
+    span = max(end - start, 1)
+    segments = []
+    for segment in purpose["segments"]:
+        x = max(0, min(299, 300 * (segment["start"] - start) / span))
+        width = min(300 - x, max(1, 300 * (segment["end"] - segment["start"]) / span))
+        kind = segment["kind"]
+        color = f"pc{segment['color']}" if kind == "purpose" else f"purpose-{kind}"
+        label = segment.get("label") or ("?" if kind == "unknown" else "+")
+        title = segment["purpose"] or (
+            "Unknown: no purpose supplied" if kind == "unknown" else "Multiple purpose changes"
+        )
+        text = f'<text x="{x + width / 2:.2f}" y="12">{esc(label)}</text>' if width >= 28 else ""
+        segments.append(
+            f'<g class="purpose-segment {color}" role="button" tabindex="0" data-kind="{kind}" '
+            f'data-purpose-target="{target}" data-purpose-segment="{esc(json.dumps(segment))}" '
+            f'aria-label="{esc(title)}" aria-haspopup="dialog">'
+            f"<title>{esc(title)}</title>"
+            f'<rect x="{x:.2f}" y="1" width="{width:.2f}" height="16"/>{text}</g>'
+        )
+    latest = time.strftime("%b %d %H:%M UTC", time.gmtime(purpose["latest_at"]))
+    left = time.strftime("%Y-%m-%d %H:%M", time.gmtime(start))
+    right = time.strftime("%m-%d %H:%M UTC", time.gmtime(end))
+    unknown = (
+        '<span class="purpose-unknown-note">Latest use: unknown</span>' if purpose["latest_unknown"] else ""
+    )
+    return (
+        f'<button type="button" class="purpose-trigger" data-purpose-target="{target}" aria-haspopup="dialog">'
+        f'<span class="purpose-sentence">{esc(purpose["latest"])}</span>'
+        f'<span class="purpose-meta">{latest} · {purpose["groups"]} groups</span></button>'
+        f"{unknown}"
+        '<svg class="purpose-bar" viewBox="0 0 300 18" width="300" height="18" '
+        f'role="group" aria-label="Reported purpose over time for {target}">{"".join(segments)}</svg>'
+        f'<span class="purpose-axis"><span>{left}</span><span>{right}</span></span>'
+    )
+
+
 def hycos_page(report: dict[str, Any], now: float) -> str:
     rows = report["targets"]
     head = (
         '<tr><th class="r">#</th>'
         + sort_th("Relay HYCO")
         + sort_th("Status")
+        + sort_th("Last reported purpose")
         + sort_th(f"Jobs over {report['range']}", sort=False)
         + sort_th("Jobs", right=True)
         + sort_th("Failed", right=True)
@@ -650,6 +694,7 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
             row["user"],
             row["os"],
             status_sub,
+            (row.get("purpose") or {}).get("latest"),
         )
         body.append(
             f'<tr data-href="{esc(link("/ui/logs", target=row["id"]))}" '
@@ -659,6 +704,8 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
             f'<td data-v="{esc(row["label"].lower())}">{hyco_cell(row)}{remote}</td>'
             f'<td data-v="{esc(row["status"])}">{state_label(row["status"])}'
             f'<span class="sub">{esc(status_sub or "")}</span></td>'
+            f'<td class="purpose-cell" data-v="{esc(((row.get("purpose") or {}).get("latest") or "").lower())}">'
+            f"{purpose_cell(row)}</td>"
             f"<td>{sparkline(row['series'], row['failed_series'])}</td>"
             f'<td class="r" data-v="{row["jobs"]}">{fmt_int(row["jobs"])}</td>'
             f'<td class="r{" hot" if row["failed"] else ""}" data-v="{row["failed"]}">{fmt_int(row["failed"])}</td>'
@@ -679,8 +726,17 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
         'raki- linux (all terms must match)…" autocomplete="off"><span class="seg st"><a class="on" data-s="all">'
         'all</a><a data-s="up">up</a><a data-s="down">down</a></span><span class="chip" id="hycocount"></span></div>'
     )
+    patterns = (
+        '<svg width="0" height="0" aria-hidden="true"><defs>'
+        '<pattern id="purpose-gap" width="6" height="6" patternUnits="userSpaceOnUse">'
+        '<rect width="6" height="6" class="purpose-pattern-bg"/>'
+        '<path d="M-1 1L1-1M0 6L6 0M5 7L7 5" class="purpose-pattern-line"/></pattern>'
+        '<pattern id="purpose-mix" width="6" height="6" patternUnits="userSpaceOnUse">'
+        '<rect width="6" height="6" class="purpose-pattern-bg"/>'
+        '<path d="M0 0L6 6M0 6L6 0" class="purpose-pattern-line"/></pattern></defs></svg>'
+    )
     table = (
-        f'{toolbar}<div class="table"><table id="hycos"><thead>{head}</thead><tbody>{"".join(body)}</tbody></table>'
+        f'{patterns}{toolbar}<div class="table"><table id="hycos"><thead>{head}</thead><tbody>{"".join(body)}</tbody></table>'
         '</div><div class="empty" id="hyconone" hidden>No relay HYCOs match this search.</div>'
         if rows
         else '<div class="empty">No relays are hydrated yet. Run Sync-PrivyHubRelays.ps1 or edit relays.json.</div>'
@@ -689,6 +745,9 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
         '<p class="fine">Most used first; click a header to re-sort and a row for its logs. Sparklines show jobs '
         f"started per {esc(fmt_span(report['bucket_s']))} (red ticks: failures). Latency and uptime come from the hub's "
         "own listener probes, not from Azure.</p>"
+        '<p class="fine purpose-legend">Purpose: colors show reported work; striped gaps mean unknown; '
+        "crosshatching means multiple changes in a small interval. Hover or focus for details; click to pin history. "
+        "This is not execution duration or exclusive ownership. In memory only; resets on hub restart.</p>"
     )
     chips = (
         f'<span class="chip">{plural(report["targets_total"], "HYCO")}</span>'

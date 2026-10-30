@@ -26,6 +26,7 @@ from privy.hub.service import (
     INSTRUCTIONS,
     OPERATIONS,
     OPERATIONS_BY_NAME,
+    PURPOSE_PARAM,
     SYNC_OPERATION,
     HubError,
     HubService,
@@ -79,6 +80,7 @@ class Route:
 
 ROUTES: tuple[Route, ...] = (
     Route("GET", "/v1/targets", "list_targets"),
+    Route("GET", "/v1/purposes", "get_purpose_history"),
     Route("GET", "/v1/targets/{target}", "get_target"),
     Route("POST", "/v1/jobs", "run", raw_anchor="target", streams=True),
     Route("GET", "/v1/jobs", "list_jobs"),
@@ -770,6 +772,7 @@ def openapi_document(service: HubService, base_url: str) -> dict[str, Any]:
                     "target": {"type": "string"},
                     "shell": {"type": "string", "enum": ["powershell", "bash"]},
                     "request_id": {"type": "string", "minLength": 16, "maxLength": 128},
+                    "purpose": PURPOSE_PARAM.json_schema(),
                 }
             )
             required += ["target", "shell", "request_id"]
@@ -827,6 +830,15 @@ def openapi_document(service: HubService, base_url: str) -> dict[str, Any]:
             spec["parameters"] = [
                 {"name": "session_id", "in": "path", "required": True, "schema": {"type": "string"}}
             ]
+        else:
+            spec["requestBody"]["content"]["application/json"]["example"] = {
+                "target": example.target_id,
+                "shell": "powershell" if example.language == "powershell" else "bash",
+                "owner": "example-owner-0123456789",
+                "request_id": "example-request-0123456789",
+                "purpose": guide.EXAMPLE_PURPOSE,
+            }
+            spec["description"] += " Optional purpose is hub-only metadata; history resets on hub restart."
         paths[path] = {"post": spec}
     paths["/healthz"] = {
         "get": {

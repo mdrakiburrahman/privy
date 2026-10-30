@@ -34,6 +34,7 @@ from privy.hub.jobs import (
     StreamPiece,
     utc_iso,
 )
+from privy.hub.purpose import PurposeHistory
 from privy.hub.registry import ONLINE, UNKNOWN, ProbeResult, machine_name
 
 log = logging.getLogger("privy.hub")
@@ -204,6 +205,7 @@ class HubMetrics:
     def __init__(self, *, clock: Callable[[], float] = time.time) -> None:
         self._clock = clock
         self.started_at = clock()
+        self.purposes = PurposeHistory(clock=clock)
         self._lock = threading.Lock()
         self._entries: list[JobEntry] = []
         self._by_id: dict[str, JobEntry] = {}
@@ -217,6 +219,7 @@ class HubMetrics:
     # ---- recording ------------------------------------------------------------
 
     def job_added(self, job: HubJob) -> None:
+        self.purposes.record(job.target.id, job.purpose)
         entry = JobEntry(
             id=job.id,
             target_id=job.target.id,
@@ -447,6 +450,9 @@ class HubMetrics:
                 }
             )
         rows.sort(key=lambda row: (-row["jobs"], -(row["last_used_ts"] or 0), row["id"].lower()))
+        purposes = self.purposes.summaries(target_ids, start=start, end=now)
+        for row in rows:
+            row["purpose"] = purposes[row["id"]]
         shared = Counter(row["hybrid_connection"].lower() for row in rows)
         for row in rows:
             name = row["hybrid_connection"]

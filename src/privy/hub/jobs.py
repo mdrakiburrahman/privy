@@ -160,6 +160,7 @@ class HubJob:
         origin: str,
         output_limit: int,
         broadcast_id: str | None = None,
+        purpose: str | None = None,
     ) -> None:
         self.id = uuid.uuid4().hex[:12]
         self.type = job_type
@@ -167,6 +168,7 @@ class HubJob:
         self.spec = spec
         self.origin = origin
         self.broadcast_id = broadcast_id
+        self.purpose = purpose
         self.created_at = time.time()
         self.started_at: float | None = None
         self.finished_at: float | None = None
@@ -207,6 +209,8 @@ class HubJob:
 
     def _summary_locked(self, *, include_created: bool = False) -> dict[str, Any]:
         result: dict[str, Any] = {"job_id": self.id, "target": self.target.id}
+        if self.purpose is not None:
+            result["purpose"] = self.purpose
         if self.type == "exec":
             result["language"] = self.spec["language"]
         else:
@@ -419,6 +423,7 @@ class JobManager:
         timeout_s: float,
         origin: str,
         broadcast_id: str | None = None,
+        purpose: str | None = None,
     ) -> HubJob:
         job = HubJob(
             job_type="exec",
@@ -427,6 +432,7 @@ class JobManager:
             origin=origin,
             output_limit=self._output_limit,
             broadcast_id=broadcast_id,
+            purpose=purpose,
         )
         return self._launch(job, self._exec_body)
 
@@ -440,6 +446,7 @@ class JobManager:
         overwrite: bool,
         origin: str,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
+        purpose: str | None = None,
     ) -> HubJob:
         if direction not in ("upload", "download"):
             raise ValueError(f"invalid transfer direction: {direction!r}")
@@ -454,6 +461,7 @@ class JobManager:
             },
             origin=origin,
             output_limit=0,
+            purpose=purpose,
         )
         return self._launch(job, self._transfer_body)
 
@@ -466,6 +474,7 @@ class JobManager:
         destination_type: str,
         overwrite: bool,
         origin: str,
+        purpose: str | None = None,
     ) -> HubJob:
         job = HubJob(
             job_type="sync",
@@ -478,6 +487,7 @@ class JobManager:
             },
             origin=origin,
             output_limit=0,
+            purpose=purpose,
         )
         return self._launch(job, self._sync_body)
 
@@ -491,6 +501,7 @@ class JobManager:
         mode: str,
         timeout_s: float,
         origin: str,
+        purpose: str | None = None,
     ) -> tuple[Broadcast, list[HubJob]]:
         """Start ``code`` on every ``(target, language)`` pair."""
         broadcast_id = "b" + uuid.uuid4().hex[:11]
@@ -520,6 +531,7 @@ class JobManager:
                 timeout_s=timeout_s,
                 origin=origin,
                 broadcast_id=broadcast_id,
+                purpose=purpose,
             )
             for target, language in runs
         ]
@@ -625,12 +637,12 @@ class JobManager:
 
     def _launch(self, job: HubJob, body: Callable[[HubJob], None]) -> HubJob:
         self._ensure_capacity(1)
-        with self._lock:
-            self._jobs[job.id] = job
         try:
+            with self._lock:
+                self._jobs[job.id] = job
+                if self.on_job is not None:
+                    self.on_job(job)
             self._audit.record("job.start", **self._audit_fields(job, include_spec=True))
-            if self.on_job is not None:
-                self.on_job(job)
             thread = threading.Thread(
                 target=self._run,
                 args=(job, body),

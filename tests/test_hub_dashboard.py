@@ -96,6 +96,21 @@ def test_hycos_are_ranked_by_use_with_sparklines(hub):
     assert 'class="seg"' in text and 'href="/ui/hycos?range=7d"' in text
 
 
+def test_purpose_column_continuum_is_escaped_and_never_tagged_cells_are_blank(hub):
+    purpose = 'privy: <script>alert("purpose")</script>'
+    assert hub.call("POST", "/v1/jobs", {"target": BOX1, "code": "x", "purpose": purpose}).status == 200
+    run(hub, BOX1, "x")
+    response = hub.call("GET", "/ui/hycos")
+    text = html_of(response)
+    assert "Last reported purpose" in text
+    assert 'class="purpose-bar"' in text and 'data-kind="unknown"' in text
+    assert "Latest use: unknown" in text and "UTC" in text
+    assert "privy: &lt;script&gt;" in text and '<script>alert("purpose")' not in text
+    assert '<td class="purpose-cell" data-v=""></td>' in text
+    assert " style=" not in text
+    assert "unsafe-inline" not in response.headers["Content-Security-Policy"]
+
+
 def test_logs_show_commands_and_output_as_escaped_terminals(hub):
     job_id = run(hub, BOX1, "echo '<script>alert(1)</script>'")
 

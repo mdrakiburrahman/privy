@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from privy.client import RelayHTTPError
+from privy.hub.purpose import normalize_purpose
 from privy.hub.registry import ONLINE, TargetLookupError
 from privy.hub.responses import HttpResponse, error_response
 
@@ -93,6 +94,10 @@ class TerminalBridge:
         return isinstance(value, str) and _TOKEN.fullmatch(value) is not None
 
     def _open(self, args: dict[str, Any]) -> HttpResponse:
+        try:
+            purpose = normalize_purpose(args.get("purpose"))
+        except ValueError as exc:
+            return error_response(400, "invalid_argument", str(exc))
         request_id, target_id, shell = args.get("request_id"), args.get("target"), args.get("shell")
         if (
             not self._token(request_id)
@@ -156,6 +161,7 @@ class TerminalBridge:
             self._close_remote(request_id, binding)
             return error_response(409, "terminal_closed", "Workspace was closed while connecting.")
         if result.get("ok"):
+            self.service.metrics.purposes.record(target_id, purpose)
             self.service.jobs.audit.record(
                 "terminal.open", target=target_id, terminal_id=request_id, shell=shell
             )

@@ -6,6 +6,7 @@ text as their ``content`` (the JSON stays in ``structuredContent``).
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from collections.abc import Callable
 from typing import Any
@@ -191,6 +192,20 @@ def render_output(result: dict[str, Any], transport: str = "rest") -> str:
     return _ensure_newline(result.get("data", "")) + footer
 
 
+def render_purpose_history(result: dict[str, Any], transport: str = "rest") -> str:
+    lines = [f"Purpose history for {result['target']} ({result['range']}); in memory, resets on restart."]
+    for group in result["groups"]:
+        first = dt.datetime.fromtimestamp(group["first_at"], dt.timezone.utc).isoformat()
+        last = dt.datetime.fromtimestamp(group["last_at"], dt.timezone.utc).isoformat()
+        text = group["purpose"] if group["purpose"] is not None else "[unknown: purpose omitted]"
+        lines.append(f"{first} - {last} | {group['count']} report(s) | {text}")
+    if not result["groups"]:
+        lines.append("No reports in this window since the hub started.")
+    if result["next_cursor"]:
+        lines.append(f"Older groups: cursor={result['next_cursor']}")
+    return "\n".join(lines) + "\n"
+
+
 _RENDERERS: dict[str, Callable[[dict[str, Any], str], str]] = {
     "list_targets": render_targets,
     "get_target": render_target,
@@ -203,6 +218,7 @@ _RENDERERS: dict[str, Callable[[dict[str, Any], str], str]] = {
     "broadcast": render_broadcast,
     "get_broadcast": render_broadcast,
     "read_job_output": render_output,
+    "get_purpose_history": render_purpose_history,
 }
 
 

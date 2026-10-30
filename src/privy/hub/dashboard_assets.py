@@ -137,6 +137,42 @@ animation:blink 1s steps(1) infinite}
 @keyframes blink{50%{opacity:0}}
 .fine{color:var(--faint);font-size:10px;line-height:1.7;margin-top:12px}
 .more{display:block;text-align:center;padding:10px;font-size:11px}
+.purpose-cell{min-width:320px;max-width:340px}
+.purpose-trigger{display:block;border:0;background:transparent;color:var(--ink);text-align:left;
+padding:0;cursor:pointer;max-width:310px;font:inherit}
+.purpose-sentence{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600;color:var(--accent)}
+.purpose-meta,.purpose-unknown-note{display:block;font-size:9px;color:var(--muted);margin-top:3px}
+.purpose-unknown-note{color:var(--orange)}
+.purpose-bar{display:block;width:300px;max-width:100%;margin-top:7px;overflow:visible}
+.purpose-segment{cursor:pointer}.purpose-segment rect{stroke:var(--paper);stroke-width:1}
+.purpose-segment text{fill:white;text-anchor:middle;font:8px var(--mono);pointer-events:none}
+.purpose-segment:hover rect,.purpose-segment:focus rect{stroke:var(--ink);stroke-width:2}
+.pc0{fill:#087f78}.pc1{fill:#4975c8}.pc2{fill:#9662ac}.pc3{fill:#b77732}
+.pc4{fill:#3e889e}.pc5{fill:#b56179}.pc6{fill:#758549}.pc7{fill:#667889}
+.purpose-unknown{fill:url(#purpose-gap)}.purpose-mixed{fill:url(#purpose-mix)}
+.purpose-pattern-bg{fill:var(--line)}.purpose-pattern-line{stroke:var(--muted);stroke-width:1}
+.purpose-axis{display:flex;justify-content:space-between;font:8px var(--mono);color:var(--muted);margin-top:4px}
+.purpose-panel{position:fixed;z-index:60;width:420px;max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);
+display:flex;flex-direction:column;background:var(--paper);border:1px solid var(--line);border-radius:10px;
+box-shadow:0 12px 45px #102e3130;color:var(--ink);overflow:hidden}
+.purpose-panel.pinned{inset:0 0 0 auto!important;width:460px;max-width:100vw;height:100vh;max-height:100vh;border-radius:0}
+.purpose-panel header{display:flex;align-items:start;gap:12px;padding:17px;border-bottom:1px solid var(--line)}
+.purpose-panel h2{font-size:15px}.purpose-target{font:10px var(--mono);overflow-wrap:anywhere;color:var(--muted);margin-top:4px}
+.purpose-panel button{cursor:pointer;border:1px solid var(--line);background:var(--paper);color:var(--accent);
+padding:5px 9px;border-radius:5px;font:11px var(--sans)}
+.purpose-panel [data-purpose-close]{margin-left:auto}
+.purpose-selection{padding:10px 17px;border-bottom:1px solid var(--line);background:var(--code);font-size:11px;overflow-wrap:anywhere}
+.purpose-selection p{color:var(--muted);font-size:10px;margin-top:5px}
+.purpose-entries{overflow:auto;overscroll-behavior:contain;min-height:60px;max-height:330px;padding:12px 18px}
+.purpose-panel.pinned .purpose-entries{flex:1;max-height:none}
+.purpose-entry{border-left:2px solid var(--line);padding:0 0 18px 14px;overflow-wrap:anywhere}
+.purpose-entry.selected{border-left-color:var(--accent);background:var(--accent-soft)}
+.purpose-entry time{font:9px var(--mono);color:var(--muted)}
+.purpose-entry h3{margin:5px 0;font-size:12px}.purpose-entry p{font-size:10px;color:var(--muted)}
+.purpose-panel footer{padding:12px 17px;border-top:1px solid var(--line);font-size:10px;color:var(--muted)}
+.purpose-panel footer p{margin-bottom:8px}.purpose-panel [role=alert]{padding:0 17px;color:var(--red);font-size:11px}
+.purpose-panel .purpose-loading{padding:4px 17px;color:var(--muted);font-size:11px}
+.purpose-trigger:focus-visible,.purpose-panel button:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 """
 
 JS = r"""
@@ -260,6 +296,7 @@ JS = r"""
 
   let busy = false;
   async function refresh() {
+    if (document.querySelector("#purpose-panel:not([hidden])")) return;
     if ($("#remote-exec")) {
       document.dispatchEvent(new Event("remote-exec-refresh"));
       return;
@@ -270,6 +307,7 @@ JS = r"""
       const res = await fetch(location.href, { headers: { "X-Privy-UI": "1", "Accept": "text/html" } });
       if (!res.ok) return;
       const html = (await res.text()).replace(/<(style|script)\b[\s\S]*?<\/\1>/gi, "");
+      if (document.querySelector("#purpose-panel:not([hidden])")) return;
       const doc = new DOMParser().parseFromString(html, "text/html");
       const open = new Map($$("details[id]").map(d => [d.id, d.open]));
       const keep = new Map($$("details.term[data-following]").map(d => [d.id, d]));
@@ -306,7 +344,7 @@ JS = r"""
     const sseg = e.target.closest(".seg.st a");
     if (sseg) { e.preventDefault(); $$(".seg.st a").forEach(a => a.classList.toggle("on", a === sseg)); applyFilters(); return; }
     const tr = e.target.closest("tr[data-href]");
-    if (tr && !e.target.closest("a") && !getSelection().toString()) location.href = tr.dataset.href;
+    if (tr && !e.target.closest("a,button,[role=button]") && !getSelection().toString()) location.href = tr.dataset.href;
   });
   document.addEventListener("input", e => { if (e.target.matches("#grep, #podq, #hycoq")) applyFilters(); });
   document.addEventListener("change", e => {
@@ -327,5 +365,156 @@ JS = r"""
   }, 10000);
   if (location.hash) { const d = document.getElementById(location.hash.slice(1)); if (d && d.tagName === "DETAILS") d.open = true; }
   init();
+})();
+
+(() => {
+  let panel, trigger, target = "", pinned = false, cursor = null, controller, hideTimer, hoverTimer;
+  const date = value => new Date(value * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
+  const make = (tag, text, cls) => {
+    const node = document.createElement(tag); if (text !== undefined) node.textContent = text;
+    if (cls) node.className = cls; return node;
+  };
+  function ensurePanel() {
+    if (panel) return;
+    panel = make("section", undefined, "purpose-panel");
+    panel.id = "purpose-panel"; panel.hidden = true; panel.tabIndex = -1;
+    panel.setAttribute("role", "dialog"); panel.setAttribute("aria-label", "Purpose history");
+    panel.innerHTML = '<header><div><h2>Purpose history</h2><p class="purpose-target"></p></div>' +
+      '<button type="button" data-purpose-close aria-label="Close purpose history">Close</button></header>' +
+      '<div class="purpose-selection" hidden></div><p class="purpose-loading" role="status"></p>' +
+      '<p role="alert" hidden></p><div class="purpose-entries" tabindex="0" aria-label="Scrollable purpose history"></div>' +
+      '<footer><p>Grouped reports, newest first. In memory only; resets on restart. Auto-refresh is paused while this is open.</p>' +
+      '<button type="button" data-purpose-more hidden>Load older</button> ' +
+      '<button type="button" data-purpose-refresh>Refresh history</button> ' +
+      '<button type="button" data-purpose-pin>Pin full history</button></footer>';
+    document.body.append(panel);
+    panel.querySelector("[data-purpose-close]").onclick = () => close(true);
+    panel.querySelector("[data-purpose-pin]").onclick = pin;
+    panel.querySelector("[data-purpose-more]").onclick = () => load(true);
+    panel.querySelector("[data-purpose-refresh]").onclick = () => load(false);
+    panel.addEventListener("pointerenter", () => clearTimeout(hideTimer));
+    panel.addEventListener("pointerleave", scheduleClose);
+    panel.addEventListener("focusin", () => clearTimeout(hideTimer));
+    panel.addEventListener("focusout", scheduleClose);
+  }
+  function position() {
+    if (!panel || panel.hidden || pinned || !trigger) return;
+    const r = trigger.getBoundingClientRect(), width = panel.offsetWidth, height = panel.offsetHeight;
+    panel.style.left = Math.max(12, Math.min(r.left, innerWidth - width - 12)) + "px";
+    const below = r.bottom + 8;
+    panel.style.top = Math.max(12, Math.min(below + height <= innerHeight - 12 ? below : r.top - height - 8,
+      innerHeight - height - 12)) + "px";
+  }
+  function pin() {
+    pinned = true; panel.classList.add("pinned");
+    panel.querySelector("[data-purpose-pin]").hidden = true; panel.focus();
+  }
+  function close(restore) {
+    clearTimeout(hideTimer); clearTimeout(hoverTimer);
+    if (!panel) return;
+    controller?.abort(); panel.hidden = true; pinned = false; target = "";
+    if (trigger) trigger.setAttribute("aria-expanded", "false");
+    if (restore && trigger?.isConnected) {
+      trigger.focus({ preventScroll: true });
+      clearTimeout(hoverTimer);
+    }
+  }
+  function scheduleClose() {
+    clearTimeout(hideTimer);
+    if (!pinned) hideTimer = setTimeout(() => {
+      if (!panel?.contains(document.activeElement)) close(false);
+    }, 250);
+  }
+  function selection(node) {
+    const box = panel.querySelector(".purpose-selection");
+    box.replaceChildren(); box.hidden = !node.dataset.purposeSegment;
+    const s = box.hidden ? null : JSON.parse(node.dataset.purposeSegment);
+    panel.querySelectorAll(".purpose-entry").forEach(item =>
+      item.classList.toggle("selected", item.dataset.purposeGroup === String(s?.id)));
+    if (box.hidden) return;
+    box.append(make("b", s.purpose || (s.kind === "mixed" ? "Multiple purpose changes" : "Unknown: no purpose supplied")));
+    box.append(make("p", date(s.start) + " to " + date(s.end)));
+    if (s.count) box.append(make("p", s.count + " matching report(s); first " + date(s.first_at) +
+      ", last " + date(s.last_at) + ". Not continuous activity."));
+    else box.append(make("p", s.kind === "mixed" ? "Open the exact history below to inspect changes." :
+      "No purpose was reported for this interval. The preceding label is not carried into it."));
+  }
+  function show(node, keep) {
+    clearTimeout(hideTimer); ensurePanel();
+    const changed = target !== node.dataset.purposeTarget || panel.hidden;
+    if (trigger && trigger !== node) trigger.setAttribute("aria-expanded", "false");
+    trigger = node; target = node.dataset.purposeTarget;
+    panel.querySelector(".purpose-target").textContent = target;
+    panel.hidden = false; node.setAttribute("aria-expanded", "true");
+    if (!pinned) panel.classList.remove("pinned");
+    panel.querySelector("[data-purpose-pin]").hidden = pinned;
+    selection(node); position();
+    if (keep) pin();
+    if (changed) load(false);
+  }
+  async function load(append) {
+    controller?.abort(); const request = new AbortController(); controller = request;
+    const entries = panel.querySelector(".purpose-entries"), error = panel.querySelector("[role=alert]");
+    const more = panel.querySelector("[data-purpose-more]"), status = panel.querySelector("[role=status]");
+    if (!append) { entries.replaceChildren(); cursor = null; more.hidden = true; }
+    error.hidden = true; status.textContent = "Loading purpose history..."; more.disabled = true;
+    const range = new URLSearchParams(location.search).get("range") || "24h";
+    const params = new URLSearchParams({ target, range, limit: "50" });
+    if (append && cursor) params.set("cursor", cursor);
+    try {
+      const response = await fetch("/v1/purposes?" + params, { signal: request.signal });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error?.message || "History request failed (" + response.status + ")");
+      if (!Array.isArray(result.groups)) throw new Error("Invalid purpose history response.");
+      if (request.signal.aborted) return;
+      const selected = trigger?.dataset.purposeSegment ? JSON.parse(trigger.dataset.purposeSegment).id : null;
+      for (const group of result.groups) {
+        const item = make("article", undefined, "purpose-entry" + (group.id === selected ? " selected" : ""));
+        item.dataset.purposeGroup = String(group.id);
+        item.append(make("time", date(group.last_at)));
+        item.append(make("h3", (group.label ? group.label + " / " : "") + (group.purpose || "Unknown: purpose omitted")));
+        item.append(make("p", group.count + " report(s); first " + date(group.first_at) + ", last " + date(group.last_at)));
+        entries.append(item);
+      }
+      if (!append && !result.groups.length) entries.append(make("p", "No reports in this window since the hub started."));
+      cursor = result.next_cursor; more.hidden = !cursor; status.textContent = "";
+    } catch (failure) {
+      if (failure.name !== "AbortError") {
+        error.hidden = false; error.textContent = failure.message + " Use Refresh history to retry.";
+        status.textContent = "";
+      }
+    } finally {
+      if (!request.signal.aborted) { more.disabled = false; position(); }
+    }
+  }
+  document.addEventListener("pointerover", e => {
+    const node = e.target.closest("[data-purpose-target]");
+    if (!node || node.contains(e.relatedTarget) || pinned) return;
+    clearTimeout(hideTimer); clearTimeout(hoverTimer); hoverTimer = setTimeout(() => show(node, false), 120);
+  });
+  document.addEventListener("pointerout", e => {
+    const node = e.target.closest("[data-purpose-target]");
+    if (node && !node.contains(e.relatedTarget)) { clearTimeout(hoverTimer); scheduleClose(); }
+  });
+  document.addEventListener("focusin", e => {
+    const node = e.target.closest("[data-purpose-target]");
+    if (node && !pinned) {
+      clearTimeout(hoverTimer); hoverTimer = setTimeout(() => show(node, false), 0);
+    }
+  });
+  document.addEventListener("focusout", e => {
+    if (e.target.closest("[data-purpose-target]") && !panel?.contains(e.relatedTarget)) scheduleClose();
+  });
+  document.addEventListener("click", e => {
+    const node = e.target.closest("[data-purpose-target]");
+    if (node) { e.preventDefault(); clearTimeout(hoverTimer); show(node, true); }
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && panel && !panel.hidden) { e.preventDefault(); close(true); }
+    const node = e.target.closest(".purpose-segment");
+    if (node && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); clearTimeout(hoverTimer); show(node, true); }
+  });
+  window.addEventListener("resize", position);
+  document.addEventListener("scroll", e => { if (!panel?.contains(e.target)) position(); }, true);
 })();
 """

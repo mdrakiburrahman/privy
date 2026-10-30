@@ -28,6 +28,7 @@ from privy.hub.jobs import (
     utc_iso,
 )
 from privy.hub.metrics import HubMetrics
+from privy.hub.purpose import MAX_PURPOSE_CHARS, WINDOWS, normalize_purpose
 from privy.hub.registry import (
     ONLINE,
     UNKNOWN,
@@ -68,6 +69,9 @@ authentication is needed.
 3. While a job is running, call get_job(job_id) again: each call waits up to wait_s and returns only
    the output produced since your previous call, until done is true.
 4. broadcast runs one command on many machines; upload_file and download_file copy files.
+5. Opt in to purpose on work submissions, e.g. "privy: Implementing HYCO purpose history." Reuse the
+   same short sentence across related commands and transfers. Omission creates an unknown gap.
+   Purpose is hub-only, in memory, and resets on restart. Never include secrets.
 The same API is plain HTTP at this server's / (a quickstart) and /openapi.json. Commands run with the
 listener user's privileges: prefer read-only commands unless the user asked for changes."""
 
@@ -138,6 +142,8 @@ class Param:
 
     def json_schema(self) -> dict[str, Any]:
         schema: dict[str, Any] = {"type": self.type, "description": self.description}
+        if self.name == "purpose":
+            schema["type"] = ["string", "null"]
         if self.type == "array":
             schema["items"] = {"type": "string"}
         if self.enum:
@@ -155,6 +161,11 @@ class Param:
     def coerce(self, value: Any) -> Any:
         """Validate ``value``; strings are accepted for scalars (REST query parameters)."""
         name = self.name
+        if name == "purpose":
+            try:
+                return normalize_purpose(value)
+            except ValueError as exc:
+                raise _invalid(str(exc)) from None
         if self.type == "string":
             if not isinstance(value, str):
                 raise _invalid(f"{name} must be a string")
@@ -284,6 +295,15 @@ _WAIT = Param(
     maximum=MAX_WAIT_S,
 )
 _JOB_ID = Param("job_id", "string", "Job id returned by run, broadcast, upload_file, or download_file.", True)
+PURPOSE_PARAM = Param(
+    "purpose",
+    "string",
+    'Optional project/task sentence, e.g. "privy: Implementing HYCO purpose history." '
+    "Reuse across related work. Whitespace is normalized; omitted/null/blank means unknown and "
+    "breaks the preceding purpose group. Hub-only metadata, never sent to listeners or persisted. "
+    "History resets on hub restart. Do not include secrets.",
+    max_length=MAX_PURPOSE_CHARS,
+)
 
 
 def _max_output(default: int) -> Param:
@@ -350,7 +370,16 @@ OPERATIONS: tuple[Operation, ...] = (
         "a command that finishes in time returns its exit_code, stdout, and stderr; otherwise state "
         "is 'running' and you call get_job(job_id), which returns only the output produced since "
         "your previous read, until done is true. Runs with the listener user's privileges.",
-        (_TARGET, _CODE, _LANGUAGE, _MODE, _TIMEOUT, _WAIT, _max_output(DEFAULT_MAX_OUTPUT_BYTES)),
+        (
+            _TARGET,
+            _CODE,
+            PURPOSE_PARAM,
+            _LANGUAGE,
+            _MODE,
+            _TIMEOUT,
+            _WAIT,
+            _max_output(DEFAULT_MAX_OUTPUT_BYTES),
+        ),
         read_only=False,
         destructive=True,
     ),
@@ -406,6 +435,22 @@ OPERATIONS: tuple[Operation, ...] = (
         idempotent=True,
     ),
     Operation(
+        "get_purpose_history",
+        "Get a machine's purpose history",
+        "Newest-first grouped, request-declared purposes and explicit unknown gaps. "
+        "In memory only: resets on hub restart. Timestamps are Unix seconds, not execution durations. "
+        "Groups include first/last reports and total matching report counts; start/end are clipped to "
+        "the requested window. Follow next_cursor for older groups.",
+        (
+            _TARGET,
+            Param("range", "string", "Timeline window.", default="24h", enum=tuple(WINDOWS)),
+            Param("cursor", "string", "Opaque next_cursor from a previous page.", max_length=80),
+            Param("limit", "integer", "Maximum groups per page.", default=50, minimum=1, maximum=200),
+        ),
+        read_only=True,
+        idempotent=True,
+    ),
+    Operation(
         "broadcast",
         "Run code on many machines",
         "Run the same code on every machine matching the patterns, in parallel. Returns a "
@@ -420,6 +465,7 @@ OPERATIONS: tuple[Operation, ...] = (
                 default=["*"],
             ),
             _CODE,
+            PURPOSE_PARAM,
             _LANGUAGE,
             _MODE,
             _TIMEOUT,
@@ -454,6 +500,7 @@ OPERATIONS: tuple[Operation, ...] = (
         "a job: if it is not done within wait_s, continue with get_job.",
         (
             _TARGET,
+            PURPOSE_PARAM,
             Param("local_path", "string", "Absolute path of the source file on this machine.", required=True),
             Param(
                 "remote_path",
@@ -475,6 +522,7 @@ OPERATIONS: tuple[Operation, ...] = (
         "a job: if it is not done within wait_s, continue with get_job.",
         (
             _TARGET,
+            PURPOSE_PARAM,
             Param("remote_path", "string", "Source file path on the target.", required=True),
             Param("local_path", "string", "Absolute destination path on this machine.", required=True),
             Param("overwrite", "boolean", "Replace an existing destination file.", default=False),
@@ -498,6 +546,7 @@ SYNC_OPERATION = Operation(
     "Failure/cancellation leaves completed files intact; no whole-tree rollback. REST only, not an MCP tool.",
     (
         _TARGET,
+        PURPOSE_PARAM,
         Param(
             "local_path",
             "string",
@@ -650,7 +699,7 @@ class HubService:
             return self._start_exec(origin=origin, **args)
 
     def start_sync(self, raw_args: Mapping[str, Any], *, origin: str) -> dict[str, Any]:
-        if any(value is None for value in raw_args.values()):
+        if any(value is None for name, value in raw_args.items() if name != "purpose"):
             raise _invalid("sync arguments must not be null")
         args = SYNC_OPERATION.parse(raw_args)
         if not args["target"].strip():
@@ -800,6 +849,7 @@ class HubService:
         language: str | None,
         mode: str,
         timeout_s: float,
+        purpose: str | None = None,
         **_: Any,
     ) -> HubJob:
         self._validate_code(language, mode, code)
@@ -811,6 +861,7 @@ class HubService:
             mode=mode,
             timeout_s=timeout_s,
             origin=origin,
+            purpose=purpose,
         )
 
     def _wait(
@@ -873,9 +924,16 @@ class HubService:
         wait_s: float,
         max_output_bytes: int,
         progress: Progress | None,
+        purpose: str | None,
     ) -> dict[str, Any]:
         job = self._start_exec(
-            origin=origin, target=target, code=code, language=language, mode=mode, timeout_s=timeout_s
+            origin=origin,
+            target=target,
+            code=code,
+            language=language,
+            mode=mode,
+            timeout_s=timeout_s,
+            purpose=purpose,
         )
         self._wait([job], wait_s, progress, prefix=False)
         return self._job_view(job, max_output_bytes)
@@ -921,6 +979,15 @@ class HubService:
         jobs = self.jobs.list(target_id=target_id, limit=limit)
         return {"jobs": [job.summary(include_created=True) for job in jobs], "counts": self.jobs.counts()}
 
+    def _op_get_purpose_history(
+        self, *, origin: str, target: str, range: str, cursor: str | None, limit: int
+    ) -> dict[str, Any]:
+        resolved = self.registry.resolve(target)
+        try:
+            return self.metrics.purposes.history(resolved.id, range_name=range, cursor=cursor, limit=limit)
+        except ValueError as exc:
+            raise _invalid(str(exc)) from None
+
     def _op_broadcast(
         self,
         *,
@@ -932,6 +999,7 @@ class HubService:
         timeout_s: float,
         wait_s: float,
         only_online: bool,
+        purpose: str | None,
         max_output_bytes: int,
         progress: Progress | None,
     ) -> dict[str, Any]:
@@ -969,6 +1037,7 @@ class HubService:
             mode=mode,
             timeout_s=timeout_s,
             origin=origin,
+            purpose=purpose,
         )
         self._wait(jobs, wait_s, progress, prefix=True)
         return self._broadcast_view(broadcast, jobs, max_output_bytes)
@@ -990,6 +1059,7 @@ class HubService:
         self,
         *,
         direction: str,
+        purpose: str | None,
         origin: str,
         target: str,
         local: Path,
@@ -1007,6 +1077,7 @@ class HubService:
             remote_path=remote_path,
             overwrite=overwrite,
             origin=origin,
+            purpose=purpose,
         )
         self._wait([job], wait_s, progress, prefix=False)
         return self._job_view(job, 0)
@@ -1015,6 +1086,7 @@ class HubService:
         self,
         *,
         origin: str,
+        purpose: str | None,
         target: str,
         local_path: str,
         remote_path: str,
@@ -1029,6 +1101,7 @@ class HubService:
             raise HubError(f"local_path is not a file: {local}", status=404, code="local_file_not_found")
         return self._transfer(
             direction="upload",
+            purpose=purpose,
             origin=origin,
             target=target,
             local=local,
@@ -1042,6 +1115,7 @@ class HubService:
         self,
         *,
         origin: str,
+        purpose: str | None,
         target: str,
         remote_path: str,
         local_path: str,
@@ -1060,6 +1134,7 @@ class HubService:
             )
         return self._transfer(
             direction="download",
+            purpose=purpose,
             origin=origin,
             target=target,
             local=local,
