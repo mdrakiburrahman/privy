@@ -7,10 +7,12 @@ can copy them and run them unchanged.
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 from privy.hub import render
 from privy.hub.registry import ONLINE, TargetLookupError, language_from, machine_name
@@ -23,6 +25,7 @@ if TYPE_CHECKING:
 
 #: Job id used in examples.
 EXAMPLE_JOB_ID = "9f3c2a1b7d4e"
+EXAMPLE_PURPOSE = "privy: Implementing HYCO purpose history."
 
 
 @dataclass(frozen=True)
@@ -227,6 +230,35 @@ def quickstart(service: HubService, base_url: str) -> str:
         "- MCP clients can use job/target operations as tools at `/mcp`; sync and credential export are REST-only.",
         "",
     ]
+    purpose_lines = [
+        "## Opt in: describe the purpose of your work",
+        "",
+        "Add optional `purpose` to commands, broadcasts, file upload/download/sync, or terminal creation.",
+        "Use a short project/task sentence and reuse it across related requests; change it when the task changes.",
+        "Maximum 240 Unicode characters; whitespace is normalized. Never include secrets.",
+        "Omitted, null, or blank purpose starts an **unknown gap**; it does not erase the previous label.",
+        "This is **hub-only metadata**: listeners do not receive it and need no upgrade.",
+        "History lives **in memory only and resets on hub restart**. It is not ownership or execution duration.",
+        "Discovery, probes, polling, and terminal read/write/resize/close do not change purpose history.",
+        "",
+        "JSON request example:",
+        "",
+        "```json",
+        json.dumps({"target": example.machine, "code": example.code, "purpose": EXAMPLE_PURPOSE}, indent=2),
+        "```",
+        "",
+        "Raw code / live streaming (URL-encode purpose):",
+        "",
+        "```powershell",
+        f'curl.exe -sN "{base_url}/v1/jobs?stream=true&target={example.machine}&purpose={quote(EXAMPLE_PURPOSE)}" --data-binary {_quote(example.code)}',
+        "```",
+        "",
+        f"Read grouped history: `GET {base_url}/v1/purposes?target={example.machine}&range=24h`.",
+        "Use `next_cursor` to page older entries. Times are Unix seconds; the UI displays dates and timezone.",
+        "",
+    ]
+    insertion = lines.index("## Run without streaming")
+    lines[insertion:insertion] = purpose_lines
     return "\n".join(lines)
 
 
@@ -288,6 +320,7 @@ def examples(operation: str, base_url: str, example: Example) -> dict[str, Any]:
     targets = _targets_example(example)
     finished = _job_example(example, done=True)
     running = _job_example(example, done=False)
+    purpose_query = quote(EXAMPLE_PURPOSE)
     stream = (
         f"[privy] job={EXAMPLE_JOB_ID} target={example.target_id} language={example.language}\n"
         f"{example.output}[privy] job={EXAMPLE_JOB_ID} state=succeeded exit=0 duration=1.4s\n"
@@ -303,14 +336,14 @@ def examples(operation: str, base_url: str, example: Example) -> dict[str, Any]:
         },
         "get_target": {"samples": [f'curl.exe -s "{base_url}/v1/targets/{machine}?format=text"']},
         "run": {
-            "request": {"target": machine, "code": example.code},
+            "request": {"target": machine, "code": example.code, "purpose": EXAMPLE_PURPOSE},
             "raw": example.code,
             "response": finished,
             "text": render.render_job(finished),
             "samples": [
-                f'curl.exe -sN "{base_url}/v1/jobs?stream=true&target={machine}" --data-binary {code}',
-                f'curl.exe -s "{base_url}/v1/jobs?format=text&target={machine}" --data-binary {code}',
-                f'Invoke-RestMethod -Method Post "{base_url}/v1/jobs?format=text&target={machine}" -Body {code}',
+                f'curl.exe -sN "{base_url}/v1/jobs?stream=true&target={machine}&purpose={purpose_query}" --data-binary {code}',
+                f'curl.exe -s "{base_url}/v1/jobs?format=text&target={machine}&purpose={purpose_query}" --data-binary {code}',
+                f'Invoke-RestMethod -Method Post "{base_url}/v1/jobs?format=text&target={machine}&purpose={purpose_query}" -Body {code}',
             ],
         },
         "get_job": {
@@ -322,11 +355,38 @@ def examples(operation: str, base_url: str, example: Example) -> dict[str, Any]:
         "read_job_output": {"samples": [f'curl.exe -s "{job}/output?stream=stdout&offset=0&format=text"']},
         "cancel_job": {"samples": [f'curl.exe -s -X POST "{job}/cancel?format=text"']},
         "list_jobs": {"samples": [f'curl.exe -s "{base_url}/v1/jobs?format=text"']},
+        "get_purpose_history": {
+            "samples": [f'curl.exe -s "{base_url}/v1/purposes?target={machine}&range=24h&format=text"'],
+            "response": {
+                "target": example.target_id,
+                "range": "24h",
+                "start": 1700000000,
+                "end": 1700086400,
+                "history_since": 1700080000,
+                "ephemeral": True,
+                "latest": EXAMPLE_PURPOSE,
+                "latest_at": 1700086200,
+                "latest_unknown": False,
+                "groups": [
+                    {
+                        "id": 1,
+                        "purpose": EXAMPLE_PURPOSE,
+                        "first_at": 1700086000,
+                        "last_at": 1700086200,
+                        "count": 3,
+                        "start": 1700086000,
+                        "end": 1700086400,
+                        "kind": "purpose",
+                    }
+                ],
+                "next_cursor": None,
+            },
+        },
         "broadcast": {
-            "request": {"targets": ["*_windows"], "code": example.code},
+            "request": {"targets": ["*_windows"], "code": example.code, "purpose": EXAMPLE_PURPOSE},
             "raw": example.code,
             "samples": [
-                f'curl.exe -s "{base_url}/v1/broadcasts?format=text&targets=*_windows" --data-binary {code}'
+                f'curl.exe -s "{base_url}/v1/broadcasts?format=text&targets=*_windows&purpose={purpose_query}" --data-binary {code}'
             ],
         },
         "get_broadcast": {"samples": [f'curl.exe -s "{base_url}/v1/broadcasts/b1a2b3c4d5e6?format=text"']},
@@ -335,10 +395,11 @@ def examples(operation: str, base_url: str, example: Example) -> dict[str, Any]:
                 "target": machine,
                 "local_path": "C:\\data\\model.pkl",
                 "remote_path": "C:\\temp\\model.pkl",
+                "purpose": EXAMPLE_PURPOSE,
             },
             "samples": [
                 f'curl.exe -s -X POST "{base_url}/v1/files/upload?format=text&target={machine}'
-                '&local_path=C:\\data\\model.pkl&remote_path=C:\\temp\\model.pkl"'
+                f'&local_path=C:\\data\\model.pkl&remote_path=C:\\temp\\model.pkl&purpose={purpose_query}"'
             ],
         },
         "download_file": {
@@ -346,10 +407,11 @@ def examples(operation: str, base_url: str, example: Example) -> dict[str, Any]:
                 "target": machine,
                 "remote_path": "C:\\temp\\log.txt",
                 "local_path": "C:\\data\\log.txt",
+                "purpose": EXAMPLE_PURPOSE,
             },
             "samples": [
                 f'curl.exe -s -X POST "{base_url}/v1/files/download?format=text&target={machine}'
-                '&remote_path=C:\\temp\\log.txt&local_path=C:\\data\\log.txt"'
+                f'&remote_path=C:\\temp\\log.txt&local_path=C:\\data\\log.txt&purpose={purpose_query}"'
             ],
         },
         "sync_files": {
@@ -358,12 +420,14 @@ def examples(operation: str, base_url: str, example: Example) -> dict[str, Any]:
                 "local_path": "C:\\data\\project",
                 "remote_path": "C:\\temp\\project",
                 "destination_type": "directory",
+                "purpose": EXAMPLE_PURPOSE,
             },
             "samples": [
                 f'Invoke-RestMethod -Method Post "{base_url}/v1/files/sync" '
                 '-ContentType "application/json" -Body (@{'
                 f'target="{machine}"; local_path="C:\\data\\project"; '
-                'remote_path="C:\\temp\\project"; destination_type="directory"} | ConvertTo-Json)'
+                f'remote_path="C:\\temp\\project"; destination_type="directory"; purpose="{EXAMPLE_PURPOSE}"'
+                "} | ConvertTo-Json)"
             ],
         },
     }

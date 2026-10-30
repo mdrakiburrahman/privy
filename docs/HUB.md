@@ -190,6 +190,73 @@ back redirected pipeline and `Write-Host` output for roughly another 0.4 seconds
 `[Console]::Out.WriteLine()` output is not delayed. A short command that is not streamed takes about
 1.3 seconds end to end.
 
+## Report what a HYCO is being used for
+
+Opt in by adding **`purpose`** to each work submission: a short project/task sentence such as
+`privy: Implementing HYCO purpose history.` Reuse the same sentence for related work and change it
+when the task changes. The limit is **240 Unicode characters before whitespace normalization**;
+leading/trailing whitespace is removed and internal whitespace is collapsed. Never include secrets.
+
+```powershell
+$work = @{
+    target = "dev/devbox01_windows"
+    code = "hostname"
+    purpose = "privy: Implementing HYCO purpose history."
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post http://127.0.0.1:7748/v1/jobs -ContentType application/json -Body $work
+```
+
+For raw-code requests, including live streaming, URL-encode the sentence in the query:
+
+```powershell
+$purpose = [Uri]::EscapeDataString("privy: Implementing HYCO purpose history.")
+curl.exe -sN "http://127.0.0.1:7748/v1/jobs?target=devbox01&stream=true&purpose=$purpose" --data-binary "hostname"
+```
+
+The same optional field is available on `/v1/broadcasts` (copied to every admitted child job),
+`/v1/files/upload`, `/v1/files/download`, `/v1/files/sync`, and terminal creation at
+`POST /v1/terminals`. For example, include `purpose` alongside `target`, `local_path`, and
+`remote_path` in a file transfer JSON body, or alongside `target`, `shell`, `owner`, and
+`request_id` in a terminal-open body. MCP's `run`, `broadcast`, `upload_file`, and `download_file`
+tools accept the same field. `/`, `/llms.txt`, `/v1`, `/openapi.json`, and MCP discovery document
+this convention and examples.
+
+**This is hub-only metadata: no listener update is needed.** It is recorded when a job is admitted,
+even if execution later fails, and when a terminal is successfully opened. Rejected requests,
+skipped broadcast targets, discovery, probes, polling, and terminal read/write/resize/close do not
+change it. An omitted, JSON `null`, empty, or whitespace-only purpose creates an **unknown gap**
+rather than extending the previous purpose through untagged work.
+
+On **Relay HYCOs**, the last nonempty sentence and its timestamp remain visible, even when the
+latest work is unknown. A HYCO that has never supplied a purpose has a blank cell. The continuum
+uses the selected 1h/24h/7d window and an absolute UTC axis. Consecutive matching reports are
+grouped; a different sentence or unknown gap breaks a group. Returning purposes reuse their color
+and short text label. Stripes identify unknown intervals; dense intervals with multiple changes use
+crosshatching rather than pretending they have one purpose.
+
+Hover or focus a sentence/segment to scroll its history, or click/press Enter to pin the full panel.
+**Load older** pages through groups; Escape closes it. Dashboard auto-refresh pauses while the panel
+is open to preserve focus, selection, and scrolling. First/last report times and counts describe
+submitted metadata, **not execution duration, continuous activity, or ownership**.
+
+History is **in memory only and resets on every hub restart**. There is no purpose audit, snapshot,
+or backfill. Detail is retained for seven days, plus the predecessor needed to explain the left edge
+of the timeline; the latest sentence lasts for the current process lifetime. Existing command audit
+behavior is unchanged.
+
+Read grouped history through REST or MCP's `get_purpose_history`:
+
+```text
+GET /v1/purposes?target=dev/devbox01_windows&range=24h&limit=50
+GET /v1/purposes?target=dev/devbox01_windows&range=24h&format=text
+```
+
+JSON returns `latest`, `latest_at`, `latest_unknown`, `history_since`, `ephemeral: true`, and
+newest-first `groups` with `purpose`, `first_at`, `last_at`, `count`, and window-clipped
+`start`/`end`. Times are Unix seconds. Pass the URL-encoded `next_cursor` back as `cursor` for older
+groups; `limit` accepts 1–200. Cursors are tied to the target, range, and running hub, and expire as
+the window advances. If a cursor is rejected, restart from the first page.
+
 ## Home directory
 
 `--home DIR`, else `PRIVY_HUB_HOME`, else `%LOCALAPPDATA%\privy\hub` on Windows and
