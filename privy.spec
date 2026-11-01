@@ -24,6 +24,8 @@ a = Analysis(
         "privy.hub.guide",
         "privy.hub.home",
         "privy.hub.jobs",
+        "privy.hub.leases",
+        "yaml",
         "privy.hub.mcp",
         "privy.hub.registry",
         "privy.hub.render",

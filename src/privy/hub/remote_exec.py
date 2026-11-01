@@ -45,6 +45,8 @@ def workspace(service: Any, report: dict[str, Any], selected: str) -> str:
                 "os": row["os"],
                 "languages": choices,
                 "default": preferred if preferred in choices else choices[0],
+                "group": (row.get("lease_group") or {}).get("group"),
+                "lease": (row.get("lease_group") or {}).get("lease"),
             }
         )
     data = html.escape(json.dumps(targets, ensure_ascii=True), quote=True)
@@ -62,9 +64,11 @@ def workspace(service: Any, report: dict[str, Any], selected: str) -> str:
 <label class="exec-field exec-machine">Terminal-capable HYCO<select id="exec-target"></select></label>
 <label class="exec-field">Shell<select id="exec-language"></select></label>
 <button type="button" id="exec-refresh" class="exec-button">Refresh</button>
-<button type="button" id="exec-connect" class="exec-button primary" disabled>{TERMINAL_ICON}Connect shell</button>
+<button type="button" id="exec-connect" class="exec-button primary" disabled>{TERMINAL_ICON}Open terminal</button>
 </div>
 <p id="exec-machine-note" class="fine"></p>
+<p class="fine">Your clicks run without a lease. On a leased group, Run and Open terminal show a heads-up;
+they never acquire, renew, or take over someone else's lease.</p>
 <div id="exec-message" role="alert" hidden></div>
 <div class="exec-composer" aria-label="Local command composer">
 <div class="exec-composer-heading"><label for="exec-command">Command composer

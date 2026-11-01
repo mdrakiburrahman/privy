@@ -27,6 +27,7 @@ from privy.hub.jobs import (
     JobManager,
     utc_iso,
 )
+from privy.hub.leases import LeaseError, LeaseStore
 from privy.hub.metrics import HubMetrics
 from privy.hub.purpose import MAX_PURPOSE_CHARS, WINDOWS, normalize_purpose
 from privy.hub.registry import (
@@ -62,6 +63,17 @@ Progress = Callable[..., None]
 INSTRUCTIONS = """\
 privy hub runs commands on remote machines (privy listeners reached through Azure Relay). No
 authentication is needed.
+Recommended flow: register_client once per chat (session_id makes registration idempotent), then
+acquire_lease with client_id, purpose and arbitrary labels (e.g. repo). Omit target for ANY free group,
+or name any member to reserve the whole stack. Separate ANY requests can allocate multiple groups.
+Pass lease_id on every run, broadcast, transfer, sync, job poll or terminal call. Usage renews the
+30m idle TTL; jobs pin it until completion. Before a long wait, renew_lease with ttl up to 4h.
+Release with release_lease and client_id when pushed work is done. On none_available wait for
+retry_after_s; on group_leased for a user-named box ask before using someone else's group.
+Leases are advisory: unleased commands still run with a lease_warning and count as recent use,
+but never renew or take over another client's lease. Lease and client metadata are public and
+cooperative, not authentication; do not include secrets. Peek with list_leases or get_lease;
+reading leases or filtering job history does not renew them.
 1. list_targets shows every machine and whether it is online. Name a machine by its short name
    (devbox01), hybrid connection (devbox01_windows), full id (relay/hyco), or host name.
 2. run executes code; language is optional (PowerShell on Windows, Bash elsewhere). It waits up to
@@ -69,9 +81,11 @@ authentication is needed.
 3. While a job is running, call get_job(job_id) again: each call waits up to wait_s and returns only
    the output produced since your previous call, until done is true.
 4. broadcast runs one command on many machines; upload_file and download_file copy files.
-5. Opt in to purpose on work submissions, e.g. "privy: Implementing HYCO purpose history." Reuse the
-   same short sentence across related commands and transfers. Omission creates an unknown gap.
-   Purpose is hub-only, in memory, and resets on restart. Never include secrets.
+5. Use purpose on work submissions, e.g. "privy: Implementing HYCO purpose history." Reuse the
+   same short sentence across related commands and transfers. A lease supplies its purpose when
+   omitted; otherwise omission creates an unknown gap.
+   Purpose history is hub-only and resets on restart; a lease's default purpose persists with
+   its lease. Never include secrets.
 The same API is plain HTTP at this server's / (a quickstart) and /openapi.json. Commands run with the
 listener user's privileges: prefer read-only commands unless the user asked for changes."""
 
@@ -108,6 +122,8 @@ def _translated_errors() -> Iterator[None]:
     """Turn lookup and capacity failures into :class:`HubError` with an HTTP status."""
     try:
         yield
+    except LeaseError as exc:
+        raise HubError(str(exc), status=exc.status, code=exc.code, details=exc.details) from None
     except TargetLookupError as exc:
         raise HubError(
             str(exc), status=404, code="target_not_found", details={"candidates": exc.candidates}
@@ -144,8 +160,12 @@ class Param:
         schema: dict[str, Any] = {"type": self.type, "description": self.description}
         if self.name == "purpose":
             schema["type"] = ["string", "null"]
+        if self.name == "ttl":
+            schema["type"] = ["string", "number"]
         if self.type == "array":
             schema["items"] = {"type": "string"}
+        if self.type == "object":
+            schema["additionalProperties"] = {"type": "string"}
         if self.enum:
             schema["enum"] = list(self.enum)
         if self.minimum is not None:
@@ -161,6 +181,10 @@ class Param:
     def coerce(self, value: Any) -> Any:
         """Validate ``value``; strings are accepted for scalars (REST query parameters)."""
         name = self.name
+        if name == "ttl" and type(value) in (int, float):
+            if not math.isfinite(value) or value <= 0:
+                raise _invalid("ttl seconds must be positive and finite")
+            return f"{value:g}s"
         if name == "purpose":
             try:
                 return normalize_purpose(value)
@@ -209,6 +233,12 @@ class Param:
             if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
                 raise _invalid(f"{name} must be a list of strings")
             return [_require_text(name, item) for item in value]
+        if self.type == "object":
+            if not isinstance(value, Mapping) or not all(
+                isinstance(key, str) and isinstance(item, str) for key, item in value.items()
+            ):
+                raise _invalid(f"{name} must be an object with string values")
+            return dict(value)
         raise AssertionError(f"unsupported parameter type {self.type!r}")
 
 
@@ -295,13 +325,21 @@ _WAIT = Param(
     maximum=MAX_WAIT_S,
 )
 _JOB_ID = Param("job_id", "string", "Job id returned by run, broadcast, upload_file, or download_file.", True)
+_LEASE_ID = Param("lease_id", "string", "Lease id to associate this call with and renew.")
+_REQUIRED_LEASE_ID = Param(
+    "lease_id", "string", "Lease id to associate this call with and renew.", required=True
+)
+_CLIENT_ID = Param("client_id", "string", "Registered lease client id.")
+_REQUIRED_CLIENT_ID = Param("client_id", "string", "Registered lease client id.", required=True)
+_LABELS = Param("labels", "object", "Free-form string labels.")
+_TTL = Param("ttl", "string", "Lease duration, for example 30m or 2h.", max_length=32)
 PURPOSE_PARAM = Param(
     "purpose",
     "string",
     'Optional project/task sentence, e.g. "privy: Implementing HYCO purpose history." '
     "Reuse across related work. Whitespace is normalized; omitted/null/blank means unknown and "
-    "breaks the preceding purpose group. Hub-only metadata, never sent to listeners or persisted. "
-    "History resets on hub restart. Do not include secrets.",
+    "breaks the preceding purpose group unless a lease supplies its default. Hub-only metadata, "
+    "never sent to listeners. History resets on hub restart; lease purpose persists. Do not include secrets.",
     max_length=MAX_PURPOSE_CHARS,
 )
 
@@ -379,6 +417,7 @@ OPERATIONS: tuple[Operation, ...] = (
             _TIMEOUT,
             _WAIT,
             _max_output(DEFAULT_MAX_OUTPUT_BYTES),
+            _LEASE_ID,
         ),
         read_only=False,
         destructive=True,
@@ -390,7 +429,14 @@ OPERATIONS: tuple[Operation, ...] = (
         "since your previous run/get_job call for it, plus its state. Call it repeatedly to follow "
         "a long command; stop when done is true. States: queued, running, succeeded, failed "
         "(non-zero exit), timed_out, cancelled, error (the hub could not run it).",
-        (_JOB_ID, _WAIT, _max_output(DEFAULT_MAX_OUTPUT_BYTES), _offset("stdout"), _offset("stderr")),
+        (
+            _JOB_ID,
+            _WAIT,
+            _max_output(DEFAULT_MAX_OUTPUT_BYTES),
+            _offset("stdout"),
+            _offset("stderr"),
+            _LEASE_ID,
+        ),
         read_only=True,
     ),
     Operation(
@@ -410,6 +456,7 @@ OPERATIONS: tuple[Operation, ...] = (
                 minimum=1,
                 maximum=MAX_OUTPUT_BYTES,
             ),
+            _LEASE_ID,
         ),
         read_only=True,
         idempotent=True,
@@ -419,7 +466,7 @@ OPERATIONS: tuple[Operation, ...] = (
         "Cancel job",
         "Cancel a queued or running job. Best effort: the listener kills the remote process tree "
         "and a partial file transfer stays resumable.",
-        (_JOB_ID,),
+        (_JOB_ID, _LEASE_ID),
         read_only=False,
         idempotent=True,
     ),
@@ -429,6 +476,8 @@ OPERATIONS: tuple[Operation, ...] = (
         "List recent hub jobs, newest first, without their output.",
         (
             Param("target", "string", "Only jobs for this machine."),
+            _LEASE_ID,
+            _CLIENT_ID,
             Param("limit", "integer", "Maximum jobs to return.", default=20, minimum=1, maximum=200),
         ),
         read_only=True,
@@ -477,6 +526,7 @@ OPERATIONS: tuple[Operation, ...] = (
                 default=True,
             ),
             _max_output(DEFAULT_BROADCAST_OUTPUT_BYTES),
+            _LEASE_ID,
         ),
         read_only=False,
         destructive=True,
@@ -490,6 +540,7 @@ OPERATIONS: tuple[Operation, ...] = (
             Param("broadcast_id", "string", "Broadcast id returned by broadcast.", required=True),
             _WAIT,
             _max_output(DEFAULT_BROADCAST_OUTPUT_BYTES),
+            _LEASE_ID,
         ),
         read_only=True,
     ),
@@ -511,6 +562,7 @@ OPERATIONS: tuple[Operation, ...] = (
             ),
             Param("overwrite", "boolean", "Replace an existing destination file.", default=False),
             _WAIT,
+            _LEASE_ID,
         ),
         read_only=False,
         destructive=True,
@@ -527,9 +579,122 @@ OPERATIONS: tuple[Operation, ...] = (
             Param("local_path", "string", "Absolute destination path on this machine.", required=True),
             Param("overwrite", "boolean", "Replace an existing destination file.", default=False),
             _WAIT,
+            _LEASE_ID,
         ),
         read_only=False,
         destructive=True,
+    ),
+    Operation(
+        "register_client",
+        "Register a lease client",
+        "Register or retrieve a client identity used to acquire and manage leases. Registration is "
+        "idempotent for a session_id.",
+        (
+            Param("name", "string", "Chat title or short task name.", required=True, max_length=200),
+            Param(
+                "kind", "string", "Client type, such as copilot-app, copilot-cli, service, script, or human."
+            ),
+            Param("host", "string", "Client host name."),
+            Param(
+                "session_id",
+                "string",
+                "Copilot session identifier; registration is idempotent on this value.",
+            ),
+            _LABELS,
+        ),
+        read_only=False,
+        idempotent=True,
+    ),
+    Operation(
+        "list_clients",
+        "List lease clients",
+        "List registered lease clients, optionally limiting the result to clients with active leases.",
+        (Param("active", "boolean", "Only return clients currently holding active leases.", default=False),),
+        read_only=True,
+        idempotent=True,
+    ),
+    Operation(
+        "get_client",
+        "Get a lease client",
+        "Show one client and the leases it holds.",
+        (_REQUIRED_CLIENT_ID,),
+        read_only=True,
+        idempotent=True,
+    ),
+    Operation(
+        "delete_client",
+        "Unregister a lease client",
+        "Unregister a client and release its leases.",
+        (_REQUIRED_CLIENT_ID,),
+        read_only=False,
+        destructive=True,
+        idempotent=True,
+    ),
+    Operation(
+        "list_groups",
+        "List lease groups",
+        "List lease groups with their members, availability, holder, and cooldown information.",
+        (),
+        read_only=True,
+        idempotent=True,
+    ),
+    Operation(
+        "acquire_lease",
+        "Acquire a lease",
+        "Acquire an advisory lease on a target or group. Omit target to select an available group.",
+        (
+            _REQUIRED_CLIENT_ID,
+            Param("target", "string", "Target member or group name; omit to acquire any available group."),
+            _LABELS,
+            PURPOSE_PARAM,
+            _TTL,
+        ),
+        read_only=False,
+        destructive=True,
+    ),
+    Operation(
+        "list_leases",
+        "List leases",
+        "List leases, optionally filtered by client, group, repeated key=value labels, or state.",
+        (
+            _CLIENT_ID,
+            Param("group", "string", "Only leases for this group."),
+            Param("label", "array", "Match each key=value label; repeat to require multiple labels."),
+            Param(
+                "state",
+                "string",
+                "Lease state to include.",
+                default="active",
+                enum=("active", "expired", "released", "all"),
+            ),
+        ),
+        read_only=True,
+        idempotent=True,
+    ),
+    Operation(
+        "get_lease",
+        "Get a lease",
+        "Inspect a lease, including its members, labels, timers, event history, and linked jobs.",
+        (_REQUIRED_LEASE_ID,),
+        read_only=True,
+        idempotent=True,
+    ),
+    Operation(
+        "renew_lease",
+        "Renew a lease",
+        "Renew a lease held by the specified client, optionally changing its TTL.",
+        (_REQUIRED_LEASE_ID, _REQUIRED_CLIENT_ID, _TTL),
+        read_only=False,
+        idempotent=True,
+    ),
+    Operation(
+        "release_lease",
+        "Release a lease",
+        "Release a lease, skipping its group's cooldown. When client_id is supplied, only its holder may release it.",
+        (_REQUIRED_LEASE_ID, _CLIENT_ID),
+        read_only=False,
+        destructive=True,
+        idempotent=True,
     ),
 )
 OPERATIONS_BY_NAME = {operation.name: operation for operation in OPERATIONS}
@@ -547,6 +712,7 @@ SYNC_OPERATION = Operation(
     (
         _TARGET,
         PURPOSE_PARAM,
+        _LEASE_ID,
         Param(
             "local_path",
             "string",
@@ -566,6 +732,15 @@ SYNC_OPERATION = Operation(
             "overwrite", "boolean", "Replace changed files; identical files are always skipped.", default=True
         ),
     ),
+    read_only=False,
+    destructive=True,
+)
+FORCE_RELEASE_OPERATION = Operation(
+    "force_release_lease",
+    "Force-release a lease (REST dashboard only)",
+    "Force-release a lease without holder credentials. Restricted to same-origin dashboard requests carrying "
+    "X-Privy-UI: 1; not exposed over MCP. Running jobs are not stopped.",
+    (_REQUIRED_LEASE_ID,),
     read_only=False,
     destructive=True,
 )
@@ -661,17 +836,28 @@ class HubService:
         version: str,
         started_at: float | None = None,
         metrics: HubMetrics | None = None,
+        leases: LeaseStore | None = None,
     ) -> None:
         self.registry = registry
         self.jobs = jobs
         self.version = version
         self.started_at = time.time() if started_at is None else started_at
         self.metrics = metrics if metrics is not None else HubMetrics()
-        jobs.on_job = self.metrics.job_added
+        self.leases = leases if leases is not None else LeaseStore(registry, audit=jobs.audit)
+        jobs.on_job = self._job_added
+        jobs.on_finish = self.leases.job_finished
         registry.on_probe = self.metrics.probe
         self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
             operation.name: getattr(self, f"_op_{operation.name}") for operation in OPERATIONS
         }
+
+    def _job_added(self, job: HubJob) -> None:
+        self.leases.job_started(job)
+        self.metrics.job_added(job)
+
+    def lease_use(self, target: str, lease_id: str | None, *, origin: str) -> dict[str, Any]:
+        with _translated_errors():
+            return self.leases.use(target, lease_id, origin=origin)
 
     def invoke(
         self,
@@ -699,7 +885,7 @@ class HubService:
             return self._start_exec(origin=origin, **args)
 
     def start_sync(self, raw_args: Mapping[str, Any], *, origin: str) -> dict[str, Any]:
-        if any(value is None for name, value in raw_args.items() if name != "purpose"):
+        if any(value is None for name, value in raw_args.items() if name not in ("purpose", "lease_id")):
             raise _invalid("sync arguments must not be null")
         args = SYNC_OPERATION.parse(raw_args)
         if not args["target"].strip():
@@ -716,9 +902,18 @@ class HubService:
             job = self.jobs.start_sync(self.registry.resolve(args.pop("target")), origin=origin, **args)
         return self._job_view(job, 0)
 
-    def job(self, job_id: str) -> HubJob:
+    def job(self, job_id: str, *, lease_id: str | None = None, origin: str = "rest") -> HubJob:
+        return self.job_usage(job_id, lease_id=lease_id, origin=origin)[0]
+
+    def job_usage(
+        self, job_id: str, *, lease_id: str | None = None, origin: str = "rest"
+    ) -> tuple[HubJob, dict[str, Any]]:
         with _translated_errors():
-            return self.jobs.get(job_id)
+            job = self.jobs.get(job_id)
+            usage = self.leases.use(
+                job.target.id, lease_id if job.lease_id == lease_id else None, origin=origin
+            )
+            return job, usage
 
     def summary(self) -> dict[str, Any]:
         snapshot = self.registry.snapshot()
@@ -763,6 +958,7 @@ class HubService:
             "status": probe.status if probe else UNKNOWN,
         }
         view.update(_listener_summary(probe))
+        view.update(self.leases.target_summary(target.id))
         if probe is not None and probe.status == ONLINE:
             language = language_from(probe.info, target.path)
             if language:
@@ -850,6 +1046,7 @@ class HubService:
         mode: str,
         timeout_s: float,
         purpose: str | None = None,
+        lease_id: str | None = None,
         **_: Any,
     ) -> HubJob:
         self._validate_code(language, mode, code)
@@ -862,6 +1059,7 @@ class HubService:
             timeout_s=timeout_s,
             origin=origin,
             purpose=purpose,
+            lease_id=lease_id,
         )
 
     def _wait(
@@ -925,6 +1123,7 @@ class HubService:
         max_output_bytes: int,
         progress: Progress | None,
         purpose: str | None,
+        lease_id: str | None = None,
     ) -> dict[str, Any]:
         job = self._start_exec(
             origin=origin,
@@ -934,6 +1133,7 @@ class HubService:
             mode=mode,
             timeout_s=timeout_s,
             purpose=purpose,
+            lease_id=lease_id,
         )
         self._wait([job], wait_s, progress, prefix=False)
         return self._job_view(job, max_output_bytes)
@@ -948,35 +1148,61 @@ class HubService:
         stdout_offset: int | None,
         stderr_offset: int | None,
         progress: Progress | None,
+        lease_id: str | None = None,
     ) -> dict[str, Any]:
-        job = self.jobs.get(job_id)
+        job, usage = self.job_usage(job_id, lease_id=lease_id, origin=origin)
         self._wait([job], wait_s, progress, prefix=False)
         offsets = None
         if stdout_offset is not None or stderr_offset is not None:
             offsets = {"stdout": stdout_offset, "stderr": stderr_offset}
-        return self._job_view(job, max_output_bytes, offsets=offsets)
+        return {
+            **{
+                k: v
+                for k, v in self._job_view(job, max_output_bytes, offsets=offsets).items()
+                if k != "lease_warning"
+            },
+            **{k: v for k, v in usage.items() if k == "lease_warning"},
+        }
 
     def _op_read_job_output(
-        self, *, origin: str, job_id: str, stream: str, offset: int, limit: int
+        self, *, origin: str, job_id: str, stream: str, offset: int, limit: int, lease_id: str | None = None
     ) -> dict[str, Any]:
-        job = self.jobs.get(job_id)
+        job, usage = self.job_usage(job_id, lease_id=lease_id, origin=origin)
         if job.type != "exec":
             raise _invalid(f"job {job_id!r} is a file transfer and has no output streams")
-        return job.read_output(stream, offset, limit)
+        return {
+            **job.read_output(stream, offset, limit),
+            **{k: v for k, v in usage.items() if k == "lease_warning"},
+        }
 
-    def _op_cancel_job(self, *, origin: str, job_id: str) -> dict[str, Any]:
+    def _op_cancel_job(self, *, origin: str, job_id: str, lease_id: str | None = None) -> dict[str, Any]:
+        current = self.jobs.get(job_id)
+        usage = self.leases.use(current.target.id, lease_id, origin=origin)
         job = self.jobs.cancel(job_id)
         self.jobs.wait(job, CANCEL_SETTLE_S)
-        return self._job_view(job, DEFAULT_MAX_OUTPUT_BYTES)
+        return {
+            **{
+                k: v for k, v in self._job_view(job, DEFAULT_MAX_OUTPUT_BYTES).items() if k != "lease_warning"
+            },
+            **{k: v for k, v in usage.items() if k == "lease_warning"},
+        }
 
-    def _op_list_jobs(self, *, origin: str, target: str | None, limit: int) -> dict[str, Any]:
+    def _op_list_jobs(
+        self,
+        *,
+        origin: str,
+        target: str | None,
+        limit: int,
+        lease_id: str | None = None,
+        client_id: str | None = None,
+    ) -> dict[str, Any]:
         target_id = None
         if target is not None:
             try:
                 target_id = self.registry.resolve(target).id
             except TargetLookupError:
                 target_id = target.strip()
-        jobs = self.jobs.list(target_id=target_id, limit=limit)
+        jobs = self.jobs.list(target_id=target_id, limit=limit, lease_id=lease_id, client_id=client_id)
         return {"jobs": [job.summary(include_created=True) for job in jobs], "counts": self.jobs.counts()}
 
     def _op_get_purpose_history(
@@ -1002,6 +1228,7 @@ class HubService:
         purpose: str | None,
         max_output_bytes: int,
         progress: Progress | None,
+        lease_id: str | None = None,
     ) -> dict[str, Any]:
         patterns = [part.strip() for pattern in targets for part in pattern.split(",") if part.strip()]
         self._validate_code(language, mode, code)
@@ -1024,6 +1251,8 @@ class HubService:
                 if probes[target.id].status != ONLINE
             ]
         runs: list[tuple[Target, str]] = []
+        if lease_id:
+            self.leases.validate_targets(lease_id, [target.id for target in matched])
         for target in eligible:
             try:
                 runs.append((target, self._language_for(target, language, mode)))
@@ -1038,6 +1267,7 @@ class HubService:
             timeout_s=timeout_s,
             origin=origin,
             purpose=purpose,
+            lease_id=lease_id,
         )
         self._wait(jobs, wait_s, progress, prefix=True)
         return self._broadcast_view(broadcast, jobs, max_output_bytes)
@@ -1050,8 +1280,13 @@ class HubService:
         wait_s: float,
         max_output_bytes: int,
         progress: Progress | None,
+        lease_id: str | None = None,
     ) -> dict[str, Any]:
         broadcast, jobs = self.jobs.get_broadcast(broadcast_id)
+        if lease_id:
+            self.leases.validate_targets(lease_id, [job.target.id for job in jobs])
+        for job in jobs:
+            self.leases.use(job.target.id, lease_id, origin=origin)
         self._wait(jobs, wait_s, progress, prefix=True)
         return self._broadcast_view(broadcast, jobs, max_output_bytes)
 
@@ -1067,6 +1302,7 @@ class HubService:
         overwrite: bool,
         wait_s: float,
         progress: Progress | None,
+        lease_id: str | None = None,
     ) -> dict[str, Any]:
         if not remote_path.strip():
             raise _invalid("remote_path must not be empty")
@@ -1078,6 +1314,7 @@ class HubService:
             overwrite=overwrite,
             origin=origin,
             purpose=purpose,
+            lease_id=lease_id,
         )
         self._wait([job], wait_s, progress, prefix=False)
         return self._job_view(job, 0)
@@ -1093,6 +1330,7 @@ class HubService:
         overwrite: bool,
         wait_s: float,
         progress: Progress | None,
+        lease_id: str | None = None,
     ) -> dict[str, Any]:
         local = Path(local_path).expanduser()
         if not local.is_absolute():
@@ -1109,6 +1347,7 @@ class HubService:
             overwrite=overwrite,
             wait_s=wait_s,
             progress=progress,
+            lease_id=lease_id,
         )
 
     def _op_download_file(
@@ -1122,6 +1361,7 @@ class HubService:
         overwrite: bool,
         wait_s: float,
         progress: Progress | None,
+        lease_id: str | None = None,
     ) -> dict[str, Any]:
         local = Path(local_path).expanduser()
         if not local.is_absolute():
@@ -1142,4 +1382,81 @@ class HubService:
             overwrite=overwrite,
             wait_s=wait_s,
             progress=progress,
+            lease_id=lease_id,
         )
+
+    def _op_register_client(
+        self,
+        *,
+        origin: str,
+        name: str,
+        kind: str | None,
+        host: str | None,
+        session_id: str | None,
+        labels: dict[str, str] | None,
+    ) -> dict[str, Any]:
+        with _translated_errors():
+            return self.leases.register_client(
+                name=name, kind=kind, host=host, session_id=session_id, labels=labels
+            )
+
+    def _op_list_clients(self, *, origin: str, active: bool) -> list[dict[str, Any]]:
+        with _translated_errors():
+            return self.leases.list_clients(active=active)
+
+    def _op_get_client(self, *, origin: str, client_id: str) -> dict[str, Any]:
+        with _translated_errors():
+            return self.leases.get_client(client_id)
+
+    def _op_delete_client(self, *, origin: str, client_id: str) -> dict[str, Any]:
+        with _translated_errors():
+            return self.leases.delete_client(client_id)
+
+    def _op_list_groups(self, *, origin: str) -> list[dict[str, Any]]:
+        with _translated_errors():
+            return self.leases.groups(probe=True)
+
+    def _op_acquire_lease(
+        self,
+        *,
+        origin: str,
+        client_id: str,
+        target: str | None,
+        labels: dict[str, str] | None,
+        purpose: str | None,
+        ttl: str | None,
+    ) -> dict[str, Any]:
+        with _translated_errors():
+            return self.leases.acquire(client_id, target=target, labels=labels, purpose=purpose, ttl=ttl)
+
+    def _op_list_leases(
+        self,
+        *,
+        origin: str,
+        client_id: str | None,
+        group: str | None,
+        label: list[str] | None,
+        state: str,
+    ) -> list[dict[str, Any]]:
+        with _translated_errors():
+            return self.leases.list_leases(client_id=client_id, group=group, label=label, state=state)
+
+    def _op_get_lease(self, *, origin: str, lease_id: str) -> dict[str, Any]:
+        with _translated_errors():
+            return self.leases.get_lease(lease_id)
+
+    def _op_renew_lease(
+        self, *, origin: str, lease_id: str, client_id: str, ttl: str | None
+    ) -> dict[str, Any]:
+        with _translated_errors():
+            return self.leases.renew(lease_id, client_id, ttl=ttl)
+
+    def _op_release_lease(self, *, origin: str, lease_id: str, client_id: str | None) -> dict[str, Any]:
+        with _translated_errors():
+            return self.leases.release(lease_id, client_id=client_id)
+
+    def _op_force_release_lease(self, *, origin: str, lease_id: str) -> dict[str, Any]:
+        if origin != "rest":
+            raise HubError("force-release is REST dashboard only", status=403, code="forbidden")
+        with _translated_errors():
+            return self.leases.release(lease_id, force=True)

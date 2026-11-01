@@ -1,5 +1,7 @@
 """Static CSS and JavaScript of the hub dashboard (inlined into every page under a CSP nonce)."""
 
+from importlib.resources import files
+
 CSS = """
 :root{--bg:#f5f6f8;--paper:#fff;--ink:#18232e;--muted:#667481;--faint:#909ba6;--line:#e5e9ed;--accent:#087f78;
 --accent-soft:#e8f5f1;--blue:#4975c8;--orange:#b76923;--orange-soft:#fff5e8;--red:#bb5160;--red-soft:#fdeef0;
@@ -173,6 +175,35 @@ padding:5px 9px;border-radius:5px;font:11px var(--sans)}
 .purpose-panel footer p{margin-bottom:8px}.purpose-panel [role=alert]{padding:0 17px;color:var(--red);font-size:11px}
 .purpose-panel .purpose-loading{padding:4px 17px;color:var(--muted);font-size:11px}
 .purpose-trigger:focus-visible,.purpose-panel button:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.lease-cell{min-width:280px;max-width:340px;overflow-wrap:anywhere}
+.lease-holder{display:block;font-weight:600;margin-top:5px}
+.lease-state{display:inline-block;font-size:10px;font-weight:600;padding:1px 7px;border-radius:4px;
+background:var(--code);color:var(--muted)}
+.lease-state.leased,.lease-state.active{background:var(--accent-soft);color:var(--accent)}
+.lease-state.cooling,.lease-state.expired{background:var(--orange-soft);color:var(--orange)}
+.lease-state.unavailable{background:var(--red-soft);color:var(--red)}
+.lease-tag{display:inline-block;font:9px var(--mono);padding:2px 5px;border:1px solid var(--line);
+border-radius:4px;margin:4px 4px 0 0;background:var(--code);overflow-wrap:anywhere}
+.lease-cell .bar{display:block;margin-top:7px}.lease-actions{min-width:180px}
+.lease-button{display:inline-block;cursor:pointer;padding:4px 7px;border:1px solid var(--line);border-radius:5px;
+font:10px var(--sans);color:var(--accent);background:var(--paper);margin:2px}
+.lease-button:hover{background:var(--accent-soft);text-decoration:none}
+.lease-button.danger{color:var(--red);border-color:var(--red)}
+.lease-button:focus-visible,.lease-dialog button:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.toolbar select{border:1px solid var(--line);border-radius:5px;padding:5px;background:var(--paper);color:var(--ink)}
+.lease-rules{padding:15px;background:var(--code);border:1px solid var(--line);border-radius:7px;
+overflow:auto;max-height:420px;font-size:11px}
+.lease-event{white-space:pre-wrap;overflow-wrap:anywhere;max-width:700px;font:10px var(--mono)}
+.lease-dialog{width:570px;max-width:calc(100vw - 32px);max-height:calc(100vh - 40px);overflow:auto;
+padding:26px;border:1px solid var(--line);border-radius:12px;background:var(--paper);color:var(--ink);
+box-shadow:0 15px 60px #102e3140}
+.lease-dialog::backdrop{background:#102e3166}.lease-dialog h2{font-size:19px;margin:8px 0 14px}
+.lease-dialog p{font-size:12px;line-height:1.7;margin:10px 0;overflow-wrap:anywhere}
+.lease-dialog .lease-warning{padding:12px;background:var(--orange-soft);color:var(--orange);
+border:1px solid var(--line);border-radius:7px}
+.lease-dialog .lease-dialog-actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:20px}
+.lease-dialog .primary{background:var(--accent);color:var(--paper);border-color:var(--accent)}
+.lease-action-error{color:var(--red);padding:12px}
 """
 
 JS = r"""
@@ -222,17 +253,20 @@ JS = r"""
     const p = ($("#podq") ? $("#podq").value : "").toLowerCase();
     $$(".pods a").forEach(a => { a.hidden = !!p && !a.textContent.toLowerCase().includes(p); });
     filterHycos();
+    window.PrivyLeases?.filter();
   }
   function filterHycos() {
     const box = $("#hycoq"), table = $("#hycos");
     if (!box || !table) return;
     const terms = box.value.toLowerCase().split(/\s+/).filter(Boolean);
     const st = $(".seg.st a.on"), s = st ? st.dataset.s : "all";
+    const lease = $("#hycolease")?.value || "all";
     let shown = 0, up = 0, total = 0;
     $$("tbody tr", table).forEach(tr => {
       total++;
       const hay = tr.dataset.q || "", isUp = tr.dataset.up === "1";
-      const ok = terms.every(t => hay.includes(t)) && (s === "all" || (s === "up") === isUp);
+      const ok = terms.every(t => hay.includes(t)) && (s === "all" || (s === "up") === isUp) &&
+        (lease === "all" || tr.dataset.leaseState === lease);
       tr.hidden = !ok;
       if (ok) { shown++; if (isUp) up++; }
     });
@@ -243,6 +277,7 @@ JS = r"""
     const url = new URL(location.href);
     if (box.value) url.searchParams.set("q", box.value); else url.searchParams.delete("q");
     if (s !== "all") url.searchParams.set("status", s); else url.searchParams.delete("status");
+    if (lease !== "all") url.searchParams.set("lease_state", lease); else url.searchParams.delete("lease_state");
     if (url.href !== location.href) history.replaceState(null, "", url);
   }
   function tail(pre) { pre.scrollTop = pre.scrollHeight; }
@@ -287,6 +322,7 @@ JS = r"""
     const f = $("#follow"); if (f) f.checked = store("privy.follow", true);
     const params = new URLSearchParams(location.search), hq = $("#hycoq");
     if (hq && params.get("q")) hq.value = params.get("q");
+    if ($("#hycolease") && params.get("lease_state")) $("#hycolease").value = params.get("lease_state");
     if (params.get("status")) $$(".seg.st a").forEach(a => a.classList.toggle("on", a.dataset.s === params.get("status")));
     restoreSort();
     applyFilters();
@@ -296,7 +332,9 @@ JS = r"""
 
   let busy = false;
   async function refresh() {
+    if (document.querySelector(".lease-dialog[open]")) return;
     if (document.querySelector("#purpose-panel:not([hidden])")) return;
+    if (document.querySelector(".lease-dialog[open]")) return;
     if ($("#remote-exec")) {
       document.dispatchEvent(new Event("remote-exec-refresh"));
       return;
@@ -313,7 +351,7 @@ JS = r"""
       const keep = new Map($$("details.term[data-following]").map(d => [d.id, d]));
       const scroll = new Map($$("details.term[id] pre").map(p => [p.closest("details").id,
         p.scrollHeight - p.scrollTop - p.clientHeight < 30 ? -1 : p.scrollTop]));
-      const values = new Map($$("#main input[id]").map(i => [i.id, i.type === "checkbox" ? i.checked : i.value]));
+      const values = new Map($$("#main input[id], #main select[id]").map(i => [i.id, i.type === "checkbox" ? i.checked : i.value]));
       const kind = $(".seg.kind a.on"), st = $(".seg.st a.on");
       for (const id of ["main", "nav", "topchips", "appinfo"]) {
         const a = document.getElementById(id), b = doc.getElementById(id);
@@ -352,6 +390,7 @@ JS = r"""
     if (t.id === "expand") $$("details.term").forEach(d => { d.open = t.checked; });
     if (t.id === "follow") { save("privy.follow", t.checked); follow(); }
     if (t.id === "autorefresh") save("privy.refresh", t.checked);
+    if (t.id === "hycolease") applyFilters();
   });
   document.addEventListener("toggle", e => {
     if (e.target.matches && e.target.matches("details.term") && e.target.open) tail($("pre", e.target));
@@ -518,3 +557,5 @@ JS = r"""
   document.addEventListener("scroll", e => { if (!panel?.contains(e.target)) position(); }, true);
 })();
 """
+
+JS += files("privy.hub").joinpath("assets").joinpath("leases.js").read_text(encoding="utf-8")

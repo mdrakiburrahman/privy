@@ -98,6 +98,8 @@ class JobEntry:
     duration_ms: int | None = None
     bytes_moved: int = 0
     command_truncated: bool = False
+    lease_id: str | None = None
+    client_id: str | None = None
 
     @property
     def restored(self) -> bool:
@@ -116,6 +118,8 @@ class JobEntry:
             "broadcast_id": self.broadcast_id,
             "restored": self.restored,
             "command_truncated": self.command_truncated,
+            "lease_id": self.lease_id,
+            "client_id": self.client_id,
         }
         job = self.job
         if job is None:
@@ -229,6 +233,8 @@ class HubMetrics:
             origin=job.origin,
             created_at=job.created_at,
             broadcast_id=job.broadcast_id,
+            lease_id=job.lease_id,
+            client_id=job.client_id,
             job=job,
         )
         with self._lock:
@@ -295,6 +301,8 @@ class HubMetrics:
                     created_at=at,
                     broadcast_id=record.get("broadcast_id"),
                     command_truncated=bool(record.get("code_truncated")),
+                    lease_id=record.get("lease_id"),
+                    client_id=record.get("client_id"),
                 )
             elif job_id in restored:
                 entry = restored[job_id]

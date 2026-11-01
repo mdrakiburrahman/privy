@@ -367,6 +367,10 @@ class McpEndpoint:
             }
         return {
             "content": [{"type": "text", "text": render(name, result, transport="mcp")}],
-            "structuredContent": result,
+            "structuredContent": (
+                {{"list_clients": "clients", "list_groups": "groups", "list_leases": "leases"}[name]: result}
+                if isinstance(result, list)
+                else result
+            ),
             "isError": False,
         }

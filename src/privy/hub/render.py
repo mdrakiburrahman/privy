@@ -42,7 +42,16 @@ def _job_header(job: dict[str, Any]) -> str:
         header += f", {_seconds(job['duration_ms'])}"
     if job.get("error"):
         header += f" ({job['error']})"
-    return header + "\n"
+    return header + "\n" + _lease_warning(job)
+
+
+def _lease_warning(result: dict[str, Any]) -> str:
+    warning = result.get("lease_warning")
+    return (
+        "[privy] lease_warning=" + json.dumps(warning, ensure_ascii=True, separators=(",", ":")) + "\n"
+        if warning
+        else ""
+    )
 
 
 def _job_body(job: dict[str, Any]) -> str:
@@ -189,7 +198,7 @@ def render_output(result: dict[str, Any], transport: str = "rest") -> str:
         + (", end" if result.get("eof") else "")
         + "]\n"
     )
-    return _ensure_newline(result.get("data", "")) + footer
+    return _lease_warning(result) + _ensure_newline(result.get("data", "")) + footer
 
 
 def render_purpose_history(result: dict[str, Any], transport: str = "rest") -> str:

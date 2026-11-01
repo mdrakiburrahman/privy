@@ -15,7 +15,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 from privy.hub import dashboard, guide, render
 from privy.hub.jobs import HubJob
@@ -23,6 +23,7 @@ from privy.hub.mcp import MCP_PATH, SUPPORTED_VERSIONS
 from privy.hub.metrics import DEFAULT_RANGE, RANGES, public_report
 from privy.hub.responses import TEXT_TYPE, HttpResponse, error_response
 from privy.hub.service import (
+    FORCE_RELEASE_OPERATION,
     INSTRUCTIONS,
     OPERATIONS,
     OPERATIONS_BY_NAME,
@@ -31,6 +32,7 @@ from privy.hub.service import (
     HubError,
     HubService,
     Param,
+    _translated_errors,
 )
 from privy.hub.terminals import TerminalBridge
 
@@ -41,7 +43,11 @@ STREAM_JOB = "stream_job"
 RELAYS_PATH = "/v1/relays"
 RELAYS_OPERATION = "get_relay_credentials"
 RELAYS_TITLE = "Get normalized Relay credentials per target (REST only)"
-REST_OPERATIONS = {**OPERATIONS_BY_NAME, SYNC_OPERATION.name: SYNC_OPERATION}
+REST_OPERATIONS = {
+    **OPERATIONS_BY_NAME,
+    SYNC_OPERATION.name: SYNC_OPERATION,
+    FORCE_RELEASE_OPERATION.name: FORCE_RELEASE_OPERATION,
+}
 
 _PATH_PARAM_RE = re.compile(r"\{(\w+)\}")
 _UI_LOG_RE = re.compile(r"/ui/jobs/([^/]+)/log")
@@ -79,6 +85,17 @@ class Route:
 
 
 ROUTES: tuple[Route, ...] = (
+    Route("POST", "/v1/clients", "register_client"),
+    Route("GET", "/v1/clients", "list_clients"),
+    Route("GET", "/v1/clients/{client_id}", "get_client"),
+    Route("DELETE", "/v1/clients/{client_id}", "delete_client"),
+    Route("GET", "/v1/groups", "list_groups"),
+    Route("POST", "/v1/leases", "acquire_lease"),
+    Route("GET", "/v1/leases", "list_leases"),
+    Route("GET", "/v1/leases/{lease_id}", "get_lease"),
+    Route("POST", "/v1/leases/{lease_id}/renew", "renew_lease"),
+    Route("DELETE", "/v1/leases/{lease_id}", "release_lease"),
+    Route("POST", "/v1/leases/{lease_id}/force-release", FORCE_RELEASE_OPERATION.name),
     Route("GET", "/v1/targets", "list_targets"),
     Route("GET", "/v1/purposes", "get_purpose_history"),
     Route("GET", "/v1/targets/{target}", "get_target"),
@@ -153,6 +170,24 @@ def _method_not_allowed(methods: list[str]) -> HttpResponse:
     )
 
 
+def _same_origin_ui(headers: Mapping[str, str]) -> bool:
+    origin = headers.get("Origin")
+    host = headers.get("Host")
+    if not origin or not host:
+        return False
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() == "http"
+        and parsed.netloc.casefold() == host.casefold()
+        and parsed.path in ("", "/")
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
 # ---- live streams -------------------------------------------------------------
 
 
@@ -173,9 +208,19 @@ def _stream_trailer(job: HubJob) -> str:
     return trailer + "\n"
 
 
-def write_job_stream(job: HubJob, write: Callable[[bytes], None], *, poll_s: float = STREAM_POLL_S) -> None:
+def write_job_stream(
+    job: HubJob,
+    write: Callable[[bytes], None],
+    *,
+    poll_s: float = STREAM_POLL_S,
+    usage: dict[str, Any] | None = None,
+) -> None:
     """Write a job's output to ``write`` as it arrives, between a header and a trailer line."""
     write(_stream_header(job).encode("utf-8"))
+    lease_warning = job.lease_warning if usage is None else usage.get("lease_warning")
+    if lease_warning:
+        warning = json.dumps(lease_warning, ensure_ascii=True, separators=(",", ":"))
+        write(f"[privy] lease_warning={warning}\n".encode("ascii"))
     index = 0
     at_line_start = True
     while True:
@@ -199,12 +244,12 @@ def write_job_stream(job: HubJob, write: Callable[[bytes], None], *, poll_s: flo
     write((trailer if at_line_start else "\n" + trailer).encode("utf-8", "backslashreplace"))
 
 
-def _stream_response(job: HubJob) -> HttpResponse:
+def _stream_response(job: HubJob, usage: dict[str, Any] | None = None) -> HttpResponse:
     return HttpResponse(
         200,
         headers={"X-Privy-Job-Id": job.id},
         content_type=TEXT_TYPE,
-        stream=lambda write: write_job_stream(job, write),
+        stream=lambda write: write_job_stream(job, write, usage=usage),
         note=f"stream job={job.id}",
     )
 
@@ -234,7 +279,7 @@ class RestApi:
         body: bytes,
     ) -> HttpResponse:
         base_url = self.base_url_for(headers)
-        terminal_response = self.terminals.route(method, path, headers, body)
+        terminal_response = self.terminals.route(method, path, headers, body, query=query)
         if terminal_response is not None:
             return terminal_response
         ui = dashboard.PAGES
@@ -332,6 +377,7 @@ class RestApi:
         body: bytes,
     ) -> HttpResponse:
         text = False
+        origin = "ui" if headers.get("X-Privy-UI") == "1" else "rest"
         try:
             output_format = _last(query, "format", "json").strip().lower()
             if output_format not in ("json", "text"):
@@ -340,26 +386,55 @@ class RestApi:
             stream = route.streams and _flag("stream", _last(query, "stream", "false"))
             args = self._arguments(route, path_values, query, headers, body)
             if route.operation == STREAM_JOB:
-                if set(args) - {"job_id"}:
+                if set(args) - {"job_id", "lease_id"}:
                     raise _invalid(
-                        f"unknown argument(s) for stream_job: {', '.join(sorted(set(args) - {'job_id'}))}"
+                        f"unknown argument(s) for stream_job: {', '.join(sorted(set(args) - {'job_id', 'lease_id'}))}"
                     )
-                return _stream_response(self.service.job(args["job_id"]))
+                return _stream_response(
+                    *self.service.job_usage(args["job_id"], lease_id=args.get("lease_id"), origin=origin)
+                )
+            if route.operation == FORCE_RELEASE_OPERATION.name:
+                FORCE_RELEASE_OPERATION.parse(args)
+                if headers.get("X-Privy-UI") != "1" or not _same_origin_ui(headers):
+                    return error_response(
+                        403,
+                        "forbidden_origin",
+                        "Force-release requires a same-origin dashboard request with X-Privy-UI: 1",
+                    )
+                result = self.service._op_force_release_lease(origin="rest", lease_id=args["lease_id"])
+                if text:
+                    return HttpResponse(
+                        200,
+                        text=render.render(route.operation, result, transport="rest"),
+                    )
+                return HttpResponse(200, result)
+            if route.operation == "list_jobs" and route.method == "GET":
+                header_lease = headers.get("X-Privy-Lease")
+                if header_lease:
+                    with _translated_errors():
+                        self.service.leases.touch(header_lease)
             if stream and route.operation == "run":
-                return _stream_response(self.service.start_run(args, origin="rest"))
+                return _stream_response(self.service.start_run(args, origin=origin))
             if stream:
                 OPERATIONS_BY_NAME[route.operation].parse(args)
-                return _stream_response(self.service.job(args["job_id"]))
+                return _stream_response(
+                    *self.service.job_usage(args["job_id"], lease_id=args.get("lease_id"), origin=origin)
+                )
             if route.operation == SYNC_OPERATION.name:
-                result = self.service.start_sync(args, origin="rest")
+                result = self.service.start_sync(args, origin=origin)
             else:
-                result = self.service.invoke(route.operation, args, origin="rest")
+                result = self.service.invoke(route.operation, args, origin=origin)
         except HubError as exc:
             error = exc.to_dict()
             if text:
                 return HttpResponse(exc.status, text=render.render_error(error), note=exc.code)
             return HttpResponse(exc.status, {"error": error}, note=exc.code)
-        status = 202 if route.operation == SYNC_OPERATION.name else 200
+        if route.operation == SYNC_OPERATION.name:
+            status = 202
+        elif route.operation in {"register_client", "acquire_lease"} and result.get("created"):
+            status = 201
+        else:
+            status = 200
         response_headers = {"Location": f"/v1/jobs/{result['job_id']}"} if status == 202 else {}
         if text:
             operation = "get_job" if route.operation == SYNC_OPERATION.name else route.operation
@@ -407,6 +482,23 @@ class RestApi:
                     if name in args:
                         raise _invalid(f"{name} was sent both in the query string and in the body")
                     args[name] = value
+        if route.operation in {
+            "run",
+            "broadcast",
+            STREAM_JOB,
+            "get_job",
+            "read_job_output",
+            "cancel_job",
+            "get_broadcast",
+            "upload_file",
+            "download_file",
+            SYNC_OPERATION.name,
+        }:
+            header_lease = headers.get("X-Privy-Lease")
+            if header_lease:
+                if "lease_id" in args and args["lease_id"] != header_lease:
+                    raise _invalid("lease_id conflicts with X-Privy-Lease")
+                args.setdefault("lease_id", header_lease)
         if route.raw_anchor and route.raw_anchor in args and "code" not in args:
             raise _invalid(
                 f"send the code to run as the request body ({route.raw_anchor} is in the query string)"
@@ -498,7 +590,7 @@ def _parameter(param: Param, location: str, *, required: bool) -> dict[str, Any]
         "schema": schema,
     }
     if param.type == "array":
-        entry.update(style="form", explode=False)
+        entry.update(style="form", explode=param.name == "label")
     return entry
 
 
@@ -528,7 +620,14 @@ def _operation_spec(route: Route, base_url: str, example: guide.Example) -> dict
                     "required": True,
                     "description": "Job id returned by run.",
                     "schema": {"type": "string"},
-                }
+                },
+                {"name": "lease_id", "in": "query", "required": False, "schema": {"type": "string"}},
+                {
+                    "name": "X-Privy-Lease",
+                    "in": "header",
+                    "required": False,
+                    "schema": {"type": "string"},
+                },
             ],
             "responses": {
                 "200": _response(samples, json_body=False),
@@ -549,6 +648,49 @@ def _operation_spec(route: Route, base_url: str, example: guide.Example) -> dict
                 parameters.append(_parameter(param, "query", required=param.required))
             elif param.name != "code":
                 parameters.append(_parameter(param, "query", required=False))
+        if route.operation in {
+            "run",
+            "broadcast",
+            "get_job",
+            "read_job_output",
+            "cancel_job",
+            "list_jobs",
+            "get_broadcast",
+            "upload_file",
+            "download_file",
+            SYNC_OPERATION.name,
+        }:
+            parameters.append(
+                {
+                    "name": "X-Privy-Lease",
+                    "in": "header",
+                    "required": False,
+                    "description": (
+                        "Touch/renew this lease while listing jobs; it is not a list filter."
+                        if route.operation == "list_jobs"
+                        else "Lease id alternative to the lease_id argument."
+                    ),
+                    "schema": {"type": "string"},
+                }
+            )
+        if route.operation == FORCE_RELEASE_OPERATION.name:
+            parameters.extend(
+                [
+                    {
+                        "name": "Origin",
+                        "in": "header",
+                        "required": True,
+                        "description": "Must match the host and origin serving the dashboard.",
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "X-Privy-UI",
+                        "in": "header",
+                        "required": True,
+                        "schema": {"type": "string", "const": "1"},
+                    },
+                ]
+            )
         parameters.append(_FORMAT_PARAM)
         if route.streams:
             parameters.append(_STREAM_PARAM)
@@ -568,6 +710,16 @@ def _operation_spec(route: Route, base_url: str, example: guide.Example) -> dict
             "parameters": parameters,
             "responses": {"200": _response(samples), "default": {"$ref": "#/components/responses/Error"}},
         }
+        if route.operation in {"list_clients", "list_groups", "list_leases"}:
+            spec["responses"]["200"]["content"]["application/json"]["schema"] = {
+                "type": "array",
+                "items": {"type": "object"},
+            }
+        if route.operation in {"register_client", "acquire_lease"}:
+            spec["responses"]["201"] = {
+                **spec["responses"]["200"],
+                "description": "Created",
+            }
         if route.operation == SYNC_OPERATION.name:
             accepted = spec["responses"].pop("200")
             accepted.update(
@@ -773,6 +925,7 @@ def openapi_document(service: HubService, base_url: str) -> dict[str, Any]:
                     "shell": {"type": "string", "enum": ["powershell", "bash"]},
                     "request_id": {"type": "string", "minLength": 16, "maxLength": 128},
                     "purpose": PURPOSE_PARAM.json_schema(),
+                    "lease_id": {"type": "string", "description": "Lease id for this terminal's target."},
                 }
             )
             required += ["target", "shell", "request_id"]
@@ -826,6 +979,16 @@ def openapi_document(service: HubService, base_url: str) -> dict[str, Any]:
                 },
             },
         }
+        if action == "open":
+            spec["parameters"] = [
+                {"name": "lease_id", "in": "query", "required": False, "schema": {"type": "string"}},
+                {
+                    "name": "X-Privy-Lease",
+                    "in": "header",
+                    "required": False,
+                    "schema": {"type": "string"},
+                },
+            ]
         if action != "open":
             spec["parameters"] = [
                 {"name": "session_id", "in": "path", "required": True, "schema": {"type": "string"}}

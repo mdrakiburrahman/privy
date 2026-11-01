@@ -162,7 +162,7 @@ const PrivyComposer = (() => {
       editor.focus();
       editor.setSelectionRange(editor.value.length, editor.value.length);
     }
-    function run() {
+    async function run() {
       if (composing || !available || pending) return;
       const text = editor.value;
       let input;
@@ -175,7 +175,7 @@ const PrivyComposer = (() => {
       controls();
       try {
         // The terminal chooses native bracketed paste only when the shell advertised it.
-        submit(text, ticket, input);
+        await submit(text, ticket, input);
       } catch (error) {
         pending = false;
         ticket = null;
