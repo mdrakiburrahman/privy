@@ -72,6 +72,10 @@ used. Without one, existing execution behavior is unchanged; if another client h
 response includes a `lease_warning`. `GET /v1/jobs` also accepts `lease_id` and `client_id` filters.
 MCP exposes client, group, and lease operations, but not force-release.
 
+Job detail, output, and stream reads renew or revive a supplied lease only when it matches the job's
+recorded `lease_id`. Peeking at an unleased or differently leased job remains allowed and does not
+renew the supplied lease, even when both belong to the same target group.
+
 ## Remote Exec workspace
 
 Open **Remote Exec** in the sidebar at `/ui/exec`, choose a machine and **PowerShell** or **Bash**,

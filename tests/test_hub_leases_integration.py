@@ -368,7 +368,9 @@ def test_text_work_responses_preserve_advisory_warning(leased):
     result = hub.call("POST", "/v1/jobs?format=text", {"target": WSL, "code": "echo human"})
     assert result.status == 200 and "lease_warning=" in result.text
     assert lease["lease_id"] in result.text
-    submitted = hub.call("POST", "/v1/jobs", {"target": WSL, "code": "echo human"}).payload
+    submitted = hub.call(
+        "POST", "/v1/jobs", {"target": WSL, "code": "echo human", "lease_id": lease["lease_id"]}
+    ).payload
     for suffix in ("?format=text", "/output?stream=stdout&format=text"):
         result = hub.call("GET", f"/v1/jobs/{submitted['job_id']}{suffix}")
         assert result.status == 200 and "lease_warning=" in result.text
@@ -376,3 +378,32 @@ def test_text_work_responses_preserve_advisory_warning(leased):
             "GET", f"/v1/jobs/{submitted['job_id']}{suffix}", headers={"X-Privy-Lease": lease["lease_id"]}
         )
         assert "lease_warning=" not in result.text
+
+
+@pytest.mark.parametrize("suffix", ["", "/output?stream=stdout", "/stream", "?stream=true"])
+@pytest.mark.parametrize("job_kind", ["unleased", "different", "matching"])
+@pytest.mark.parametrize("expired", [False, True])
+def test_job_reads_only_renew_or_revive_the_jobs_recorded_lease(leased, suffix, job_kind, expired):
+    hub, now, client, lease, _ = leased
+    body = {"target": WSL, "code": "echo readable"}
+    if job_kind != "unleased":
+        body["lease_id"] = lease["lease_id"]
+    submitted = hub.call("POST", "/v1/jobs", body).payload
+    if job_kind == "different":
+        hub.call("DELETE", f"/v1/leases/{lease['lease_id']}?client_id={client['client_id']}")
+        lease = hub.call("POST", "/v1/leases", {"client_id": client["client_id"], "target": WSL}).payload
+    now[0] += 1801 if expired else 100
+    before = hub.service.leases.get_lease(lease["lease_id"])
+    response = hub.call(
+        "GET", f"/v1/jobs/{submitted['job_id']}{suffix}", headers={"X-Privy-Lease": lease["lease_id"]}
+    )
+    assert response.status == 200
+    if response.stream:
+        response.stream(lambda _: None)
+    after = hub.service.leases.get_lease(lease["lease_id"])
+    if job_kind == "matching":
+        assert after["state"] == "active"
+        assert after["expires_at"] > before["expires_at"]
+    else:
+        assert after["state"] == before["state"]
+        assert after["expires_at"] == before["expires_at"]

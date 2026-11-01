@@ -910,7 +910,9 @@ class HubService:
     ) -> tuple[HubJob, dict[str, Any]]:
         with _translated_errors():
             job = self.jobs.get(job_id)
-            usage = self.leases.use(job.target.id, lease_id, origin=origin)
+            usage = self.leases.use(
+                job.target.id, lease_id if job.lease_id == lease_id else None, origin=origin
+            )
             return job, usage
 
     def summary(self) -> dict[str, Any]:
@@ -1148,8 +1150,7 @@ class HubService:
         progress: Progress | None,
         lease_id: str | None = None,
     ) -> dict[str, Any]:
-        job = self.jobs.get(job_id)
-        usage = self.leases.use(job.target.id, lease_id, origin=origin)
+        job, usage = self.job_usage(job_id, lease_id=lease_id, origin=origin)
         self._wait([job], wait_s, progress, prefix=False)
         offsets = None
         if stdout_offset is not None or stderr_offset is not None:
@@ -1166,8 +1167,7 @@ class HubService:
     def _op_read_job_output(
         self, *, origin: str, job_id: str, stream: str, offset: int, limit: int, lease_id: str | None = None
     ) -> dict[str, Any]:
-        job = self.jobs.get(job_id)
-        usage = self.leases.use(job.target.id, lease_id, origin=origin)
+        job, usage = self.job_usage(job_id, lease_id=lease_id, origin=origin)
         if job.type != "exec":
             raise _invalid(f"job {job_id!r} is a file transfer and has no output streams")
         return {
