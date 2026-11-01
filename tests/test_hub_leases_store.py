@@ -166,6 +166,80 @@ def test_expired_token_revives_without_cooldown_but_loses_after_takeover(leasing
     assert store.get_lease(takeover["lease_id"])["state"] == "active"
 
 
+@pytest.mark.parametrize("ending", ["expired", "released"])
+@pytest.mark.parametrize("restart", [False, True])
+def test_superseded_token_stays_lost_after_new_holder_expires_or_releases(leasing, tmp_path, ending, restart):
+    hub, store, now = leasing
+    owner, other = client(store), client(store, "other")
+    old = acquire(store, owner)
+    now[0] += 2701
+    newer = acquire(store, other)
+    if ending == "expired":
+        now[0] += 1801
+        assert store.get_lease(newer["lease_id"])["state"] == "expired"
+    else:
+        store.release(newer["lease_id"], other)
+    if restart:
+        store = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
+    with pytest.raises(LeaseError) as error:
+        store.use("dev/raki-windows-big_wsl", old["lease_id"])
+    assert error.value.code == "lease_lost"
+    assert store.get_lease(newer["lease_id"])["state"] == ending
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_stale_release_cannot_erase_new_holders_expiry_cooldown(leasing, tmp_path, restart):
+    hub, store, now = leasing
+    owner, other, third = client(store), client(store, "other"), client(store, "third")
+    old = acquire(store, owner)
+    now[0] += 2701
+    newer = acquire(store, other)
+    store.use("dev/raki-windows-big_wsl", newer["lease_id"])
+    now[0] += 1801
+    before = next(g for g in store.groups() if g["group"] == old["group"])
+    assert before["state"] == "cooling"
+    store.release(old["lease_id"], owner)
+    if restart:
+        store = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
+    after = next(g for g in store.groups() if g["group"] == old["group"])
+    assert after["state"] == "cooling" and after["leasable_at"] == before["leasable_at"]
+    with pytest.raises(LeaseError) as error:
+        acquire(store, third)
+    assert error.value.code == "cooling_down"
+    with pytest.raises(LeaseError):
+        acquire(store, owner)
+    assert acquire(store, other)["state"] == "active"
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_unregister_permanently_releases_expired_tokens(leasing, tmp_path, restart):
+    hub, store, now = leasing
+    owner = client(store)
+    lease = acquire(store, owner)
+    now[0] += 1801
+    assert store.get_lease(lease["lease_id"])["state"] == "expired"
+    store.delete_client(owner)
+    if restart:
+        store = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
+    with pytest.raises(LeaseError) as error:
+        store.use("dev/raki-windows-big_wsl", lease["lease_id"])
+    assert error.value.code == "lease_released"
+    with pytest.raises(LeaseError) as error:
+        store.get_client(owner)
+    assert error.value.code == "unknown_client"
+
+
+def test_idle_ageout_still_allows_latest_expired_token_revival(leasing):
+    _, store, now = leasing
+    owner = client(store)
+    lease = acquire(store, owner)
+    now[0] += 86401
+    assert store.list_clients() == []
+    store.use("dev/raki-windows-big_wsl", lease["lease_id"])
+    assert store.get_client(owner)["session_id"] == "chat"
+    assert store.get_lease(lease["lease_id"])["state"] == "active"
+
+
 def test_holder_only_release_renew_and_max_ttl(leasing):
     _, store, _ = leasing
     owner, other = client(store), client(store, "other")

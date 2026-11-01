@@ -651,7 +651,6 @@ OPERATIONS: tuple[Operation, ...] = (
         ),
         read_only=False,
         destructive=True,
-        idempotent=True,
     ),
     Operation(
         "list_leases",
@@ -904,10 +903,15 @@ class HubService:
         return self._job_view(job, 0)
 
     def job(self, job_id: str, *, lease_id: str | None = None, origin: str = "rest") -> HubJob:
+        return self.job_usage(job_id, lease_id=lease_id, origin=origin)[0]
+
+    def job_usage(
+        self, job_id: str, *, lease_id: str | None = None, origin: str = "rest"
+    ) -> tuple[HubJob, dict[str, Any]]:
         with _translated_errors():
             job = self.jobs.get(job_id)
-            self.leases.use(job.target.id, lease_id, origin=origin)
-            return job
+            usage = self.leases.use(job.target.id, lease_id, origin=origin)
+            return job, usage
 
     def summary(self) -> dict[str, Any]:
         snapshot = self.registry.snapshot()
@@ -1151,7 +1155,11 @@ class HubService:
         if stdout_offset is not None or stderr_offset is not None:
             offsets = {"stdout": stdout_offset, "stderr": stderr_offset}
         return {
-            **self._job_view(job, max_output_bytes, offsets=offsets),
+            **{
+                k: v
+                for k, v in self._job_view(job, max_output_bytes, offsets=offsets).items()
+                if k != "lease_warning"
+            },
             **{k: v for k, v in usage.items() if k == "lease_warning"},
         }
 
@@ -1173,7 +1181,9 @@ class HubService:
         job = self.jobs.cancel(job_id)
         self.jobs.wait(job, CANCEL_SETTLE_S)
         return {
-            **self._job_view(job, DEFAULT_MAX_OUTPUT_BYTES),
+            **{
+                k: v for k, v in self._job_view(job, DEFAULT_MAX_OUTPUT_BYTES).items() if k != "lease_warning"
+            },
             **{k: v for k, v in usage.items() if k == "lease_warning"},
         }
 

@@ -208,11 +208,18 @@ def _stream_trailer(job: HubJob) -> str:
     return trailer + "\n"
 
 
-def write_job_stream(job: HubJob, write: Callable[[bytes], None], *, poll_s: float = STREAM_POLL_S) -> None:
+def write_job_stream(
+    job: HubJob,
+    write: Callable[[bytes], None],
+    *,
+    poll_s: float = STREAM_POLL_S,
+    usage: dict[str, Any] | None = None,
+) -> None:
     """Write a job's output to ``write`` as it arrives, between a header and a trailer line."""
     write(_stream_header(job).encode("utf-8"))
-    if job.lease_warning:
-        warning = json.dumps(job.lease_warning, ensure_ascii=True, separators=(",", ":"))
+    lease_warning = job.lease_warning if usage is None else usage.get("lease_warning")
+    if lease_warning:
+        warning = json.dumps(lease_warning, ensure_ascii=True, separators=(",", ":"))
         write(f"[privy] lease_warning={warning}\n".encode("ascii"))
     index = 0
     at_line_start = True
@@ -237,12 +244,12 @@ def write_job_stream(job: HubJob, write: Callable[[bytes], None], *, poll_s: flo
     write((trailer if at_line_start else "\n" + trailer).encode("utf-8", "backslashreplace"))
 
 
-def _stream_response(job: HubJob) -> HttpResponse:
+def _stream_response(job: HubJob, usage: dict[str, Any] | None = None) -> HttpResponse:
     return HttpResponse(
         200,
         headers={"X-Privy-Job-Id": job.id},
         content_type=TEXT_TYPE,
-        stream=lambda write: write_job_stream(job, write),
+        stream=lambda write: write_job_stream(job, write, usage=usage),
         note=f"stream job={job.id}",
     )
 
@@ -384,7 +391,7 @@ class RestApi:
                         f"unknown argument(s) for stream_job: {', '.join(sorted(set(args) - {'job_id', 'lease_id'}))}"
                     )
                 return _stream_response(
-                    self.service.job(args["job_id"], lease_id=args.get("lease_id"), origin=origin)
+                    *self.service.job_usage(args["job_id"], lease_id=args.get("lease_id"), origin=origin)
                 )
             if route.operation == FORCE_RELEASE_OPERATION.name:
                 FORCE_RELEASE_OPERATION.parse(args)
@@ -411,7 +418,7 @@ class RestApi:
             if stream:
                 OPERATIONS_BY_NAME[route.operation].parse(args)
                 return _stream_response(
-                    self.service.job(args["job_id"], lease_id=args.get("lease_id"), origin=origin)
+                    *self.service.job_usage(args["job_id"], lease_id=args.get("lease_id"), origin=origin)
                 )
             if route.operation == SYNC_OPERATION.name:
                 result = self.service.start_sync(args, origin=origin)

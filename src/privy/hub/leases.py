@@ -409,7 +409,7 @@ class LeaseStore:
             self._sweep()
             self._client(client_id)
             for lease in list(self._leases.values()):
-                if lease["client_id"] == client_id and lease["state"] == "active":
+                if lease["client_id"] == client_id and lease["state"] != "released":
                     self.release(lease["lease_id"], client_id)
             del self._clients[client_id]
             self.audit.record("client.unregistered", client_id=client_id)
@@ -443,27 +443,16 @@ class LeaseStore:
             None,
         )
 
+    def _latest(self, group: str) -> dict[str, Any] | None:
+        return next((item for item in reversed(self._leases.values()) if item["group"] == group), None)
+
     def _group_view(self, group: dict[str, Any], *, probe: bool = False) -> dict[str, Any]:
         key = group["group"]
         lease = self._active(key)
         use = self._uses.get(key, {})
-        latest = max(
-            (
-                item.get("expired_ts", 0)
-                for item in self._leases.values()
-                if item["group"] == key and item["state"] == "expired"
-            ),
-            default=0,
-        )
-        # Explicit release makes all earlier activity/expiry irrelevant.
-        released = max(
-            (
-                item.get("released_ts", 0)
-                for item in self._leases.values()
-                if item["group"] == key and item["state"] == "released"
-            ),
-            default=0,
-        )
+        allocation = self._latest(key)
+        latest = allocation.get("expired_ts", 0) if allocation and allocation["state"] == "expired" else 0
+        released = allocation.get("released_ts", 0) if allocation and allocation["state"] == "released" else 0
         last = max(use.get("at", 0), latest)
         leasable = last + self.cooldown if last > released else 0
         online = True
@@ -580,15 +569,8 @@ class LeaseStore:
             for candidate in candidates:
                 view = self._group_view(candidate, probe=True)
                 views.append(view)
-                previous = next(
-                    (
-                        item
-                        for item in reversed(list(self._leases.values()))
-                        if item["group"] == candidate["group"] and item["state"] == "expired"
-                    ),
-                    None,
-                )
-                reclaim = previous and previous["client_id"] == client_id
+                previous = self._latest(candidate["group"])
+                reclaim = previous and previous["state"] == "expired" and previous["client_id"] == client_id
                 if view["state"] == "free" or (view["state"] == "cooling" and reclaim):
                     now = self._clock()
                     lease_id = "ls-" + uuid.uuid4().hex
@@ -674,10 +656,10 @@ class LeaseStore:
     def _renew(self, lease: dict[str, Any]) -> None:
         if lease["state"] == "released":
             raise LeaseError("lease was released", status=409, code="lease_released")
-        current = self._active(lease["group"])
+        current = self._latest(lease["group"])
         if current is not None and current["lease_id"] != lease["lease_id"]:
             raise LeaseError(
-                "another client now holds this group",
+                "this lease was superseded by a newer group allocation",
                 status=409,
                 code="lease_lost",
                 details={"lease_id": current["lease_id"], "holder": self._view(current)["holder"]},

@@ -296,3 +296,83 @@ def test_expired_http_token_revives_then_reports_loss_after_takeover(leased):
     )
     assert lost.status == 409 and lost.payload["error"]["code"] == "lease_lost"
     assert hub.call("DELETE", f"/v1/leases/{lease['lease_id']}?client_id={client['client_id']}").status == 200
+
+
+@pytest.mark.parametrize("ending", ["expired", "released"])
+def test_http_stale_token_stays_lost_and_stale_release_preserves_cooldown(leased, ending):
+    hub, now, client, lease, _ = leased
+    now[0] += 2701
+    other = hub.call("POST", "/v1/clients", {"name": "other"}).payload
+    newer = hub.call("POST", "/v1/leases", {"client_id": other["client_id"], "target": WSL}).payload
+    if ending == "expired":
+        now[0] += 1801
+    else:
+        assert (
+            hub.call("DELETE", f"/v1/leases/{newer['lease_id']}?client_id={other['client_id']}").status == 200
+        )
+    lost = hub.call(
+        "POST",
+        "/v1/jobs",
+        {"target": WSL, "code": "must not run"},
+        headers={"X-Privy-Lease": lease["lease_id"]},
+    )
+    assert lost.status == 409 and lost.payload["error"]["code"] == "lease_lost"
+    assert hub.call("DELETE", f"/v1/leases/{lease['lease_id']}?client_id={client['client_id']}").status == 200
+    group = next(g for g in hub.call("GET", "/v1/groups").payload if g["group"] == lease["group"])
+    assert group["state"] == ("cooling" if ending == "expired" else "free")
+
+
+def test_http_unregister_expired_client_cannot_be_reversed_by_old_lease(leased):
+    hub, now, client, lease, _ = leased
+    now[0] += 1801
+    assert hub.call("DELETE", f"/v1/clients/{client['client_id']}").status == 200
+    old = hub.call(
+        "POST",
+        "/v1/jobs",
+        {"target": WSL, "code": "must not run"},
+        headers={"X-Privy-Lease": lease["lease_id"]},
+    )
+    assert old.status == 409 and old.payload["error"]["code"] == "lease_released"
+    assert hub.call("GET", f"/v1/clients/{client['client_id']}").status == 404
+
+
+@pytest.mark.parametrize("suffix", ["/stream", "?stream=true"])
+def test_stream_warning_is_request_specific_and_does_not_mutate_shared_job(leased, suffix):
+    hub, _, client, lease, _ = leased
+    submitted = hub.call(
+        "POST", "/v1/jobs", {"target": WSL, "code": "echo leased", "lease_id": lease["lease_id"]}
+    ).payload
+    job = hub.jobs.get(submitted["job_id"])
+    assert job.lease_warning is None
+    base = f"/v1/jobs/{job.id}{suffix}"
+    chunks = []
+    hub.call("GET", base).stream(chunks.append)
+    assert b"lease_warning=" in b"".join(chunks)
+    assert job.lease_warning is None
+    chunks = []
+    hub.call("GET", base, headers={"X-Privy-Lease": lease["lease_id"]}).stream(chunks.append)
+    assert b"lease_warning=" not in b"".join(chunks)
+    human = hub.call("POST", "/v1/jobs", {"target": WSL, "code": "echo human"}).payload
+    human_job = hub.jobs.get(human["job_id"])
+    assert human_job.lease_warning
+    hub.call("DELETE", f"/v1/leases/{lease['lease_id']}?client_id={client['client_id']}")
+    assert "lease_warning" not in hub.call("GET", f"/v1/jobs/{human_job.id}").payload
+    chunks = []
+    hub.call("GET", f"/v1/jobs/{human_job.id}{suffix}").stream(chunks.append)
+    assert b"lease_warning=" not in b"".join(chunks)
+    assert human_job.lease_warning
+
+
+def test_text_work_responses_preserve_advisory_warning(leased):
+    hub, _, _, lease, _ = leased
+    result = hub.call("POST", "/v1/jobs?format=text", {"target": WSL, "code": "echo human"})
+    assert result.status == 200 and "lease_warning=" in result.text
+    assert lease["lease_id"] in result.text
+    submitted = hub.call("POST", "/v1/jobs", {"target": WSL, "code": "echo human"}).payload
+    for suffix in ("?format=text", "/output?stream=stdout&format=text"):
+        result = hub.call("GET", f"/v1/jobs/{submitted['job_id']}{suffix}")
+        assert result.status == 200 and "lease_warning=" in result.text
+        result = hub.call(
+            "GET", f"/v1/jobs/{submitted['job_id']}{suffix}", headers={"X-Privy-Lease": lease["lease_id"]}
+        )
+        assert "lease_warning=" not in result.text
