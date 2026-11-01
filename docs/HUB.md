@@ -42,6 +42,36 @@ every request, so startup is instant and works without an Azure login.
 For an always-on hub, install the `PrivyHub` logon task described in
 [Scheduled tasks](SCHEDULED_TASKS.md#2-install-the-hub-task).
 
+## Lease a devbox
+
+When using the hub for a task, register a client once, acquire a lease for the devbox stack, pass
+`lease_id` on each job, file-transfer, sync, or terminal-open request, then release the lease when
+finished. A lease is advisory: it prevents another registered client from acquiring the same group,
+but does not block unleased commands.
+
+| Method and path                                                  | Purpose                                                                                                                      |
+| ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/clients`                                               | Register a client (`name`, optional `kind`, `host`, `session_id`, and `labels`). Registration is idempotent on `session_id`. |
+| `GET /v1/clients?active=true`                                    | List clients, optionally only those holding active leases.                                                                   |
+| `GET /v1/clients/{client_id}` / `DELETE /v1/clients/{client_id}` | Inspect a client or unregister it and release its leases.                                                                    |
+| `GET /v1/groups`                                                 | Show group members, current state, holder, and when it becomes leasable.                                                     |
+| `POST /v1/leases`                                                | Acquire by `target` (a member or group name), or omit target to select an available group.                                   |
+| `GET /v1/leases`                                                 | List leases; filter with `client_id`, `group`, repeated `label=key=value`, and `state`.                                      |
+| `GET /v1/leases/{lease_id}`                                      | Inspect a lease, its events, timers, and linked jobs.                                                                        |
+| `POST /v1/leases/{lease_id}/renew`                               | Renew as the holder; optionally supply `ttl` (capped at four hours).                                                         |
+| `DELETE /v1/leases/{lease_id}?client_id=...`                     | Release as the holder.                                                                                                       |
+| `POST /v1/leases/{lease_id}/force-release`                       | Dashboard only: requires a same-origin browser request and `X-Privy-UI: 1`; running jobs continue.                           |
+
+Client and lease detail endpoints return one object directly; `GET /v1/clients`, `GET /v1/groups`,
+and `GET /v1/leases` return bare JSON arrays. Client registration and lease acquisition return
+`201 Created` when newly created and `200 OK` when returning an existing resource.
+
+Lease-aware execution endpoints accept `lease_id` in the query, JSON body, or `X-Privy-Lease`
+header. With a lease id, the hub validates group membership and renews the lease as the call is
+used. Without one, existing execution behavior is unchanged; if another client holds that group, the
+response includes a `lease_warning`. `GET /v1/jobs` also accepts `lease_id` and `client_id` filters.
+MCP exposes client, group, and lease operations, but not force-release.
+
 ## Remote Exec workspace
 
 Open **Remote Exec** in the sidebar at `/ui/exec`, choose a machine and **PowerShell** or **Bash**,

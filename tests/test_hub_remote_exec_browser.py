@@ -98,7 +98,7 @@ def assert_closed(session):
 def test_all_sidebar_icons_and_capability_only_navigation(browser_workspace):
     page, _, linux, _, errors = browser_workspace
     page.goto("http://127.0.0.1:7750/ui/hycos")
-    assert page.locator(".sidebar nav a").count() == page.locator(".sidebar nav a svg").count() == 9
+    assert page.locator(".sidebar nav a").count() == page.locator(".sidebar nav a svg").count() == 10
     assert page.locator("a.remote-link").count() == 1
     assert page.locator("a.remote-link").get_attribute("href") == "/ui/exec?target=contoso-lab%2Fgpu1_linux"
     assert page.locator(".sidebar nav a svg").evaluate_all(

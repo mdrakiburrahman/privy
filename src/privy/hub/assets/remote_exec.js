@@ -205,9 +205,12 @@
     clearTimeout(s.flushTimer);
     s.flushTimer = setTimeout(() => void flush(s), 16);
   }
-  function submitCommand(text, receipt) {
+  async function submitCommand(text, receipt) {
     const s = session;
     if (!s || s.phase !== "connected") throw new Error("Connect to your shell before running a command.");
+    const target = targets.find(item => item.id === s.target) || {id: s.target};
+    if (!await PrivyLeases.confirmTarget(target, "Run")) throw new Error("Run cancelled. Your draft has not been sent.");
+    if (session !== s || s.phase !== "connected" || leaving) throw new Error("The shell changed while confirming. Your draft has not been sent.");
     enqueue(s, PrivyComposer.encode(text, s.shell, terminal.modes.bracketedPasteMode), true, receipt);
   }
   terminal.onData(data => {
@@ -221,6 +224,11 @@
     const target = targets.find(item => item.id === $("exec-target").value);
     const shell = $("exec-language").value;
     if (!target || !target.languages.includes(shell)) return;
+    $("exec-connect").disabled = true;
+    try {
+      if (!await PrivyLeases.confirmTarget(target, "Open terminal")) return;
+      if (session || leaving || $("exec-target").value !== target.id || $("exec-language").value !== shell) return;
+    } finally { controls(); }
     const s = {
       id: crypto.randomUUID(), owner: crypto.randomUUID(), target: target.id, shell,
       offset: 0, seq: 0, queue: [], queued: 0, phase: "connecting", deadline: 0

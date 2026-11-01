@@ -161,6 +161,7 @@ class HubJob:
         output_limit: int,
         broadcast_id: str | None = None,
         purpose: str | None = None,
+        lease_id: str | None = None,
     ) -> None:
         self.id = uuid.uuid4().hex[:12]
         self.type = job_type
@@ -169,6 +170,9 @@ class HubJob:
         self.origin = origin
         self.broadcast_id = broadcast_id
         self.purpose = purpose
+        self.lease_id = lease_id
+        self.client_id: str | None = None
+        self.lease_warning: dict[str, Any] | None = None
         self.created_at = time.time()
         self.started_at: float | None = None
         self.finished_at: float | None = None
@@ -209,6 +213,11 @@ class HubJob:
 
     def _summary_locked(self, *, include_created: bool = False) -> dict[str, Any]:
         result: dict[str, Any] = {"job_id": self.id, "target": self.target.id}
+        result["lease_id"] = self.lease_id
+        if self.client_id:
+            result["client_id"] = self.client_id
+        if self.lease_warning:
+            result["lease_warning"] = self.lease_warning
         if self.purpose is not None:
             result["purpose"] = self.purpose
         if self.type == "exec":
@@ -396,6 +405,7 @@ class JobManager:
         self._registry = registry
         #: Called with every job the hub starts (the dashboard's history).
         self.on_job = on_job
+        self.on_finish: Callable[[HubJob], None] | None = None
         self._slots = threading.BoundedSemaphore(max_running)
         self.max_running = max_running
         self._max_queued = max_queued if max_queued is not None else max_running * 8
@@ -424,6 +434,7 @@ class JobManager:
         origin: str,
         broadcast_id: str | None = None,
         purpose: str | None = None,
+        lease_id: str | None = None,
     ) -> HubJob:
         job = HubJob(
             job_type="exec",
@@ -433,6 +444,7 @@ class JobManager:
             output_limit=self._output_limit,
             broadcast_id=broadcast_id,
             purpose=purpose,
+            lease_id=lease_id,
         )
         return self._launch(job, self._exec_body)
 
@@ -447,6 +459,7 @@ class JobManager:
         origin: str,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         purpose: str | None = None,
+        lease_id: str | None = None,
     ) -> HubJob:
         if direction not in ("upload", "download"):
             raise ValueError(f"invalid transfer direction: {direction!r}")
@@ -462,6 +475,7 @@ class JobManager:
             origin=origin,
             output_limit=0,
             purpose=purpose,
+            lease_id=lease_id,
         )
         return self._launch(job, self._transfer_body)
 
@@ -475,6 +489,7 @@ class JobManager:
         overwrite: bool,
         origin: str,
         purpose: str | None = None,
+        lease_id: str | None = None,
     ) -> HubJob:
         job = HubJob(
             job_type="sync",
@@ -488,6 +503,7 @@ class JobManager:
             origin=origin,
             output_limit=0,
             purpose=purpose,
+            lease_id=lease_id,
         )
         return self._launch(job, self._sync_body)
 
@@ -502,6 +518,7 @@ class JobManager:
         timeout_s: float,
         origin: str,
         purpose: str | None = None,
+        lease_id: str | None = None,
     ) -> tuple[Broadcast, list[HubJob]]:
         """Start ``code`` on every ``(target, language)`` pair."""
         broadcast_id = "b" + uuid.uuid4().hex[:11]
@@ -532,6 +549,7 @@ class JobManager:
                 origin=origin,
                 broadcast_id=broadcast_id,
                 purpose=purpose,
+                lease_id=lease_id,
             )
             for target, language in runs
         ]
@@ -565,12 +583,23 @@ class JobManager:
             jobs = [self._jobs[job_id] for job_id in broadcast.job_ids if job_id in self._jobs]
         return broadcast, jobs
 
-    def list(self, *, target_id: str | None = None, limit: int = 20) -> list[HubJob]:
+    def list(
+        self,
+        *,
+        target_id: str | None = None,
+        limit: int = 20,
+        lease_id: str | None = None,
+        client_id: str | None = None,
+    ) -> list[HubJob]:
         self._reap()
         with self._lock:
             jobs = list(self._jobs.values())
         if target_id is not None:
             jobs = [job for job in jobs if job.target.id.lower() == target_id.lower()]
+        if lease_id is not None:
+            jobs = [job for job in jobs if job.lease_id == lease_id]
+        if client_id is not None:
+            jobs = [job for job in jobs if job.client_id == client_id]
         return list(reversed(jobs))[:limit]
 
     def counts(self) -> dict[str, int]:
@@ -637,11 +666,13 @@ class JobManager:
 
     def _launch(self, job: HubJob, body: Callable[[HubJob], None]) -> HubJob:
         self._ensure_capacity(1)
+        admitted = False
         try:
             with self._lock:
                 self._jobs[job.id] = job
                 if self.on_job is not None:
                     self.on_job(job)
+                admitted = True
             self._audit.record("job.start", **self._audit_fields(job, include_spec=True))
             thread = threading.Thread(
                 target=self._run,
@@ -654,6 +685,8 @@ class JobManager:
             # Never leave a job queued that no thread will ever run.
             with self._lock:
                 self._jobs.pop(job.id, None)
+            if admitted and self.on_finish is not None:
+                self.on_finish(job)
             raise
         return job
 
@@ -851,6 +884,8 @@ class JobManager:
         job.state = state
         job.error = error
         job.finished_at = time.time()
+        if self.on_finish is not None:
+            self.on_finish(job)
         self._audit.record("job.finish", **self._audit_fields(job, include_spec=False))
         console.job_finished(job)
         job.cond.notify_all()
@@ -879,6 +914,8 @@ class JobManager:
             "type": job.type,
             "target": job.target.id,
             "origin": job.origin,
+            "lease_id": job.lease_id,
+            "client_id": job.client_id,
         }
         if job.broadcast_id:
             fields["broadcast_id"] = job.broadcast_id

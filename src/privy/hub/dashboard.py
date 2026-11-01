@@ -15,10 +15,14 @@ import secrets
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote, urlencode
 
+import yaml
+
 from privy.hub.dashboard_assets import CSS, JS
+from privy.hub.leases import LeaseError
 from privy.hub.metrics import BAD_STATES, DEFAULT_RANGE, RANGES, JobEntry
 from privy.hub.registry import ONLINE, UNKNOWN, ProbeResult
 from privy.hub.remote_exec import EXEC_CSS, EXEC_JS, TERMINAL_ICON, workspace
@@ -41,6 +45,7 @@ OPEN_NEWEST = 3
 PAGES = {
     "overview": ("/ui", "Overview"),
     "hycos": ("/ui/hycos", "Relay HYCOs"),
+    "leases": ("/ui/leases", "Leases"),
     "exec": ("/ui/exec", "Remote Exec"),
     "logs": ("/ui/logs", "Logs"),
     "jobs": ("/ui/jobs", "Jobs"),
@@ -134,6 +139,7 @@ def nav_icon(name: str) -> str:
         "hycos": '<rect x="8" y="3" width="8" height="5" rx="1.5"/>'
         '<rect x="2" y="16" width="8" height="5" rx="1.5"/>'
         '<rect x="14" y="16" width="8" height="5" rx="1.5"/><path d="M12 8v4H6v4m6-4h6v4"/>',
+        "leases": '<circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 8.7-8.7M16 7l2.5 2.5M18.5 4.5 21 7"/>',
         "logs": '<path d="M7 3h8l4 4v14H5V5a2 2 0 0 1 2-2Z"/><path d="M14 3v5h5M8 12h8m-8 4h6"/>',
         "jobs": '<rect x="3" y="7" width="18" height="14" rx="3"/>'
         '<path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M3 12h18m-11 0v3h4v-3"/>',
@@ -322,6 +328,8 @@ def shell(
         "logs": report["kept_jobs"],
         "jobs": report["jobs"]["total"],
     }
+    if getattr(service, "leases", None) is not None:
+        nav_counts["leases"] = len(service.leases.list_leases())
     nav = "".join(
         f'<a href="{esc(link(path, range=rng if rng != DEFAULT_RANGE else None))}"'
         f"{ON if name == page else ''}>{nav_icon(name)}{esc(label)}"
@@ -649,12 +657,269 @@ def purpose_cell(row: dict[str, Any]) -> str:
     )
 
 
+def lease_time(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def lease_at(value: Any) -> str:
+    at = lease_time(value)
+    return esc(time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(at))) if at is not None else "—"
+
+
+def lease_labels(labels: Mapping[str, Any]) -> str:
+    return "".join(
+        f'<span class="lease-tag">{esc(str(key))}={esc(str(value))}</span>' for key, value in labels.items()
+    )
+
+
+def lease_state(state: str) -> str:
+    return f'<span class="lease-state {esc(state)}">{esc("cooling down" if state == "cooling" else state)}</span>'
+
+
+def lease_timer(lease: dict[str, Any], now: float) -> str:
+    running = lease.get("running_jobs") or []
+    ttl = str(lease.get("ttl") or f"{lease.get('ttl_s', 0)}s")
+    if lease.get("state", "active") != "active":
+        return f'<span class="sub">expires {lease_at(lease.get("expires_at"))}</span>'
+    if running:
+        return (
+            f'{hbar(1)}<span class="sub">pinned: {plural(len(running), "job")} running · '
+            f"expires {esc(ttl)} after the last job ends</span>"
+        )
+    expiry = lease_time(lease.get("expires_at"))
+    remaining = max(0, expiry - now) if expiry is not None else 0
+    ttl_s = lease.get("ttl_s") or remaining or 1
+    return (
+        f'{hbar(remaining / ttl_s)}<span class="sub">expires {lease_at(lease.get("expires_at"))}'
+        f" (in {esc(fmt_span(remaining))}) · idle TTL {esc(ttl)}, renews on use</span>"
+    )
+
+
+def lease_cell(group: dict[str, Any], now: float) -> str:
+    state = group["state"]
+    lease = group.get("lease")
+    name = esc(str(group["group"]))
+    text = lease_state(state)
+    if lease:
+        holder = lease.get("holder") or {}
+        peek = link("/ui/leases", state="all", peek=lease["lease_id"]) + "#s-lease-peek"
+        text += (
+            f'<a class="lease-holder" href="{esc(peek)}">{esc(str(holder.get("name") or lease.get("client_id") or "Unknown holder"))}</a>'
+            f'<span class="sub">{esc(str(holder.get("kind") or ""))} · lease {esc(lease["lease_id"])} · group {name}</span>'
+            f"{lease_labels(lease.get('labels') or {})}{lease_timer(lease, now)}"
+        )
+    else:
+        text += f'<span class="sub">group {name} · {plural(len(group.get("members") or {}), "member")}</span>'
+    if state == "cooling":
+        text += (
+            f'<span class="sub">free at {lease_at(group.get("leasable_at"))}</span>'
+            f'<span class="sub">last used {lease_at(group.get("last_used_at"))} · '
+            f"{esc(str(group.get('last_used_by') or 'unknown origin'))}</span>"
+        )
+    elif state == "unavailable":
+        text += (
+            f'<span class="sub">required online: {esc(", ".join(group.get("require_online") or []))}</span>'
+        )
+    return text
+
+
+def enrich_lease_report(service: Any, report: dict[str, Any]) -> None:
+    store = getattr(service, "leases", None)
+    groups = store.groups() if store is not None else []
+    by_target = {target: group for group in groups for target in group["members"].values()}
+    for row in report["targets"]:
+        row["lease_group"] = by_target.get(row["id"])
+
+
+def lease_entries(service: Any, lease_id: str) -> list[JobEntry]:
+    entries = service.metrics.entries()
+    if not lease_id:
+        return entries
+    return [entry for entry in entries if entry.view().get("lease_id") == lease_id]
+
+
+def leases_page(service: Any, query: Mapping[str, list[str]], now: float) -> str:
+    store = getattr(service, "leases", None)
+    if store is None:
+        return (
+            hero("LEASES", "Who is holding which devbox")
+            + '<div class="empty">Leasing is not configured.</div>'
+        )
+    state = _last(query, "state", "active")
+    if state not in ("active", "expired", "released", "all"):
+        state = "active"
+    all_leases = store.list_leases(state="all")
+    leases = [lease for lease in all_leases if state == "all" or lease["state"] == state]
+    by_lease = {lease["lease_id"]: lease for lease in all_leases}
+    groups = store.groups()
+    clients = store.list_clients(active=False)
+    job_counts: dict[str, int] = {}
+    for entry in service.metrics.entries():
+        lease_id = entry.view().get("lease_id")
+        if lease_id:
+            job_counts[lease_id] = job_counts.get(lease_id, 0) + 1
+    chips = (
+        f'<span class="chip">{plural(len(store.list_leases()), "active lease")}</span>'
+        f'<span class="chip">{sum(bool(client.get("leases")) for client in clients)} clients holding</span>'
+        f'<span class="chip ok">{sum(group["state"] == "free" for group in groups)} free groups</span>'
+        f'<span class="chip">{sum(group["state"] == "cooling" for group in groups)} cooling down</span>'
+        '<span class="chip warn">enforcement: advisory · commands without a lease still run</span>'
+    )
+    filters = "".join(
+        f'<a href="{esc(link("/ui/leases", state=value, q=_last(query, "q"), label=_last(query, "label")))}"'
+        f"{ON if state == value else ''}>{value}</a>"
+        for value in ("active", "expired", "released", "all")
+    )
+    toolbar = (
+        '<div class="toolbar"><input type="search" id="leaseq" aria-label="Search leases, clients and groups" '
+        f'value="{esc(_last(query, "q"))}" placeholder="filter by client, group, session or purpose…" autocomplete="off">'
+        f'<input type="search" id="leaselabel" aria-label="Filter lease labels" value="{esc(_last(query, "label"))}" '
+        'placeholder="labels: repo=owner/repo task=leasing" autocomplete="off">'
+        f'<span class="seg">{filters}</span><span class="chip" id="leasecount"></span></div>'
+    )
+    body = []
+    for lease in leases:
+        lease_id = lease["lease_id"]
+        holder = lease.get("holder") or {}
+        search = json.dumps(lease, ensure_ascii=False).lower()
+        jobs = job_counts.get(lease_id, 0)
+        actions = (
+            f'<a class="lease-button" href="{esc(link("/ui/leases", state=state, peek=lease_id))}#s-lease-peek">Peek</a>'
+            f'<a class="lease-button" href="{esc(link("/ui/logs", target="*", lease=lease_id))}">Peek logs</a>'
+            f'<a class="lease-button" href="{esc(link("/ui/jobs", lease=lease_id))}">Jobs</a>'
+        )
+        if lease["state"] == "active":
+            actions += f'<button class="lease-button danger" type="button" data-force-release="{esc(lease_id)}">Force release</button>'
+        members = "".join(
+            f'<span class="lease-tag" title="{esc(target)}">{esc(layer)}</span>'
+            for layer, target in lease.get("members", {}).items()
+        )
+        body.append(
+            f'<tr data-lease-row data-q="{esc(search)}" data-labels="{esc(json.dumps(lease.get("labels") or {}))}">'
+            f'<td><b>{esc(lease["group"])}</b><span class="sub">{esc(lease_id)}</span>{lease_state(lease["state"])}</td>'
+            f"<td>{members}</td><td><b>{esc(str(holder.get('name') or lease.get('client_id') or '—'))}</b>"
+            f'<span class="sub">{esc(str(holder.get("kind") or ""))} · {esc(str(holder.get("session_id") or ""))}</span></td>'
+            f"<td>{lease_labels(lease.get('labels') or {})}</td><td>{esc(lease.get('purpose') or '')}</td>"
+            f'<td class="nw">{lease_at(lease.get("acquired_at"))}</td><td>{lease_timer(lease, now)}</td>'
+            f'<td class="r">{jobs} ({len(lease.get("running_jobs") or [])} running)</td><td class="lease-actions">{actions}</td></tr>'
+        )
+    lease_table = (
+        '<div class="table"><table id="leases"><thead><tr>'
+        + "".join(
+            sort_th(name)
+            for name in ("Group", "Members", "Holder", "Labels", "Purpose", "Acquired", "Expires", "Jobs")
+        )
+        + f"<th>Actions</th></tr></thead><tbody>{''.join(body)}</tbody></table></div>"
+        '<div class="empty" id="leasenone" hidden>No leases match.</div>'
+    )
+    client_rows = []
+    for client in clients:
+        held = client.get("leases") or []
+        held_links = []
+        held_leases = [lease if isinstance(lease, dict) else by_lease.get(str(lease), {}) for lease in held]
+        for lease in held_leases:
+            lease_id = lease.get("lease_id", "")
+            title = lease.get("group", lease_id)
+            held_links.append(
+                f'<a href="{esc(link("/ui/leases", state="all", peek=lease_id))}#s-lease-peek">{esc(title)}</a>'
+            )
+        client_rows.append(
+            f'<tr data-client-row data-q="{esc(json.dumps({**client, "leases": held_leases}, ensure_ascii=False).lower())}" '
+            f'data-label-sets="{esc(json.dumps([lease.get("labels") or {} for lease in held_leases]))}">'
+            f'<td><b>{esc(client.get("name") or "")}</b><span class="sub">{esc(client["client_id"])}</span></td>'
+            f"<td>{esc(client.get('kind') or '')}</td><td>{esc(client.get('host') or '')}</td>"
+            f'<td class="mono">{esc(client.get("session_id") or "—")}</td>'
+            f"<td>{lease_at(client.get('registered_at'))}</td><td>{lease_at(client.get('last_seen_at'))}</td>"
+            f"<td>{len(held)} · {', '.join(held_links) or 'no leases held'}</td></tr>"
+        )
+    client_table = (
+        '<div class="table"><table id="lease-clients"><thead><tr>'
+        + "".join(
+            sort_th(name)
+            for name in (
+                "Client",
+                "Kind",
+                "Host",
+                "Copilot session",
+                "Registered",
+                "Last seen",
+                "Leases held",
+            )
+        )
+        + f"</tr></thead><tbody>{''.join(client_rows)}</tbody></table></div>"
+    )
+    group_rows = []
+    for group in groups:
+        group_rows.append(
+            f'<tr data-group-row data-q="{esc(json.dumps(group, ensure_ascii=False).lower())}" '
+            f'data-labels="{esc(json.dumps((group.get("lease") or {}).get("labels") or {}))}">'
+            f'<td><b>{esc(group["group"])}</b><span class="sub">{esc(", ".join(group["members"].values()))}</span></td>'
+            f"<td>{lease_state(group['state'])}</td><td>{lease_cell(group, now)}</td>"
+            f"<td>{'now' if group['state'] == 'free' else 'pinned' if (group.get('lease') or {}).get('running_jobs') else lease_at(group.get('leasable_at'))}</td>"
+            f'<td>{lease_at(group.get("last_used_at"))}<span class="sub">{esc(str(group.get("last_used_by") or ""))}</span></td></tr>'
+        )
+    group_table = (
+        '<div class="table"><table id="lease-groups"><thead><tr>'
+        + "".join(sort_th(name) for name in ("Group", "State", "Lease", "Leasable at", "Last used"))
+        + f"</tr></thead><tbody>{''.join(group_rows)}</tbody></table></div>"
+    )
+    peek = _last(query, "peek")
+    peek_section = ""
+    if peek:
+        try:
+            lease = store.get_lease(peek)
+        except (KeyError, ValueError, LeaseError):
+            lease = None
+        if lease:
+            events = "".join(
+                f'<tr><td class="nw">{lease_at(event.get("at") or event.get("timestamp"))}</td>'
+                f"<td><b>{esc(str(event.get('event') or event.get('type') or ''))}</b></td>"
+                f'<td class="lease-event">{esc(json.dumps({key: value for key, value in event.items() if key not in ("at", "timestamp", "event", "type")}, ensure_ascii=False))}</td></tr>'
+                for event in lease.get("events") or []
+            )
+            peek_body = (
+                f"<p>{lease_cell({'group': lease['group'], 'state': lease['state'], 'lease': lease}, now)}</p>"
+                f'<p class="fine">Purpose: {esc(lease.get("purpose") or "—")}</p>'
+                f'<p><a href="{esc(link("/ui/logs", target="*", lease=peek))}">Logs</a> · '
+                f'<a href="{esc(link("/ui/jobs", lease=peek))}">Jobs and live output</a></p>'
+                f'<div class="table"><table><thead><tr><th>Time (UTC)</th><th>Event</th><th>Detail</th></tr></thead>'
+                f"<tbody>{events}</tbody></table></div>"
+            )
+        else:
+            peek_body = '<div class="empty">This lease no longer exists.</div>'
+        peek_section = section("lease-peek", "04", f"Lease {peek}", "event history · read-only", peek_body)
+    rules = (
+        f'<p class="fine mono">{esc(str(store.config_path)) if store.config_path else "In-memory defaults"}</p>'
+        f'<pre class="lease-rules">{esc(yaml.safe_dump(store.config, sort_keys=False, allow_unicode=True))}</pre>'
+        '<p class="fine">Effective configuration, read-only. First matching rule wins; unmatched targets are groups of one. '
+        "Leases are advisory. Explicit release skips cooldown; running jobs pin expiry; idle open terminals do not.</p>"
+    )
+    return (
+        hero("LEASES", "Who is holding which devbox", chips)
+        + section("leases", "01", "Leases", "a lease always covers the whole group", toolbar + lease_table)
+        + section(
+            "lease-clients", "02", "Clients", "who registered, and which leases they hold", client_table
+        )
+        + section("lease-groups", "03", "Lease groups", "availability for new leases right now", group_table)
+        + peek_section
+        + section("lease-rules", "05", "Lease rules", "effective config, read-only", rules)
+    )
+
+
 def hycos_page(report: dict[str, Any], now: float) -> str:
     rows = report["targets"]
     head = (
         '<tr><th class="r">#</th>'
         + sort_th("Relay HYCO")
         + sort_th("Status")
+        + sort_th("Lease")
         + sort_th("Last reported purpose")
         + sort_th(f"Jobs over {report['range']}", sort=False)
         + sort_th("Jobs", right=True)
@@ -679,6 +944,8 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
             row["reason"] or os_line or (row["listener_version"] and f"privy {row['listener_version']}")
         )
         up = row["status"] == ONLINE
+        group = row.get("lease_group")
+        lease_status = group["state"] if group else "unavailable"
         remote = (
             f'<a class="remote-link" href="{esc(link("/ui/exec", target=row["id"]))}" '
             f'aria-label="Remote execute on {esc(row["label"])}">{TERMINAL_ICON}Remote</a>'
@@ -695,15 +962,17 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
             row["os"],
             status_sub,
             (row.get("purpose") or {}).get("latest"),
+            json.dumps(group, ensure_ascii=False) if group else "",
         )
         body.append(
             f'<tr data-href="{esc(link("/ui/logs", target=row["id"]))}" '
             f'data-q="{esc(" ".join(str(term) for term in terms if term).lower())}" '
-            f'data-up="{1 if up else 0}">'
+            f'data-up="{1 if up else 0}" data-lease-state="{esc(lease_status)}">'
             f'<td class="idx">{i:02d}</td>'
             f'<td data-v="{esc(row["label"].lower())}">{hyco_cell(row)}{remote}</td>'
             f'<td data-v="{esc(row["status"])}">{state_label(row["status"])}'
             f'<span class="sub">{esc(status_sub or "")}</span></td>'
+            f'<td class="lease-cell" data-v="{esc(lease_status)}">{lease_cell(group, now) if group else "—"}</td>'
             f'<td class="purpose-cell" data-v="{esc(((row.get("purpose") or {}).get("latest") or "").lower())}">'
             f"{purpose_cell(row)}</td>"
             f"<td>{sparkline(row['series'], row['failed_series'])}</td>"
@@ -724,7 +993,11 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
     toolbar = (
         '<div class="toolbar"><input type="search" id="hycoq" placeholder="search HYCOs, e.g. _windows or '
         'raki- linux (all terms must match)…" autocomplete="off"><span class="seg st"><a class="on" data-s="all">'
-        'all</a><a data-s="up">up</a><a data-s="down">down</a></span><span class="chip" id="hycocount"></span></div>'
+        'all</a><a data-s="up">up</a><a data-s="down">down</a></span>'
+        '<label class="tg">Lease <select id="hycolease" aria-label="Lease state">'
+        '<option value="all">all states</option><option value="leased">leased</option><option value="free">free</option>'
+        '<option value="cooling">cooling down</option><option value="unavailable">unavailable</option></select></label>'
+        '<span class="chip" id="hycocount"></span></div>'
     )
     patterns = (
         '<svg width="0" height="0" aria-hidden="true"><defs>'
@@ -888,23 +1161,26 @@ def logs_page(
 ) -> tuple[str, str]:
     rows = report["targets"]
     by_id = {row["id"]: row for row in rows}
-    every = service.metrics.entries()
+    lease_id = _last(query, "lease")
+    every = lease_entries(service, lease_id)
     kept: dict[str, int] = {}
     for entry in every:
         kept[entry.target_id] = kept.get(entry.target_id, 0) + 1
     selected = _last(query, "target")
+    if lease_id and not selected:
+        selected = "*"
     if selected not in by_id and selected != "*":
         used = sorted((row for row in rows if row["last_used_ts"]), key=lambda row: -row["last_used_ts"])
         selected = used[0]["id"] if used else (rows[0]["id"] if rows else "*")
     limit = limit_of(query, DEFAULT_LOG_LIMIT)
     pods = [
-        f'<a href="{esc(link("/ui/logs", target="*"))}"{ON if selected == "*" else ""}>'
+        f'<a href="{esc(link("/ui/logs", target="*", lease=lease_id))}"{ON if selected == "*" else ""}>'
         f"<b>All relay HYCOs</b><span>{len(every):,}</span><small>every job, newest first</small></a>"
     ]
     for row in sorted(rows, key=lambda row: (-(row["last_used_ts"] or 0), row["label"].lower())):
         who = row["user"] and row["host"] and f"{row['user']}@{row['host']}"
         pods.append(
-            f'<a href="{esc(link("/ui/logs", target=row["id"]))}"{ON if row["id"] == selected else ""}>'
+            f'<a href="{esc(link("/ui/logs", target=row["id"], lease=lease_id))}"{ON if row["id"] == selected else ""}>'
             f"<b>{status_dot(row['status'])}{esc(row['label'])}</b><span>{kept.get(row['id'], 0):,}</span>"
             f"<small>{esc(who or row['status'])} · {esc(fmt_ago(row['last_used_ts'], now))}</small></a>"
         )
@@ -927,7 +1203,7 @@ def logs_page(
         )
     elif len(entries) > limit:
         terms += (
-            f'<a class="more" href="{esc(link("/ui/logs", target=selected, limit=str(min(MAX_LIMIT, limit * 4))))}">'
+            f'<a class="more" href="{esc(link("/ui/logs", target=selected, lease=lease_id, limit=str(min(MAX_LIMIT, limit * 4))))}">'
             f"Show more ({len(entries) - limit:,} older jobs)</a>"
         )
     toolbar = (
@@ -948,6 +1224,8 @@ def logs_page(
         )
         if row["os"]:
             chips += f'<span class="chip">{esc(row["os"])}</span>'
+    if lease_id:
+        chips += f'<span class="chip">lease {esc(lease_id)}</span><a href="/ui/logs?target=*">Clear lease filter</a>'
     main = (
         hero("LOGS · LIKE kubectl logs, PER RELAY HYCO", heading, chips)
         + '<div class="logs"><div class="pods"><div class="hd">RELAY HYCOs'
@@ -972,7 +1250,8 @@ def _status_chip(row: dict[str, Any]) -> str:
 
 def jobs_page(service: Any, report: dict[str, Any], query: Mapping[str, list[str]], now: float) -> str:
     wanted = _last(query, "state").strip().lower()
-    entries = sorted(service.metrics.entries(), key=lambda entry: entry.created_at, reverse=True)
+    lease_id = _last(query, "lease")
+    entries = sorted(lease_entries(service, lease_id), key=lambda entry: entry.created_at, reverse=True)
     views = [entry.view() for entry in entries]
     if wanted == "failed":
         views = [view for view in views if view["state"] in BAD_STATES]
@@ -1011,7 +1290,7 @@ def jobs_page(service: Any, report: dict[str, Any], query: Mapping[str, list[str
         for view in views[:limit]
     )
     filters = "".join(
-        f'<a href="{esc(link("/ui/jobs", state=name or None))}"{ON if wanted == name else ""}>{label}</a>'
+        f'<a href="{esc(link("/ui/jobs", state=name or None, lease=lease_id))}"{ON if wanted == name else ""}>{label}</a>'
         for name, label in (("", "all"), ("running", "running"), ("failed", "failed"), ("succeeded", "ok"))
     )
     table = (
@@ -1021,10 +1300,12 @@ def jobs_page(service: Any, report: dict[str, Any], query: Mapping[str, list[str
     )
     if len(views) > limit:
         table += (
-            f'<a class="more" href="{esc(link("/ui/jobs", state=wanted or None, limit=str(min(MAX_LIMIT, limit * 4))))}">'
+            f'<a class="more" href="{esc(link("/ui/jobs", state=wanted or None, lease=lease_id, limit=str(min(MAX_LIMIT, limit * 4))))}">'
             f"Show more ({len(views) - limit:,} older jobs)</a>"
         )
     chips = f'<span class="seg">{filters}</span><span class="chip">{plural(len(views), "job")}</span>'
+    if lease_id:
+        chips += f'<span class="chip">lease {esc(lease_id)}</span><a href="/ui/jobs">Clear lease filter</a>'
     return hero("EVERY JOB THE HUB REMEMBERS", "Jobs", chips) + section(
         "jobs", "01", "Jobs", "newest first · click a row for its terminal", table
     )
@@ -1037,6 +1318,7 @@ def render(service: Any, page: str, query: Mapping[str, list[str]], base_url: st
     """One dashboard page (``overview``, ``hycos``, ``logs``, or ``jobs``) as an HTML response."""
     rng = range_of(query)
     report = build_report(service, rng)
+    enrich_lease_report(service, report)
     now = time.time()
     nonce = secrets.token_urlsafe(18)
     params: dict[str, str | None] = {}
@@ -1044,16 +1326,24 @@ def render(service: Any, page: str, query: Mapping[str, list[str]], base_url: st
         title, main = "Overview", overview_page(service, report, now)
     elif page == "hycos":
         title, main = "Relay HYCOs", hycos_page(report, now)
+        params = {
+            "q": _last(query, "q") or None,
+            "status": _last(query, "status") or None,
+            "lease_state": _last(query, "lease_state") or None,
+        }
+    elif page == "leases":
+        title, main = "Leases", leases_page(service, query, now)
+        params = {key: _last(query, key) or None for key in ("state", "q", "label", "peek")}
     elif page == "exec":
         title, main = "Remote Exec", workspace(service, report, _last(query, "target"))
         params = {"target": _last(query, "target") or None}
     elif page == "logs":
         target, main = logs_page(service, report, query, now)
         title = f"Logs · {target}"
-        params = {"target": _last(query, "target") or None, "limit": _last(query, "limit") or None}
+        params = {key: _last(query, key) or None for key in ("target", "limit", "lease")}
     elif page == "jobs":
         title, main = "Jobs", jobs_page(service, report, query, now)
-        params = {"state": _last(query, "state") or None, "limit": _last(query, "limit") or None}
+        params = {key: _last(query, key) or None for key in ("state", "limit", "lease")}
     else:
         return error_response(404, "not_found", f"no dashboard page {page!r}")
     document = shell(

@@ -72,7 +72,7 @@ def test_root_serves_the_dashboard_to_browsers_and_markdown_to_everyone_else(hub
 
 
 @pytest.mark.parametrize(
-    "path", ["/ui", "/ui/", "/ui/hycos", "/ui/logs", "/ui/jobs", "/ui/jobs?state=failed"]
+    "path", ["/ui", "/ui/", "/ui/hycos", "/ui/leases", "/ui/logs", "/ui/jobs", "/ui/jobs?state=failed"]
 )
 def test_every_page_renders_without_jobs(hub, path):
     text = html_of(hub.call("GET", path))
@@ -321,12 +321,12 @@ def test_hycos_page_has_a_search_box_with_per_row_search_keys(hub):
     assert re.search(r'target=dev%2Fbox2_windows" data-q="[^"]*" data-up="0"', text)
 
 
-@pytest.mark.parametrize("path", ["/ui", "/ui/hycos", "/ui/exec", "/ui/logs", "/ui/jobs"])
+@pytest.mark.parametrize("path", ["/ui", "/ui/hycos", "/ui/leases", "/ui/exec", "/ui/logs", "/ui/jobs"])
 def test_all_sidebar_links_have_consistent_decorative_icons(hub, path):
     text = html_of(hub.call("GET", path, headers=BROWSER))
     sidebar = re.search(r'<aside class="sidebar">([\s\S]*?)</aside>', text).group(1)
     links = re.findall(r'<a href="([^"]*)"[^>]*>([\s\S]*?)</a>', sidebar)
-    assert len(links) == 9
+    assert len(links) == 10
     for _, content in links:
         assert content.count("<svg ") == 1
         assert 'viewBox="0 0 24 24"' in content
@@ -336,6 +336,7 @@ def test_all_sidebar_links_have_consistent_decorative_icons(hub, path):
     assert {href.split("?")[0] for href, _ in links} == {
         "/ui",
         "/ui/hycos",
+        "/ui/leases",
         "/ui/exec",
         "/ui/logs",
         "/ui/jobs",

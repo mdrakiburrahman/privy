@@ -24,6 +24,7 @@ from privy.hub import console
 from privy.hub.config import RelaysStore
 from privy.hub.home import AUDIT_FILENAME, RELAYS_FILENAME, ensure_home, write_state
 from privy.hub.jobs import DEFAULT_MAX_RUNNING, AuditLog, JobManager
+from privy.hub.leases import LeaseStore
 from privy.hub.mcp import MCP_PATH, McpEndpoint
 from privy.hub.registry import DEFAULT_PROBE_TTL_S, TargetRegistry
 from privy.hub.responses import HTML_TYPE, HttpResponse, error_response
@@ -363,7 +364,8 @@ def build_hub(
     store.snapshot()
     registry = TargetRegistry(store, client_factory=client_factory, probe_ttl_s=probe_ttl_s)
     jobs = JobManager(registry, max_running=max_jobs, audit=AuditLog(home / AUDIT_FILENAME))
-    service = HubService(registry=registry, jobs=jobs, version=version)
+    leases = LeaseStore(registry, home=home, audit=jobs.audit)
+    service = HubService(registry=registry, jobs=jobs, version=version, leases=leases)
     service.metrics.restore(home / AUDIT_FILENAME)
     app = HubApp(service, port=port)
     server = HubHTTPServer((host, port), app)

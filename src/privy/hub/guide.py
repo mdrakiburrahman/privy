@@ -130,6 +130,40 @@ def quickstart(service: HubService, base_url: str) -> str:
         "",
         f"Base URL: `{base_url}`",
         "",
+        "## Recommended: lease a devbox before using it",
+        "",
+        "Register once per chat, acquire a lease for the devbox stack, pass the lease id to every "
+        "job/file/terminal request, and release it when finished. Leases coordinate leasers; they "
+        "do not block commands from other clients.",
+        "",
+        "```json",
+        json.dumps(
+            {
+                "register": {
+                    "method": "POST",
+                    "url": f"{base_url}/v1/clients",
+                    "body": {"name": "Short task name", "kind": "copilot-app", "session_id": "<session-id>"},
+                },
+                "acquire": {
+                    "method": "POST",
+                    "url": f"{base_url}/v1/leases",
+                    "body": {
+                        "client_id": "<client_id>",
+                        "target": example.machine,
+                        "labels": {"repo": "<owner/repo>"},
+                        "purpose": "privy: Implementing a task.",
+                        "ttl": "30m",
+                    },
+                },
+            },
+            indent=2,
+        ),
+        "```",
+        "",
+        "Send `lease_id` on each lease-aware request as a query/body field or `X-Privy-Lease` header. "
+        "Release with `DELETE /v1/leases/{lease_id}?client_id={client_id}`. `GET /v1/groups` shows "
+        "availability; `GET /v1/leases?label=repo=<owner/repo>` peeks at matching leases.",
+        "",
         f"## Machines online now ({len(online)} of {len(targets)})",
         "",
     ]
@@ -227,7 +261,8 @@ def quickstart(service: HubService, base_url: str) -> str:
         "  absolute paths on this computer.",
         "- Commands run as the listener's user with its full privileges. Prefer read-only commands unless",
         "  you were asked to change something.",
-        "- MCP clients can use job/target operations as tools at `/mcp`; sync and credential export are REST-only.",
+        "- MCP clients can use job, target, client, group, and lease operations as tools at `/mcp`; "
+        "sync, credential export, and force-release are REST-only.",
         "",
     ]
     purpose_lines = [

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from privy.client import RelayHTTPError
+from privy.hub.leases import LeaseError
 from privy.hub.purpose import normalize_purpose
 from privy.hub.registry import ONLINE, TargetLookupError
 from privy.hub.responses import HttpResponse, error_response
@@ -57,7 +58,15 @@ class TerminalBridge:
         self._bindings: dict[str, _Binding] = {}
         self._lock = threading.Lock()
 
-    def route(self, method: str, path: str, headers: Any, body: bytes) -> HttpResponse | None:
+    def route(
+        self,
+        method: str,
+        path: str,
+        headers: Any,
+        body: bytes,
+        *,
+        query: dict[str, list[str]] | None = None,
+    ) -> HttpResponse | None:
         match = _PATH.fullmatch(path)
         if path != "/v1/terminals" and match is None:
             return None
@@ -71,6 +80,12 @@ class TerminalBridge:
             return error_response(400, "invalid_request", "body must be a JSON object")
         if not isinstance(args, dict) or not self._token(args.get("owner")):
             return error_response(400, "invalid_request", "a valid terminal workspace owner is required")
+        supplied = [v for v in (headers.get("X-Privy-Lease"), args.get("lease_id")) if v is not None]
+        supplied.extend((query or {}).get("lease_id", []))
+        if supplied:
+            if any(not isinstance(v, str) or not v.strip() for v in supplied) or len(set(supplied)) != 1:
+                return error_response(400, "invalid_argument", "provide one non-empty, consistent lease_id")
+            args["lease_id"] = supplied[0]
         if "data_b64" in args and (not isinstance(args["data_b64"], str) or len(args["data_b64"]) > 43692):
             return error_response(
                 400, "invalid_request", "terminal input must be at most 32768 decoded bytes"
@@ -81,6 +96,17 @@ class TerminalBridge:
             return self._operation(match[1], match[2], args)
         except TargetLookupError as exc:
             return error_response(404, "unknown_target", str(exc))
+        except LeaseError as exc:
+            return HttpResponse(
+                exc.status,
+                {
+                    "error": {
+                        "code": exc.code,
+                        "message": str(exc),
+                        **({"details": exc.details} if exc.details is not None else {}),
+                    }
+                },
+            )
         except RelayHTTPError as exc:
             log.warning("Terminal Relay request failed: %s", exc)
             return error_response(
@@ -117,6 +143,9 @@ class TerminalBridge:
                 "terminal_unavailable",
                 "This listener is offline or does not advertise this interactive shell capability. Upgrade or refresh targets.",
             )
+        usage = self.service.leases.use(target_id, args.get("lease_id"), origin="ui")
+        if purpose is None:
+            purpose = usage["purpose"]
         with self._lock:
             now = time.monotonic()
             self._bindings = {
@@ -165,6 +194,8 @@ class TerminalBridge:
             self.service.jobs.audit.record(
                 "terminal.open", target=target_id, terminal_id=request_id, shell=shell
             )
+        if usage.get("lease_warning"):
+            result["lease_warning"] = usage["lease_warning"]
         return self._response(result, request_id)
 
     def _operation(self, session_id: str, action: str, args: dict[str, Any]) -> HttpResponse:
@@ -201,6 +232,7 @@ class TerminalBridge:
                 binding.created = time.monotonic()
             if binding.closed and action != "close":
                 return error_response(410, "terminal_closed", "This terminal has been closed.")
+            usage = self.service.leases.use(binding.target, args.get("lease_id"), origin="ui")
             if action == "close":
                 binding.closed = True
         if action == "close":
@@ -236,6 +268,8 @@ class TerminalBridge:
                     terminal_id=session_id,
                     state=result["state"],
                 )
+        if usage.get("lease_warning"):
+            result["lease_warning"] = usage["lease_warning"]
         return self._response(result, session_id)
 
     @staticmethod
