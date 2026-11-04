@@ -145,6 +145,47 @@ def test_hyco_search_matches_own_layer_not_sibling_lease_members(lease_browser):
     assert not errors
 
 
+def test_hyco_facet_filters_chips_counts_columns_and_url(lease_browser):
+    page, _, _, _, base, errors = lease_browser
+    page.goto(base + "/ui/hycos")
+    rows = page.locator("#hycos tbody tr:visible")
+    pop = page.locator("#facet-pop")
+    page.locator('.facet-pill[data-facet="environment"]').click()
+    browser_api.expect(pop.locator("label", has_text="Windows host")).to_contain_text("2")
+    pop.locator("label", has_text="WSL").locator("input").check()
+    browser_api.expect(rows).to_have_count(1)
+    pop.locator("label", has_text="Devcontainer").locator("input").check()
+    browser_api.expect(rows).to_have_count(2)
+    page.keyboard.press("Escape")
+    browser_api.expect(pop).to_be_hidden()
+    assert "environment=WSL&environment=Devcontainer" in page.url
+    browser_api.expect(page.locator(".facet-chip")).to_have_count(2)
+
+    page.locator('.facet-pill[data-facet="os"]').click()
+    browser_api.expect(pop.locator("label", has_text="Windows")).to_contain_text("2")
+    page.locator("h1").click()
+    browser_api.expect(pop).to_be_hidden()
+    page.locator(".facet-chip", has_text="WSL").click()
+    browser_api.expect(rows).to_have_count(1)
+    page.reload()
+    browser_api.expect(page.locator('.facet-pill[data-facet="environment"]')).to_have_text(
+        "Environment: Devcontainer"
+    )
+    browser_api.expect(rows).to_contain_text("box1_devcontainer")
+    page.get_by_role("button", name="Clear all").click()
+    browser_api.expect(rows).to_have_count(4)
+
+    arch = page.locator("#hycos th.col-arch")
+    browser_api.expect(arch).to_be_hidden()
+    page.locator("#hycocols").click()
+    pop.locator("label", has_text="Arch").locator("input").check()
+    browser_api.expect(arch).to_be_visible()
+    page.reload()
+    browser_api.expect(arch).to_be_visible()
+    browser_api.expect(page.locator("#hycos td.col-arch", has_text="x86_64").first).to_be_visible()
+    assert not errors
+
+
 def test_take_manual_lease_with_duration_picker_reload_and_release(lease_browser):
     page, hub, _, _, base, errors = lease_browser
     page.goto(base + "/ui/leases")

@@ -220,6 +220,40 @@ border-radius:5px;background:var(--paper);color:var(--ink);font:12px var(--sans)
 .duration-picker{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .duration-picker input{width:80px;text-align:center}.duration-picker output{font:600 16px var(--mono)}
 .lease-button.primary{background:var(--accent);color:var(--paper)}.lease-button:disabled{opacity:.5;cursor:default}
+.toolbar.facets{gap:6px;margin:-4px 0 12px}
+.facet-title{font-size:9px;font-weight:700;letter-spacing:1.4px;text-transform:uppercase;color:var(--muted);margin-right:2px}
+.facet-pill{display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border:1px solid var(--line);border-radius:999px;
+background:var(--paper);color:var(--muted);font:550 11px var(--sans);cursor:pointer;white-space:nowrap;max-width:260px}
+.facet-pill::after{content:"";width:5px;height:5px;margin:-3px 0 0 3px;border:solid currentColor;
+border-width:0 1.5px 1.5px 0;transform:rotate(45deg);opacity:.6}
+.facet-pill:hover,.facet-pill[aria-expanded=true]{border-color:var(--accent);color:var(--ink)}
+.facet-pill.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.facet-pill .v{margin-left:-4px;overflow:hidden;text-overflow:ellipsis;font-weight:650}
+.facet-pill .v:empty{display:none}
+.facet-pill.cols{margin-left:auto}
+.facet-chips{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:-4px 0 12px}
+.facet-chip{cursor:pointer;color:var(--accent);background:var(--accent-soft);border-color:transparent;font:inherit;
+font-size:10px;font-weight:550}
+.facet-chip b{font-weight:700}.facet-chip::after{content:"\\00d7";margin-left:3px;font-size:12px;line-height:1;opacity:.7}
+.facet-chip:hover{border-color:var(--accent)}
+.facet-clear{border:0;background:none;color:var(--muted);font:550 10px var(--sans);cursor:pointer;text-decoration:underline}
+.facet-pop{position:fixed;z-index:40;width:260px;max-height:min(420px,calc(100vh - 24px));display:flex;flex-direction:column;
+background:var(--paper);color:var(--ink);border:1px solid var(--line);border-radius:10px;box-shadow:0 12px 40px #102e3133}
+.facet-pop header{display:flex;justify-content:space-between;align-items:center;padding:10px 12px 8px;font-size:12px}
+.facet-pop header button{border:0;background:none;color:var(--accent);font:550 11px var(--sans);cursor:pointer;padding:0}
+.facet-pop input[type=search]{margin:0 12px 8px;padding:6px 9px;border:1px solid var(--line);border-radius:6px;
+background:var(--code);color:var(--ink);font:11px var(--mono)}
+.facet-list{overflow-y:auto;padding:2px 6px 6px;border-top:1px solid var(--line)}
+.facet-list label{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:8px;align-items:center;padding:5px 6px;
+border-radius:6px;cursor:pointer;font:11px var(--mono)}
+.facet-list label:hover{background:var(--code)}
+.facet-list label span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.facet-list label small{color:var(--faint);font-size:10px;font-variant-numeric:tabular-nums}
+.facet-list label.zero span{color:var(--faint)}
+.facet-list input{accent-color:var(--accent);margin:0}
+.facet-pop footer{padding:8px 12px;border-top:1px solid var(--line);color:var(--faint);font-size:10px}
+td.stale{color:var(--faint);font-style:italic}
+td.fact-clip{max-width:220px;overflow:hidden;text-overflow:ellipsis}
 """
 
 JS = r"""
@@ -278,11 +312,14 @@ JS = r"""
     const st = $(".seg.st a.on"), s = st ? st.dataset.s : "all";
     const lease = $("#hycolease")?.value || "all";
     let shown = 0, up = 0, total = 0;
+    const facets = window.PrivyHycoFacets;
     $$("tbody tr", table).forEach(tr => {
       total++;
       const hay = tr.dataset.q || "", isUp = tr.dataset.up === "1";
-      const ok = terms.every(t => hay.includes(t)) && (s === "all" || (s === "up") === isUp) &&
+      const base = terms.every(t => hay.includes(t)) && (s === "all" || (s === "up") === isUp) &&
         (lease === "all" || tr.dataset.leaseState === lease);
+      tr.dataset.base = base ? "1" : "0";
+      const ok = base && (!facets || facets.matches(tr));
       tr.hidden = !ok;
       if (ok) { shown++; if (isUp) up++; }
     });
@@ -294,13 +331,15 @@ JS = r"""
     if (box.value) url.searchParams.set("q", box.value); else url.searchParams.delete("q");
     if (s !== "all") url.searchParams.set("status", s); else url.searchParams.delete("status");
     if (lease !== "all") url.searchParams.set("lease_state", lease); else url.searchParams.delete("lease_state");
+    if (facets) facets.sync(url);
     if (url.href !== location.href) history.replaceState(null, "", url);
+    const keys = ["q", "status", "lease_state", ...(facets ? facets.names() : [])];
     $$("#topchips a[href]").forEach(a => {
       const target = new URL(a.href);
       if (target.pathname !== location.pathname) return;
-      ["q", "status", "lease_state"].forEach(key => {
-        if (url.searchParams.has(key)) target.searchParams.set(key, url.searchParams.get(key));
-        else target.searchParams.delete(key);
+      keys.forEach(key => {
+        target.searchParams.delete(key);
+        url.searchParams.getAll(key).forEach(value => target.searchParams.append(key, value));
       });
       a.href = target.href;
     });
@@ -361,9 +400,10 @@ JS = r"""
 
   let busy = false;
   async function refresh() {
-    if (document.querySelector(".lease-dialog[open]")) return;
-    if (document.querySelector("#purpose-panel:not([hidden])")) return;
-    if ($("#metrics-controls")?.dataset.dirty) return;
+    const paused = () => document.querySelector(".lease-dialog[open]") ||
+      document.querySelector("#purpose-panel:not([hidden])") || window.PrivyHycoFacets?.isOpen() ||
+      $("#metrics-controls")?.dataset.dirty;
+    if (paused()) return;
     if ($("#remote-exec")) {
       document.dispatchEvent(new Event("remote-exec-refresh"));
       return;
@@ -374,8 +414,7 @@ JS = r"""
       const res = await fetch(location.href, { headers: { "X-Privy-UI": "1", "Accept": "text/html" } });
       if (!res.ok) return;
       const html = (await res.text()).replace(/<(style|script)\b[\s\S]*?<\/\1>/gi, "");
-      if (document.querySelector("#purpose-panel:not([hidden])")) return;
-      if (document.querySelector(".lease-dialog[open]") || $("#metrics-controls")?.dataset.dirty) return;
+      if (paused()) return;
       const doc = new DOMParser().parseFromString(html, "text/html");
       const open = new Map($$("details[id]").map(d => [d.id, d.open]));
       const keep = new Map($$("details.term[data-following]").map(d => [d.id, d]));
@@ -460,6 +499,7 @@ JS = r"""
     if (auto && auto.checked && !document.hidden && !typing) refresh();
   }, 10000);
   if (location.hash) { const d = document.getElementById(location.hash.slice(1)); if (d && d.tagName === "DETAILS") d.open = true; }
+  if (window.PrivyHycoFacets) window.PrivyHycoFacets.onChange = applyFilters;
   init();
 })();
 
@@ -616,4 +656,5 @@ JS = r"""
 })();
 """
 
+JS = files("privy.hub").joinpath("assets").joinpath("hycos.js").read_text(encoding="utf-8") + JS
 JS += files("privy.hub").joinpath("assets").joinpath("leases.js").read_text(encoding="utf-8")

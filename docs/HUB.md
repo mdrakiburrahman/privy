@@ -389,6 +389,23 @@ result is cached for 30 seconds (`--probe-ttl-s`); pass `refresh=true` to probe 
 targets report `host`, `os`, `user`, `languages`, `privy_version`, `default_language`,
 `running_jobs`, and `latency_ms`; `get_target` adds the listener's runtimes and working directory.
 
+Targets also report structured details from the listener's description: `os_family`, `os_release`,
+`os_build`, `os_version` (such as `Windows 11 · 26200`), `arch` (`x86_64` or `arm64`),
+`privy_version`, `python_version`, and `shells`. `environment` (`Windows host`, `WSL`,
+`Devcontainer`, `Linux host`, or `macOS host`) is inferred from the hybrid connection name suffix,
+because listeners do not report it. The hub keeps each listener's last description in
+`listener-info-state.json` under its home, so offline targets still show these details after a hub
+restart; such targets add `info_stale: true`, and `info_seen_at` says when the description was
+reported.
+
+`list_targets` filters on these details with the repeatable parameters `os`, `os_version`,
+`environment`, `arch`, `privy_version`, `python_version`, and `shell`. Matching ignores case and
+accepts `*` globs. Values of one parameter are alternatives; different parameters must all match.
+`os_version` also matches the bare release or build, and `Unknown` matches targets that never
+reported a value. For example,
+`GET /v1/targets?os=windows&privy_version=0.6.*&shell=bash&shell=pwsh`. `counts` always covers every
+target in the selected relays.
+
 | Status         | Meaning                                                                                                        |
 | -------------- | -------------------------------------------------------------------------------------------------------------- |
 | `online`       | A listener answered. privy 0.2.0+ also reports host, OS, user, version, and runtimes.                          |
@@ -407,25 +424,25 @@ Re-run the listener installer with `-UpdateBinary` to upgrade them.
 No route needs authentication. `GET /v1` describes the hub as JSON, and `GET /openapi.json` is a
 complete OpenAPI 3.1 description with examples.
 
-| Method and path                     | Operation                                                                    |
-| ----------------------------------- | ---------------------------------------------------------------------------- |
-| `GET /` and `GET /llms.txt`         | Quickstart (Markdown) with the machines online now; `/` serves browsers HTML |
-| `GET /ui`                           | Dashboard (HTML); see [Dashboard](#dashboard)                                |
-| `GET /v1/stats`                     | In-memory usage metrics with independent history range and resolution        |
-| `GET /v1/relays`                    | Export normalized Relay credentials per target (sensitive JSON; REST only)   |
-| `GET /v1/targets`                   | `list_targets` (`refresh`, `online_only`, `relay`, `probe`)                  |
-| `GET /v1/targets/{target}`          | `get_target`                                                                 |
-| `POST /v1/jobs`                     | `run`; `stream=true` streams the output                                      |
-| `GET /v1/jobs`                      | `list_jobs`                                                                  |
-| `GET /v1/jobs/{job_id}`             | `get_job` (`wait_s`, `max_output_bytes`, `stdout_offset`, `stderr_offset`)   |
-| `GET /v1/jobs/{job_id}/stream`      | The job's output from the start, then live until it finishes                 |
-| `GET /v1/jobs/{job_id}/output`      | `read_job_output` (`stream`, `offset`, `limit`)                              |
-| `POST /v1/jobs/{job_id}/cancel`     | `cancel_job`                                                                 |
-| `POST /v1/broadcasts`               | `broadcast`                                                                  |
-| `GET /v1/broadcasts/{broadcast_id}` | `get_broadcast`                                                              |
-| `POST /v1/files/upload`             | `upload_file`                                                                |
-| `POST /v1/files/download`           | `download_file`                                                              |
-| `POST /v1/files/sync`               | `sync_files`: async file/folder contents update (REST only; 202 + job URL)   |
+| Method and path                     | Operation                                                                       |
+| ----------------------------------- | ------------------------------------------------------------------------------- |
+| `GET /` and `GET /llms.txt`         | Quickstart (Markdown) with the machines online now; `/` serves browsers HTML    |
+| `GET /ui`                           | Dashboard (HTML); see [Dashboard](#dashboard)                                   |
+| `GET /v1/stats`                     | In-memory usage metrics with independent history range and resolution           |
+| `GET /v1/relays`                    | Export normalized Relay credentials per target (sensitive JSON; REST only)      |
+| `GET /v1/targets`                   | `list_targets` (`refresh`, `online_only`, `relay`, `probe`, and detail filters) |
+| `GET /v1/targets/{target}`          | `get_target`                                                                    |
+| `POST /v1/jobs`                     | `run`; `stream=true` streams the output                                         |
+| `GET /v1/jobs`                      | `list_jobs`                                                                     |
+| `GET /v1/jobs/{job_id}`             | `get_job` (`wait_s`, `max_output_bytes`, `stdout_offset`, `stderr_offset`)      |
+| `GET /v1/jobs/{job_id}/stream`      | The job's output from the start, then live until it finishes                    |
+| `GET /v1/jobs/{job_id}/output`      | `read_job_output` (`stream`, `offset`, `limit`)                                 |
+| `POST /v1/jobs/{job_id}/cancel`     | `cancel_job`                                                                    |
+| `POST /v1/broadcasts`               | `broadcast`                                                                     |
+| `GET /v1/broadcasts/{broadcast_id}` | `get_broadcast`                                                                 |
+| `POST /v1/files/upload`             | `upload_file`                                                                   |
+| `POST /v1/files/download`           | `download_file`                                                                 |
+| `POST /v1/files/sync`               | `sync_files`: async file/folder contents update (REST only; 202 + job URL)      |
 
 Arguments go in the query string, in a JSON body (`Content-Type: application/json`), or both. For
 `POST /v1/jobs` and `POST /v1/broadcasts`, putting `target` (or `targets`) in the query string makes
@@ -446,12 +463,12 @@ Invoke-RestMethod "$hub/v1/jobs/$($job.job_id)?wait_s=60"
 Open `http://127.0.0.1:7748/` (or `/ui`) in a browser for the hub's control plane. Clients that
 don't ask for `text/html` still get the Markdown quickstart at `/`.
 
-| Page        | Shows                                                                                        |
-| ----------- | -------------------------------------------------------------------------------------------- |
-| `/ui`       | Key numbers (jobs, success rate, latency, bytes moved), activity over time, busiest HYCOs    |
-| `/ui/hycos` | Every relay HYCO with status, last use, last seen online, job counts, and a sparkline        |
-| `/ui/jobs`  | Recent jobs, filterable by `state`                                                           |
-| `/ui/logs`  | Per-HYCO commands and output as collapsible terminals, like `kubectl logs`; live jobs follow |
+| Page        | Shows                                                                                               |
+| ----------- | --------------------------------------------------------------------------------------------------- |
+| `/ui`       | Key numbers (jobs, success rate, latency, bytes moved), activity over time, busiest HYCOs           |
+| `/ui/hycos` | Every relay HYCO with status, last use, last seen online, OS, versions, job counts, and a sparkline |
+| `/ui/jobs`  | Recent jobs, filterable by `state`                                                                  |
+| `/ui/logs`  | Per-HYCO commands and output as collapsible terminals, like `kubectl logs`; live jobs follow        |
 
 Add `?range=1h`, `24h`, or `7d` to change the window. `GET /ui/jobs/{job_id}/log` returns one job's
 command and output as plain text. `GET /v1/stats` returns the same numbers as JSON.
@@ -465,6 +482,15 @@ online, or "not since hub start". Both come from the hub's own listener probes, 
 page or tool asks about a HYCO, so they are approximate. They are kept in memory and reset when the
 hub restarts. `GET /v1/stats` reports them per HYCO as `status_since`, `status_since_first_check`,
 and `last_online`; each is `null` when unknown.
+
+**Relay HYCOs** also shows **OS**, **Env**, **Privy**, and **Python** columns, with **Arch** and
+**Shell** available from **Columns**; the column choice is remembered in the browser. The filter
+pills (**OS**, **OS version**, **Environment**, **Arch**, **Privy**, **Python**, and **Shell**) each
+open a checklist of the values present, with counts that follow the other filters. Values in one
+pill are alternatives; pills, search, status, and lease state must all match. Active filters appear
+as removable chips with **Clear all**, and are kept in the URL with the same parameter names as
+`list_targets`, so they survive refresh and can be shared. Offline HYCOs show their last reported
+details in gray italics; hover for when they were reported.
 
 On **Overview**, select **History range** and **Resolution** independently, then choose **Apply**.
 Ranges include `1h`, `24h`, `7d`, `30d`, **All retained history**, and **Custom dates**. Custom

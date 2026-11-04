@@ -11,6 +11,7 @@ import html
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -23,6 +24,7 @@ import yaml
 
 from privy.hub.dashboard_assets import CSS, JS
 from privy.hub.leases import LeaseError
+from privy.hub.listener_facts import FACETS, NO_SHELL, UNKNOWN_VALUE, facet_values
 from privy.hub.metrics import (
     BAD_STATES,
     DEFAULT_RANGE,
@@ -302,6 +304,7 @@ def build_report(
     for row in report["targets"]:
         probe = probes.get(row["id"])
         row["terminal_shells"] = terminal_languages(probe.info if probe else None)
+        row.update(service.listener_facts(row["id"], row["hybrid_connection"], probe))
     return report
 
 
@@ -464,10 +467,13 @@ def state_label(state: str) -> str:
     return f'<span class="st {cls}">{esc(state)}</span>'
 
 
-def sort_th(label: str, *, right: bool = False, sort: bool = True) -> str:
-    cls = ' class="r"' if right else ""
-    attr = " data-sort" if sort else ""
-    return f'<th{cls}{attr}>{esc(label)}<span class="s"></span></th>'
+def sort_th(
+    label: str, *, right: bool = False, sort: bool = True, cls: str = "", hidden: bool = False
+) -> str:
+    classes = " ".join(part for part in ("r" if right else "", cls) if part)
+    class_attr = f' class="{classes}"' if classes else ""
+    attr = (" data-sort" if sort else "") + (" hidden" if hidden else "")
+    return f'<th{class_attr}{attr}>{esc(label)}<span class="s"></span></th>'
 
 
 def job_anchor(entry_or_view: JobEntry | dict[str, Any]) -> str:
@@ -521,6 +527,81 @@ def last_online_cell(row: dict[str, Any], now: float) -> str:
     if row["status"] == UNKNOWN:
         return '<td data-v="0">—</td>'
     return '<td class="nw faint" data-v="0">not since hub start</td>'
+
+
+#: Optional ``/ui/hycos`` columns as ``(key, header, shown by default)``; the Columns picker toggles them.
+FACT_COLUMNS: tuple[tuple[str, str, bool], ...] = (
+    ("os", "OS", True),
+    ("environment", "Env", True),
+    ("arch", "Arch", False),
+    ("privy", "Privy", True),
+    ("python", "Python", True),
+    ("shell", "Shell", False),
+)
+
+
+def version_key(text: str) -> str:
+    """A sort key that orders ``0.10.0`` after ``0.9.0``."""
+    return re.sub(r"\d+", lambda match: match.group().zfill(8), text.lower())
+
+
+def fact_cells(row: dict[str, Any]) -> str:
+    stale = row.get("info_stale")
+    seen = row.get("info_seen_at_ts")
+    as_of = f"as of {utc_time(seen)}, the last report while online" if stale and seen is not None else None
+    shells = row.get("shells")
+    values = {
+        "os": row.get("os_version") or row.get("os_family"),
+        "environment": row.get("environment"),
+        "arch": row.get("arch"),
+        "privy": row.get("privy_version"),
+        "python": row.get("python_version"),
+        "shell": ", ".join(shells) if shells else NO_SHELL if shells is not None else None,
+    }
+    cells = []
+    for key, _, shown in FACT_COLUMNS:
+        value = values[key]
+        hidden = "" if shown else " hidden"
+        title = as_of
+        if key == "environment" and value:
+            title = "inferred from the HYCO name suffix"
+        elif key == "os" and value:
+            title = " · ".join(part for part in (value, as_of) if part)
+        classes = " ".join(
+            part
+            for part in (f"col-{key}", "nw", "fact-clip" if key == "os" else "", "stale" if stale else "")
+            if part
+        )
+        if value is None:
+            cells.append(f'<td class="col-{key} faint" data-v=""{hidden}>—</td>')
+        else:
+            cells.append(
+                f'<td class="{classes}" data-v="{esc(version_key(value))}"{title_attr(title)}{hidden}>'
+                f"{esc(value)}</td>"
+            )
+    return "".join(cells)
+
+
+def fact_headers() -> str:
+    return "".join(sort_th(header, cls=f"col-{key}", hidden=not shown) for key, header, shown in FACT_COLUMNS)
+
+
+def facet_toolbar() -> str:
+    pills = "".join(
+        f'<button type="button" class="facet-pill" data-facet="{esc(name)}" data-label="{esc(label)}" '
+        f'aria-haspopup="dialog" aria-expanded="false">{esc(label)}<span class="v"></span></button>'
+        for name, label in FACETS
+    )
+    columns = "".join(
+        f'<span data-col="{esc(key)}" data-label="{esc(header)}" data-default="{1 if shown else 0}"></span>'
+        for key, header, shown in FACT_COLUMNS
+    )
+    return (
+        f'<div class="toolbar facets"><span class="facet-title">Filter</span>{pills}'
+        f'<button type="button" class="facet-pill cols" id="hycocols" aria-haspopup="dialog" '
+        f'aria-expanded="false">Columns</button><span id="hycocolumns" hidden>{columns}</span></div>'
+        '<div class="facet-chips" id="hycochips" hidden></div>'
+    )
 
 
 # ---- overview -----------------------------------------------------------------------
@@ -1025,6 +1106,7 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
         + sort_th("Status")
         + sort_th("Last used")
         + sort_th("Last seen online")
+        + fact_headers()
         + sort_th("Lease")
         + sort_th("Last reported purpose")
         + sort_th(f"Jobs over {report['range']}", sort=False)
@@ -1047,6 +1129,7 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
         group = row.get("lease_group")
         lease = (group or {}).get("lease") or {}
         lease_status = group["state"] if group else "unavailable"
+        facets = facet_values(row)
         remote = (
             f'<a class="remote-link" href="{esc(link("/ui/exec", target=row["id"]))}" '
             f'aria-label="Remote execute on {esc(row["label"])}">{TERMINAL_ICON}Remote</a>'
@@ -1070,17 +1153,20 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
             (lease.get("holder") or {}).get("name"),
             lease.get("purpose"),
             json.dumps(lease.get("labels") or {}, ensure_ascii=False),
+            *(value for values in facets.values() for value in values if value != UNKNOWN_VALUE),
         )
         body.append(
             f'<tr data-href="{esc(link("/ui/logs", target=row["id"]))}" '
             f'data-q="{esc(" ".join(str(term) for term in terms if term).lower())}" '
-            f'data-up="{1 if up else 0}" data-lease-state="{esc(lease_status)}">'
+            f'data-up="{1 if up else 0}" data-lease-state="{esc(lease_status)}" '
+            f'data-facets="{esc(json.dumps(facets, ensure_ascii=False, separators=(",", ":")))}">'
             f'<td class="idx">{i:02d}</td>'
             f'<td data-v="{esc(row["label"].lower())}">{hyco_cell(row)}{remote}</td>'
             f"{hyco_status_cell(row, now)}"
             f'<td class="nw" data-v="{last_used or 0}"{title_attr(utc_time(last_used) if last_used else None)}>'
             f"{esc(fmt_ago(last_used, now))}</td>"
             f"{last_online_cell(row, now)}"
+            f"{fact_cells(row)}"
             f'<td class="lease-cell" data-v="{esc(lease_status)}">{lease_cell(group, now) if group else "—"}</td>'
             f'<td class="purpose-cell" data-v="{esc(((row.get("purpose") or {}).get("latest") or "").lower())}">'
             f"{purpose_cell(row)}</td>"
@@ -1105,7 +1191,7 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
         '<label class="tg">Lease <select id="hycolease" aria-label="Lease state">'
         '<option value="all">all states</option><option value="leased">leased</option><option value="free">free</option>'
         '<option value="cooling">cooling down</option><option value="unavailable">unavailable</option></select></label>'
-        '<span class="chip" id="hycocount"></span></div>'
+        '<span class="chip" id="hycocount"></span></div>' + facet_toolbar()
     )
     patterns = (
         '<svg width="0" height="0" aria-hidden="true"><defs>'
@@ -1118,7 +1204,7 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
     )
     table = (
         f'{patterns}{toolbar}<div class="table"><table id="hycos"><thead>{head}</thead><tbody>{"".join(body)}</tbody></table>'
-        '</div><div class="empty" id="hyconone" hidden>No relay HYCOs match this search.</div>'
+        '</div><div class="empty" id="hyconone" hidden>No relay HYCOs match this search and these filters.</div>'
         if rows
         else '<div class="empty">No relays are hydrated yet. Run Sync-PrivyHubRelays.ps1 or edit relays.json.</div>'
     )
@@ -1128,6 +1214,10 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
         "own listener probes, not from Azure. Status times and Last seen online come from the same probes, which run "
         'when a page or tool asks about a HYCO, so they are approximate; "for at least" means the status has not '
         "changed since the hub first checked. They are kept in memory and reset when the hub restarts.</p>"
+        '<p class="fine">OS, Arch, Privy, Python and Shell come from each listener\'s own report. Offline HYCOs show '
+        "their last report in grey (hover for its time); the hub keeps it across restarts. Env is inferred from "
+        "the HYCO name suffix. Filters combine: values inside one filter are alternatives, and every filter must "
+        "match. Columns chooses which of these columns to show.</p>"
         '<p class="fine purpose-legend">Purpose: colors show reported work; striped gaps mean unknown; '
         "crosshatching means multiple changes in a small interval. Hover or focus for details; click to pin history. "
         "This is not execution duration or exclusive ownership. In memory only; resets on hub restart.</p>"
