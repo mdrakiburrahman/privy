@@ -150,7 +150,11 @@ def render_target(target: dict[str, Any], transport: str = "rest") -> str:
         "host",
         "user",
         "os",
+        "os_version",
+        "arch",
+        "environment",
         "privy_version",
+        "python_version",
         "default_language",
         "reason",
         "details",
@@ -160,6 +164,10 @@ def render_target(target: dict[str, Any], transport: str = "rest") -> str:
             lines.append(f"{key}: {target[key]}")
     if target.get("languages"):
         lines.append("languages: " + ", ".join(target["languages"]))
+    if target.get("shells"):
+        lines.append("shells: " + ", ".join(target["shells"]))
+    if target.get("info_stale"):
+        lines.append(f"details as of: {target.get('info_seen_at')} (last report while online)")
     info = target.get("listener_info") or {}
     runtimes = info.get("runtimes") or {}
     if runtimes:

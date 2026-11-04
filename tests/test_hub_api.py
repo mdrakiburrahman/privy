@@ -151,6 +151,12 @@ def test_capabilities_and_openapi_describe_every_operation(hub):
     assert body["application/json"]["schema"]["required"] == ["target", "code"]
     assert body["text/plain"]["example"] == "Get-Date; hostname"
     assert {"target", "language", "format", "stream"} <= {param["name"] for param in run["parameters"]}
+    explode = {
+        (path, param["name"]): param.get("explode")
+        for path, method in (("/v1/targets", "get"), ("/v1/broadcasts", "post"))
+        for param in document["paths"][path][method]["parameters"]
+    }
+    assert explode[("/v1/targets", "os")] is True and explode[("/v1/broadcasts", "targets")] is False
     assert "stream=true&target=dev/box1_windows" in run["x-codeSamples"][0]["source"]
     assert run["responses"]["200"]["content"]["application/json"]["example"]["state"] == "succeeded"
     stream = document["paths"]["/v1/jobs/{job_id}/stream"]["get"]

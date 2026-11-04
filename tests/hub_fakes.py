@@ -12,6 +12,7 @@ from privy.client import ExecResult
 from privy.hub.app import Headers, HttpResponse, HubApp
 from privy.hub.config import RelaysStore
 from privy.hub.jobs import AuditLog, JobManager
+from privy.hub.listener_facts import ListenerInfoStore
 from privy.hub.registry import TargetRegistry
 from privy.hub.service import HubService
 from privy.transfer import TransferResult
@@ -184,14 +185,23 @@ def write_relays(path: Path, document: dict[str, Any] | None = None) -> Path:
 class Hub:
     """A fully wired in-memory hub with fake listeners."""
 
-    def __init__(self, tmp_path: Path, listeners: dict[str, FakeListener] | None = None, **job_options):
+    def __init__(
+        self,
+        tmp_path: Path,
+        listeners: dict[str, FakeListener] | None = None,
+        *,
+        listener_infos: ListenerInfoStore | None = None,
+        **job_options,
+    ):
         self.listeners = listeners if listeners is not None else {}
         self.relays_file = write_relays(tmp_path / "relays.json")
         self.store = RelaysStore(self.relays_file, check_interval_s=0)
         self.registry = TargetRegistry(self.store, client_factory=self._client)
         self.audit_path = tmp_path / "audit.jsonl"
         self.jobs = JobManager(self.registry, audit=AuditLog(self.audit_path), **job_options)
-        self.service = HubService(registry=self.registry, jobs=self.jobs, version="test")
+        self.service = HubService(
+            registry=self.registry, jobs=self.jobs, version="test", listener_infos=listener_infos
+        )
         self.app = HubApp(self.service, port=PORT)
 
     def _client(self, target) -> FakeRelayClient:

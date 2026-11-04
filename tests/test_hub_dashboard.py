@@ -351,7 +351,21 @@ def test_hycos_page_leads_with_colored_status_last_used_and_last_seen_online(hub
     text = html_of(hub.call("GET", "/ui/hycos", headers=BROWSER))
     table = text.split('<table id="hycos">', 1)[1]
     head = re.findall(r"<th[^>]*>([^<]+)", table.split("</thead>", 1)[0])
-    assert head[:6] == ["#", "Relay HYCO", "Status", "Last used", "Last seen online", "Lease"]
+    assert head[:12] == [
+        "#",
+        "Relay HYCO",
+        "Status",
+        "Last used",
+        "Last seen online",
+        "OS",
+        "Env",
+        "Arch",
+        "Privy",
+        "Python",
+        "Shell",
+        "Lease",
+    ]
+    assert re.findall(r'<th class="col-(\w+)" data-sort hidden>', table) == ["arch", "shell"]
 
     def row(target):
         return re.search(rf'<tr data-href="/ui/logs\?target={target}".*?</tr>', table, re.S).group(0)
@@ -359,8 +373,14 @@ def test_hycos_page_leads_with_colored_status_last_used_and_last_seen_online(hub
     box1, box2 = row("dev%2Fbox1_windows"), row("dev%2Fbox2_windows")
     assert '<span class="hyco-status online">online</span>' in box1 and "for at least" in box1
     assert "operator@BOX1 · Windows-11 · privy 0.2.0" in box1 and ">now</td>" in box1
+    assert re.search(r'<td class="col-os nw fact-clip"[^>]*>Windows</td>', box1)
+    assert re.search(r'<td class="col-environment nw"[^>]*>Windows host</td>', box1)
+    assert re.search(r'<td class="col-arch nw"[^>]*hidden>x86_64</td>', box1)
+    assert re.search(r'<td class="col-privy nw"[^>]*>0.2.0</td>', box1)
+    assert '<td class="col-python faint" data-v="">—</td>' in box1
     assert '<span class="hyco-status offline">offline</span>' in box2
     assert "no listener is connected" in box2 and "not since hub start" in box2
+    assert '<td class="col-os faint" data-v="">—</td>' in box2
     assert 'class="dot' not in table
 
 

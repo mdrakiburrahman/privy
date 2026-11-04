@@ -28,6 +28,7 @@ from privy.hub.jobs import (
     utc_iso,
 )
 from privy.hub.leases import LeaseError, LeaseStore
+from privy.hub.listener_facts import FACETS, ListenerInfoStore, facts_for, matches
 from privy.hub.metrics import HubMetrics
 from privy.hub.purpose import MAX_PURPOSE_CHARS, WINDOWS, normalize_purpose
 from privy.hub.registry import (
@@ -372,7 +373,10 @@ OPERATIONS: tuple[Operation, ...] = (
         "List every machine (privy listener) the hub can reach with its status: online, offline "
         "(no listener connected), not_found (hybrid connection missing), unauthorized (stale key), "
         "unreachable, or error. Online machines report host, OS, user, privy version, and "
-        "languages. Status is probed live and cached briefly. Start here.",
+        "languages; os_family, os_version, arch, privy_version, python_version, environment, and "
+        "shells are also shown for offline machines from their last report (info_stale, "
+        "info_seen_at). Filter on those with os, os_version, environment, arch, privy_version, "
+        "python_version, and shell. Status is probed live and cached briefly. Start here.",
         (
             Param(
                 "refresh",
@@ -387,6 +391,16 @@ OPERATIONS: tuple[Operation, ...] = (
                 "boolean",
                 "Probe machines without a fresh cached status. false returns cached status only (fast).",
                 default=True,
+            ),
+            *(
+                Param(
+                    name,
+                    "array",
+                    f"Only machines whose {label} matches one of these values (case-insensitive, * globs; "
+                    "'Unknown' matches machines that never reported it). Repeat or comma-separate "
+                    "alternatives.",
+                )
+                for name, label in FACETS
             ),
         ),
         read_only=True,
@@ -837,6 +851,7 @@ class HubService:
         started_at: float | None = None,
         metrics: HubMetrics | None = None,
         leases: LeaseStore | None = None,
+        listener_infos: ListenerInfoStore | None = None,
     ) -> None:
         self.registry = registry
         self.jobs = jobs
@@ -844,12 +859,21 @@ class HubService:
         self.started_at = time.time() if started_at is None else started_at
         self.metrics = metrics if metrics is not None else HubMetrics()
         self.leases = leases if leases is not None else LeaseStore(registry, audit=jobs.audit)
+        self.listener_infos = listener_infos if listener_infos is not None else ListenerInfoStore()
         jobs.on_job = self._job_added
         jobs.on_finish = self.leases.job_finished
-        registry.on_probe = self.metrics.probe
+        registry.on_probe = self._probed
         self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
             operation.name: getattr(self, f"_op_{operation.name}") for operation in OPERATIONS
         }
+
+    def _probed(self, target: Target, result: ProbeResult) -> None:
+        self.metrics.probe(target, result)
+        self.listener_infos.record(target, result)
+
+    def listener_facts(self, target_id: str, path: str, probe: ProbeResult | None) -> dict[str, Any]:
+        """OS and version facts, live or last known (see :mod:`privy.hub.listener_facts`)."""
+        return facts_for(self.listener_infos, target_id, path, probe)
 
     def _job_added(self, job: HubJob) -> None:
         self.leases.job_started(job)
@@ -950,7 +974,12 @@ class HubService:
         return view
 
     def _target_view(
-        self, target: Target, probe: ProbeResult | None, *, full: bool = False
+        self,
+        target: Target,
+        probe: ProbeResult | None,
+        *,
+        full: bool = False,
+        facts: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         view: dict[str, Any] = {
             "id": target.id,
@@ -969,6 +998,16 @@ class HubService:
             view["latency_ms"] = probe.latency_ms
         if target.description:
             view["description"] = target.description
+        facts = dict(facts) if facts is not None else self.listener_facts(target.id, target.path, probe)
+        if facts["info_seen_at"] is None:
+            facts.pop("info_stale")
+        view.update(
+            {
+                key: value
+                for key, value in facts.items()
+                if value is not None and key != "info_seen_at_ts" and key not in view
+            }
+        )
         if full:
             view.update(relay=target.relay, namespace=target.namespace, hybrid_connection=target.path)
             if probe is not None:
@@ -1071,7 +1110,14 @@ class HubService:
     # ---- operations ---------------------------------------------------------
 
     def _op_list_targets(
-        self, *, origin: str, refresh: bool, online_only: bool, relay: str | None, probe: bool
+        self,
+        *,
+        origin: str,
+        refresh: bool,
+        online_only: bool,
+        relay: str | None,
+        probe: bool,
+        **facets: list[str] | None,
     ) -> dict[str, Any]:
         snapshot = self.registry.snapshot()
         relays = snapshot.relays
@@ -1089,10 +1135,19 @@ class HubService:
             probes = self.registry.probe_many(targets, refresh=refresh)
         else:
             probes = {target.id: self.registry.cached(target) for target in targets}
-        views = [self._target_view(target, probes.get(target.id)) for target in targets]
+        facts = {
+            target.id: self.listener_facts(target.id, target.path, probes.get(target.id))
+            for target in targets
+        }
+        views = [
+            self._target_view(target, probes.get(target.id), facts=facts[target.id]) for target in targets
+        ]
         counts = Counter(view["status"] for view in views)
         if online_only:
             views = [view for view in views if view["status"] == ONLINE]
+        filters = {name: values for name, values in facets.items() if values}
+        if filters:
+            views = [view for view in views if matches(facts[view["id"]], filters)]
         result: dict[str, Any] = {
             "counts": {"targets": len(targets), **dict(sorted(counts.items()))},
             "targets": views,
