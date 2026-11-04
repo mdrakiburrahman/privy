@@ -20,7 +20,14 @@ from urllib.parse import unquote, urlsplit
 from privy.hub import dashboard, guide, render
 from privy.hub.jobs import HubJob
 from privy.hub.mcp import MCP_PATH, SUPPORTED_VERSIONS
-from privy.hub.metrics import DEFAULT_RANGE, RANGES, public_report
+from privy.hub.metrics import (
+    DEFAULT_RANGE,
+    RANGES,
+    REPORT_RANGES,
+    RESOLUTIONS,
+    ReportSelection,
+    public_report,
+)
 from privy.hub.responses import TEXT_TYPE, HttpResponse, error_response
 from privy.hub.service import (
     FORCE_RELEASE_OPERATION,
@@ -329,12 +336,13 @@ class RestApi:
         return response
 
     def stats(self, query: Mapping[str, list[str]]) -> HttpResponse:
-        value = _last(query, "range", DEFAULT_RANGE)
-        if set(query) - {"range"} or value not in RANGES:
-            return error_response(
-                400, "invalid_argument", f"this endpoint accepts only range ({', '.join(RANGES)})"
-            )
-        return HttpResponse(200, public_report(dashboard.build_report(self.service, value)))
+        try:
+            if set(query) - {"range", "start", "end", "resolution"}:
+                raise ValueError("this endpoint accepts only range, start, end and resolution")
+            selection = ReportSelection.parse(query)
+        except ValueError as exc:
+            return error_response(400, "invalid_argument", str(exc))
+        return HttpResponse(200, public_report(dashboard.build_report(self.service, selection=selection)))
 
     def credentials(self, query: Mapping[str, list[str]]) -> HttpResponse:
         if set(query) - {"format"} or _last(query, "format", "json") != "json":
@@ -385,6 +393,14 @@ class RestApi:
             text = output_format == "text"
             stream = route.streams and _flag("stream", _last(query, "stream", "false"))
             args = self._arguments(route, path_values, query, headers, body)
+            if (
+                origin == "ui"
+                and route.operation in {"acquire_lease", "renew_lease"}
+                and not _same_origin_ui(headers)
+            ):
+                return error_response(
+                    403, "forbidden_origin", "Manual leases require a same-origin dashboard request"
+                )
             if route.operation == STREAM_JOB:
                 if set(args) - {"job_id", "lease_id"}:
                     raise _invalid(
@@ -673,20 +689,21 @@ def _operation_spec(route: Route, base_url: str, example: guide.Example) -> dict
                     "schema": {"type": "string"},
                 }
             )
-        if route.operation == FORCE_RELEASE_OPERATION.name:
+        if route.operation in {FORCE_RELEASE_OPERATION.name, "acquire_lease", "renew_lease"}:
             parameters.extend(
                 [
                     {
                         "name": "Origin",
                         "in": "header",
-                        "required": True,
-                        "description": "Must match the host and origin serving the dashboard.",
+                        "required": route.operation == FORCE_RELEASE_OPERATION.name,
+                        "description": "Must match the dashboard origin when X-Privy-UI: 1 is supplied.",
                         "schema": {"type": "string"},
                     },
                     {
                         "name": "X-Privy-UI",
                         "in": "header",
-                        "required": True,
+                        "required": route.operation == FORCE_RELEASE_OPERATION.name,
+                        "description": "Dashboard manual mode; acquisition may use manual_max_ttl. Requires same-origin Origin.",
                         "schema": {"type": "string", "const": "1"},
                     },
                 ]
@@ -821,13 +838,32 @@ def openapi_document(service: HubService, base_url: str) -> dict[str, Any]:
         "get": {
             "operationId": "stats",
             "summary": "Hub usage metrics",
-            "description": "In-memory KPIs and per-HYCO job counts over time (the data behind the dashboard).",
+            "description": "Lifetime in-memory telemetry; request/probe samples reset on restart. "
+            "Requested resolution is coarsened when necessary to stay within 1000 buckets; "
+            "bucket_s reports the actual resolution and resolution_adjusted indicates coarsening.",
             "parameters": [
                 {
                     "name": "range",
                     "in": "query",
-                    "schema": {"type": "string", "enum": list(RANGES), "default": DEFAULT_RANGE},
-                }
+                    "schema": {"type": "string", "enum": list(REPORT_RANGES), "default": DEFAULT_RANGE},
+                },
+                {
+                    "name": "resolution",
+                    "in": "query",
+                    "schema": {"type": "string", "enum": list(RESOLUTIONS), "default": "auto"},
+                },
+                {
+                    "name": "start",
+                    "in": "query",
+                    "description": "Inclusive ISO timestamp with timezone; required for range=custom.",
+                    "schema": {"type": "string", "format": "date-time"},
+                },
+                {
+                    "name": "end",
+                    "in": "query",
+                    "description": "Exclusive ISO timestamp with timezone; required for range=custom.",
+                    "schema": {"type": "string", "format": "date-time"},
+                },
             ],
             "responses": {
                 "200": {"description": "Metrics report", "content": {"application/json": {}}},
@@ -835,6 +871,7 @@ def openapi_document(service: HubService, base_url: str) -> dict[str, Any]:
             },
         }
     }
+    paths["/ui"]["get"]["parameters"] = paths["/v1/stats"]["get"]["parameters"]
     paths["/v1"] = {
         "get": {
             "operationId": "capabilities",

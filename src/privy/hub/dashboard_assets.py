@@ -204,6 +204,15 @@ border:1px solid var(--line);border-radius:7px}
 .lease-dialog .lease-dialog-actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:20px}
 .lease-dialog .primary{background:var(--accent);color:var(--paper);border-color:var(--accent)}
 .lease-action-error{color:var(--red);padding:12px}
+.lease-button[hidden],.report-dates[hidden]{display:none}
+.metrics-controls{margin-bottom:20px}.metrics-controls label,.lease-form label{display:flex;flex-direction:column;gap:6px}
+.metrics-controls .toolbar,.report-dates{display:flex;gap:12px;flex-wrap:wrap;align-items:end}
+.metrics-controls input,.lease-form input,.lease-form select{padding:8px;border:1px solid var(--line);
+border-radius:5px;background:var(--paper);color:var(--ink);font:12px var(--sans);min-width:0}
+.lease-form{display:grid;gap:14px}.lease-form select{width:100%}
+.duration-picker{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.duration-picker input{width:80px;text-align:center}.duration-picker output{font:600 16px var(--mono)}
+.lease-button.primary{background:var(--accent);color:var(--paper)}.lease-button:disabled{opacity:.5;cursor:default}
 """
 
 JS = r"""
@@ -279,6 +288,15 @@ JS = r"""
     if (s !== "all") url.searchParams.set("status", s); else url.searchParams.delete("status");
     if (lease !== "all") url.searchParams.set("lease_state", lease); else url.searchParams.delete("lease_state");
     if (url.href !== location.href) history.replaceState(null, "", url);
+    $$("#topchips a[href]").forEach(a => {
+      const target = new URL(a.href);
+      if (target.pathname !== location.pathname) return;
+      ["q", "status", "lease_state"].forEach(key => {
+        if (url.searchParams.has(key)) target.searchParams.set(key, url.searchParams.get(key));
+        else target.searchParams.delete(key);
+      });
+      a.href = target.href;
+    });
   }
   function tail(pre) { pre.scrollTop = pre.scrollHeight; }
 
@@ -319,6 +337,10 @@ JS = r"""
     });
   }
   function init() {
+    $$("#metrics-custom input").forEach(input => {
+      const date = new Date(Number(input.dataset.timestamp) * 1000);
+      input.value = new Date(date.valueOf() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+    });
     const f = $("#follow"); if (f) f.checked = store("privy.follow", true);
     const params = new URLSearchParams(location.search), hq = $("#hycoq");
     if (hq && params.get("q")) hq.value = params.get("q");
@@ -334,7 +356,7 @@ JS = r"""
   async function refresh() {
     if (document.querySelector(".lease-dialog[open]")) return;
     if (document.querySelector("#purpose-panel:not([hidden])")) return;
-    if (document.querySelector(".lease-dialog[open]")) return;
+    if ($("#metrics-controls")?.dataset.dirty) return;
     if ($("#remote-exec")) {
       document.dispatchEvent(new Event("remote-exec-refresh"));
       return;
@@ -346,6 +368,7 @@ JS = r"""
       if (!res.ok) return;
       const html = (await res.text()).replace(/<(style|script)\b[\s\S]*?<\/\1>/gi, "");
       if (document.querySelector("#purpose-panel:not([hidden])")) return;
+      if (document.querySelector(".lease-dialog[open]") || $("#metrics-controls")?.dataset.dirty) return;
       const doc = new DOMParser().parseFromString(html, "text/html");
       const open = new Map($$("details[id]").map(d => [d.id, d.open]));
       const keep = new Map($$("details.term[data-following]").map(d => [d.id, d]));
@@ -385,6 +408,33 @@ JS = r"""
     if (tr && !e.target.closest("a,button,[role=button]") && !getSelection().toString()) location.href = tr.dataset.href;
   });
   document.addEventListener("input", e => { if (e.target.matches("#grep, #podq, #hycoq")) applyFilters(); });
+  function editMetrics(event) {
+    const form = event.target.closest("#metrics-controls");
+    if (!form) return;
+    form.dataset.dirty = "1";
+    $("#metrics-custom").hidden = $("#metrics-range").value !== "custom";
+  }
+  document.addEventListener("input", editMetrics);
+  document.addEventListener("change", editMetrics);
+  document.addEventListener("submit", event => {
+    if (event.target.id !== "metrics-controls") return;
+    event.preventDefault();
+    const url = new URL(location.href), range = $("#metrics-range").value;
+    url.searchParams.set("range", range);
+    url.searchParams.set("resolution", $("#metrics-resolution").value);
+    if (range === "custom") {
+      const start = new Date($("#metrics-start").value), end = new Date($("#metrics-end").value);
+      if (!Number.isFinite(start.valueOf()) || !Number.isFinite(end.valueOf()) || start >= end) {
+        $("#metrics-error").textContent = "Choose a valid start before the end.";
+        return;
+      }
+      url.searchParams.set("start", start.toISOString());
+      url.searchParams.set("end", end.toISOString());
+    } else {
+      url.searchParams.delete("start"); url.searchParams.delete("end");
+    }
+    location.assign(url);
+  });
   document.addEventListener("change", e => {
     const t = e.target;
     if (t.id === "expand") $$("details.term").forEach(d => { d.open = t.checked; });
@@ -497,7 +547,8 @@ JS = r"""
     const more = panel.querySelector("[data-purpose-more]"), status = panel.querySelector("[role=status]");
     if (!append) { entries.replaceChildren(); cursor = null; more.hidden = true; }
     error.hidden = true; status.textContent = "Loading purpose history..."; more.disabled = true;
-    const range = new URLSearchParams(location.search).get("range") || "24h";
+    const requested = new URLSearchParams(location.search).get("range") || "24h";
+    const range = ["1h", "24h", "7d"].includes(requested) ? requested : "7d";
     const params = new URLSearchParams({ target, range, limit: "50" });
     if (append && cursor) params.set("cursor", cursor);
     try {

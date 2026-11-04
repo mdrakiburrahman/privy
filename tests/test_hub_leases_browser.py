@@ -127,6 +127,76 @@ def test_hyco_lease_state_filter_and_url_survive_refresh(lease_browser):
     assert not errors
 
 
+def test_hyco_search_matches_own_layer_not_sibling_lease_members(lease_browser):
+    page, _, _, _, base, errors = lease_browser
+    page.goto(base + "/ui/hycos?q=wsl")
+    browser_api.expect(page.locator("#hycos tbody tr:visible")).to_have_count(1)
+    browser_api.expect(page.locator("#hycos tbody tr:visible")).to_contain_text("box1_wsl")
+    page.locator("#hycoq").fill("_windows")
+    browser_api.expect(page.locator("#hycos tbody tr:visible")).to_have_count(2)
+    page.locator("#hycoq").fill("wsl")
+    page.locator("#topchips").get_by_role("link", name="7d", exact=True).click()
+    browser_api.expect(page.locator("#hycoq")).to_have_value("wsl")
+    browser_api.expect(page.locator("#hycos tbody tr:visible")).to_have_count(1)
+    page.locator("#hycoq").fill("does-not-exist")
+    browser_api.expect(page.locator("#hyconone")).to_be_visible()
+    page.locator("#hycoq").fill("")
+    browser_api.expect(page.locator("#hycos tbody tr:visible")).to_have_count(4)
+    assert not errors
+
+
+def test_take_manual_lease_with_duration_picker_reload_and_release(lease_browser):
+    page, hub, _, _, base, errors = lease_browser
+    page.goto(base + "/ui/leases")
+    page.get_by_role("button", name="Take lease", exact=True).click()
+    page.locator("#lease-group").select_option("dev/box2")
+    page.locator("#lease-holder").fill("Manual operator")
+    page.locator("#lease-purpose").fill("Reserved for my work")
+    page.locator("#lease-hours").fill("35")
+    page.locator("#lease-minutes").fill("59")
+    page.get_by_role("button", name="Increase minutes", exact=True).click()
+    browser_api.expect(page.locator("#lease-duration")).to_have_text("36:00")
+    page.locator("#lease-create").get_by_role("button", name="Take lease", exact=True).click()
+    browser_api.expect(page.locator("#s-lease-peek")).to_contain_text("Reserved for my work")
+    manual = next(item for item in hub.service.leases.list_leases() if item.get("manual"))
+    assert manual["ttl_s"] == 36 * 3600 and manual["holder"]["name"] == "Manual operator"
+    before = manual["expires_at"]
+    page.reload()
+    assert hub.service.leases.get_lease(manual["lease_id"])["expires_at"] == before
+    page.get_by_role("button", name="Release", exact=True).click()
+    page.locator(".lease-dialog").get_by_role("button", name="Release", exact=True).click()
+    browser_api.expect(page.locator("[data-owner-release]:visible")).to_have_count(0)
+    assert hub.service.leases.get_lease(manual["lease_id"])["state"] == "released"
+    assert not errors
+
+
+def test_take_lease_validation_and_conflict_preserve_draft(lease_browser):
+    page, _, _, _, base, errors = lease_browser
+    page.goto(base + "/ui/leases")
+    page.get_by_role("button", name="Take lease", exact=True).click()
+    page.locator("#lease-group").select_option("dev/box2")
+    page.locator("#lease-purpose").fill("Keep this draft")
+    page.locator("#lease-hours").fill("0")
+    page.locator("#lease-minutes").fill("0")
+    page.locator("#lease-create").get_by_role("button", name="Take lease", exact=True).click()
+    assert not page.locator("#lease-minutes").evaluate("(e) => e.checkValidity()")
+    page.locator("#lease-hours").fill("8")
+    page.route(
+        "**/v1/leases",
+        lambda route: route.fulfill(
+            status=409,
+            content_type="application/json",
+            body='{"error":{"code":"group_leased","message":"Group was just reserved by another client"}}',
+        ),
+    )
+    page.locator("#lease-create").get_by_role("button", name="Take lease", exact=True).click()
+    browser_api.expect(page.locator("#lease-create-error")).to_contain_text("just reserved")
+    browser_api.expect(page.locator("#lease-purpose")).to_have_value("Keep this draft")
+    page.get_by_role("button", name="Cancel", exact=True).click()
+    browser_api.expect(page.locator("#lease-create")).to_have_count(0)
+    assert not errors
+
+
 def test_lease_search_label_client_group_filters_and_peek(lease_browser):
     page, _, lease, _, base, errors = lease_browser
     page.goto(base + "/ui/leases")

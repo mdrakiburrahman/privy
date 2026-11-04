@@ -1427,7 +1427,9 @@ class HubService:
         ttl: str | None,
     ) -> dict[str, Any]:
         with _translated_errors():
-            return self.leases.acquire(client_id, target=target, labels=labels, purpose=purpose, ttl=ttl)
+            return self.leases.acquire(
+                client_id, target=target, labels=labels, purpose=purpose, ttl=ttl, manual=origin == "ui"
+            )
 
     def _op_list_leases(
         self,
@@ -1449,7 +1451,7 @@ class HubService:
         self, *, origin: str, lease_id: str, client_id: str, ttl: str | None
     ) -> dict[str, Any]:
         with _translated_errors():
-            return self.leases.renew(lease_id, client_id, ttl=ttl)
+            return self.leases.renew(lease_id, client_id, ttl=ttl, manual=origin == "ui")
 
     def _op_release_lease(self, *, origin: str, lease_id: str, client_id: str | None) -> dict[str, Any]:
         with _translated_errors():

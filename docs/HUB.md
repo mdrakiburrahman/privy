@@ -72,6 +72,38 @@ used. Without one, existing execution behavior is unchanged; if another client h
 response includes a `lease_warning`. `GET /v1/jobs` also accepts `lease_id` and `client_id` filters.
 MCP exposes client, group, and lease operations, but not force-release.
 
+### Reserve a devbox from the dashboard
+
+Open `http://localhost:7748/ui/leases` and choose **Take lease**. Select a devbox group, enter your
+holder name and purpose, optionally add a repository label, and set the duration with the **HH:MM**
+hours/minutes fields and **+ / -** buttons. The form shows the member layers and expected expiry
+before you submit.
+
+Manual dashboard reservations can exceed four hours, up to `manual_max_ttl` (365 days by default).
+This optional setting lives in `leases.yaml` under `defaults`; existing configurations work without
+it. Ordinary agent leases still use `max_ttl`, which cannot exceed four hours. The picker measures a
+duration, not a time of day: `36:00` means 36 hours, without midnight wrapping.
+
+The whole group is reserved, so selecting `raki-onebox-executor-1` covers its Windows, WSL, and
+devcontainer members. Another client cannot acquire any of them until the reservation expires or is
+released. **Leases remain advisory**: unleased commands can still execute. The form never overrides
+another holder or silently chooses a different box.
+
+The browser remembers a manual operator identity for this origin. Your manual reservations show a
+normal **Release** action; **Force release** remains a separately confirmed administrative action.
+If browser storage is cleared, or you switch between `localhost` and `127.0.0.1`, that origin has a
+different identity; the existing force-release action provides recovery. Identity metadata is
+cooperative coordination, not authentication.
+
+Closing or refreshing the dashboard does not release or renew a reservation. Lease state survives
+hub restarts. Creation uses the existing acquisition endpoint with `X-Privy-UI: 1` and a matching
+`Origin`; client labels or `kind` alone do not enable longer TTLs.
+
+HYCO search matches each row's own target details and lease holder, purpose, and labels, not the
+names of its sibling layers. For example, `/ui/hycos?q=wsl` finds WSL targets without also matching
+their Windows and devcontainer siblings. Search, status, and lease-state filters survive refresh and
+time-range changes.
+
 Job detail, output, and stream reads renew or revive a supplied lease only when it matches the job's
 recorded `lease_id`. Peeking at an unleased or differently leased job remains allowed and does not
 renew the supplied lease, even when both belong to the same target group.
@@ -379,7 +411,7 @@ complete OpenAPI 3.1 description with examples.
 | ----------------------------------- | ---------------------------------------------------------------------------- |
 | `GET /` and `GET /llms.txt`         | Quickstart (Markdown) with the machines online now; `/` serves browsers HTML |
 | `GET /ui`                           | Dashboard (HTML); see [Dashboard](#dashboard)                                |
-| `GET /v1/stats`                     | Usage metrics per HYCO from the hub's memory (`range` = `1h`, `24h`, `7d`)   |
+| `GET /v1/stats`                     | In-memory usage metrics with independent history range and resolution        |
 | `GET /v1/relays`                    | Export normalized Relay credentials per target (sensitive JSON; REST only)   |
 | `GET /v1/targets`                   | `list_targets` (`refresh`, `online_only`, `relay`, `probe`)                  |
 | `GET /v1/targets/{target}`          | `get_target`                                                                 |
@@ -424,9 +456,34 @@ don't ask for `text/html` still get the Markdown quickstart at `/`.
 Add `?range=1h`, `24h`, or `7d` to change the window. `GET /ui/jobs/{job_id}/log` returns one job's
 command and output as plain text. `GET /v1/stats` returns the same numbers as JSON.
 
-Everything is kept in the hub's memory and is lost on restart. Each job keeps its command and up to
-its output buffer limit (older output is trimmed). On startup the hub rebuilds job history (without
-output) from `audit.jsonl`. Memory grows with the number of jobs until the hub restarts.
+On **Overview**, select **History range** and **Resolution** independently, then choose **Apply**.
+Ranges include `1h`, `24h`, `7d`, `30d`, **All retained history**, and **Custom dates**. Custom
+inputs use your local time; the applied URL uses timezone-qualified timestamps. Reload,
+auto-refresh, and the **Stats JSON** link retain the applied selection. Unsubmitted changes pause
+auto-refresh.
+
+Resolution choices are `auto`, `1m`, `5m`, `15m`, `1h`, `6h`, and `1d`. Charts have at most 1,000
+columns: if necessary, Privy automatically increases the bucket width and explicitly labels the
+effective resolution. It does not delete or sample away the underlying measurements. Online status
+and running job counts remain live, independent of the historical interval.
+
+The same selection is available through `GET /v1/stats`:
+
+```text
+/v1/stats?range=all&resolution=1h
+/v1/stats?range=custom&start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z&resolution=5m
+```
+
+`start` is inclusive and `end` exclusive; both are required for `range=custom`. Invalid intervals or
+resolutions return HTTP 400. Responses expose `requested_resolution`, `bucket_s` (effective
+resolution), and `resolution_adjusted`. Omitting the new parameters preserves the existing 24-hour
+view and preset bucket widths.
+
+Jobs, request samples, and probe measurements are kept in RAM without age-based expiry during the
+process lifetime. Memory usage grows until the hub restarts. Request/probe history and buffered job
+output are lost on restart; no persistent telemetry store is introduced. Existing startup
+restoration of recent job summaries from `audit.jsonl` remains unchanged and is labeled separately.
+Job-output buffer limits and the separate purpose timeline's retention limits are unchanged.
 
 ### Export Relay credentials
 
