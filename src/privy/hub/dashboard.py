@@ -23,7 +23,15 @@ import yaml
 
 from privy.hub.dashboard_assets import CSS, JS
 from privy.hub.leases import LeaseError
-from privy.hub.metrics import BAD_STATES, DEFAULT_RANGE, RANGES, JobEntry
+from privy.hub.metrics import (
+    BAD_STATES,
+    DEFAULT_RANGE,
+    RANGES,
+    REPORT_RANGES,
+    RESOLUTIONS,
+    JobEntry,
+    ReportSelection,
+)
 from privy.hub.registry import ONLINE, UNKNOWN, ProbeResult
 from privy.hub.remote_exec import EXEC_CSS, EXEC_JS, TERMINAL_ICON, workspace
 from privy.hub.responses import HTML_TYPE, TEXT_TYPE, HttpResponse, error_response
@@ -206,7 +214,7 @@ def activity_chart(report: dict[str, Any]) -> str:
     bar = max(1.0, slot * 0.72)
     parts = [
         f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" '
-        f'aria-label="{esc(plural(sum(series["jobs"]), "job"))} in the last {esc(report["range"])}">'
+        f'aria-label="{esc(plural(sum(series["jobs"]), "job"))} over {esc(report["range_label"])}">'
     ]
     for fraction in (0, 0.5, 1):
         y = 8 + plot_h * (1 - fraction)
@@ -233,12 +241,13 @@ def activity_chart(report: dict[str, Any]) -> str:
                 f'<rect class="fail" x="{x:.1f}" y="{8 + plot_h - h:.1f}" width="{max(1.0, bar / 3):.1f}" '
                 f'height="{h:.1f}"/>'
             )
-    start, step = report["start_ts"], report["bucket_s"]
+    start = report["start_ts"]
     short = report["window_s"] <= 86400
-    for i, anchor in ((0, "start"), (count // 2, "middle"), (count, "end")):
-        label = time.strftime("%H:%M" if short else "%a %H:%M", time.localtime(start + i * step))
+    for fraction, anchor in ((0, "start"), (0.5, "middle"), (1, "end")):
+        moment = start + fraction * (report["end_ts"] - start)
+        label = time.strftime("%H:%M" if short else "%Y-%m-%d %H:%M", time.localtime(moment))
         parts.append(
-            f'<text class="axis" x="{left + i * slot:.1f}" y="{height - 6}" text-anchor="{anchor}">{label}</text>'
+            f'<text class="axis" x="{left + fraction * plot_w:.1f}" y="{height - 6}" text-anchor="{anchor}">{label}</text>'
         )
     parts.append("</svg>")
     return "".join(parts)
@@ -267,7 +276,9 @@ def gather_probes(service: Any) -> dict[str, ProbeResult | None]:
     return {target.id: registry.cached(target) for target in targets}
 
 
-def build_report(service: Any, range_name: str) -> dict[str, Any]:
+def build_report(
+    service: Any, range_name: str = DEFAULT_RANGE, *, selection: ReportSelection | None = None
+) -> dict[str, Any]:
     targets = list(service.registry.snapshot().targets)
     probes = gather_probes(service)
     counts = service.jobs.counts()
@@ -275,6 +286,7 @@ def build_report(service: Any, range_name: str) -> dict[str, Any]:
         targets,
         probes,
         range_name=range_name,
+        selection=selection,
         jobs_running=counts["running"],
         jobs_queued=counts["queued"],
         max_running=service.jobs.max_running,
@@ -331,7 +343,7 @@ def shell(
     if getattr(service, "leases", None) is not None:
         nav_counts["leases"] = len(service.leases.list_leases())
     nav = "".join(
-        f'<a href="{esc(link(path, range=rng if rng != DEFAULT_RANGE else None))}"'
+        f'<a href="{esc(link(path, range=rng if rng in ("1h", "7d") else None))}"'
         f"{ON if name == page else ''}>{nav_icon(name)}{esc(label)}"
         + (f"<span>{fmt_int(nav_counts[name])}</span>" if name in nav_counts else "")
         + "</a>"
@@ -341,15 +353,19 @@ def shell(
         f'<a href="{esc(path)}">{nav_icon(name)}{esc(label)}</a>'
         for name, path, label in (
             ("guide", "/llms.txt", "Markdown guide"),
-            ("stats", link("/v1/stats", range=rng), "Stats JSON"),
+            (
+                "stats",
+                link("/v1/stats", **params) if page == "overview" else link("/v1/stats", range=rng),
+                "Stats JSON",
+            ),
             ("openapi", "/openapi.json", "OpenAPI"),
             ("targets", "/v1/targets", "Targets JSON"),
         )
     )
     ranges = "".join(
-        f'<a href="{esc(link(PAGES[page][0], **{**params, "range": name}))}"'
+        f'<a href="{esc(link(PAGES[page][0], **{**{k: v for k, v in params.items() if k not in ("start", "end")}, "range": name}))}"'
         f"{ON if name == rng else ''}>{name}</a>"
-        for name in RANGES
+        for name in ("1h", "24h", "7d")
     )
     jobs = report["jobs"]
     online, total = report["targets_online"], report["targets_total"]
@@ -464,6 +480,39 @@ def hyco_cell(row: dict[str, Any]) -> str:
 # ---- overview -----------------------------------------------------------------------
 
 
+def overview_controls(report: dict[str, Any]) -> str:
+    ranges = "".join(
+        f'<option value="{name}"{" selected" if name == report["range"] else ""}>'
+        f"{esc({'all': 'All retained history', 'custom': 'Custom dates'}.get(name, name))}</option>"
+        for name in REPORT_RANGES
+    )
+    resolutions = "".join(
+        f'<option value="{name}"{" selected" if name == report["requested_resolution"] else ""}>'
+        f"{esc('Auto' if name == 'auto' else name)}</option>"
+        for name in RESOLUTIONS
+    )
+    custom = report["range"] == "custom"
+    return (
+        '<section class="metrics-controls"><form id="metrics-controls" class="toolbar">'
+        f'<label>History range<select id="metrics-range">{ranges}</select></label>'
+        f'<label>Resolution<select id="metrics-resolution">{resolutions}</select></label>'
+        f'<div id="metrics-custom" class="report-dates"{"" if custom else " hidden"}>'
+        f'<label>Start (local time)<input type="datetime-local" id="metrics-start" '
+        f'data-timestamp="{report["start_ts"]}"></label>'
+        f'<label>End (local time)<input type="datetime-local" id="metrics-end" '
+        f'data-timestamp="{report["end_ts"]}"></label></div>'
+        '<button type="submit" class="lease-button">Apply</button>'
+        '<span id="metrics-error" class="lease-action-error" role="alert"></span></form>'
+        f'<p id="metrics-effective" class="fine">{"Adjusted to " if report["resolution_adjusted"] else "Showing "}'
+        f"{esc(fmt_span(report['bucket_s']))} per column"
+        f"{' to keep the chart within 1,000 columns' if report['resolution_adjusted'] else ''}. "
+        f"{esc(report['start'])} to {esc(report['end'])} (UTC).</p>"
+        '<p class="fine">Telemetry is kept in RAM without age-based expiry; memory usage grows until restart. '
+        f"Request and probe history resets on restart; collecting since {esc(report['telemetry_started_at'])}. "
+        "Existing audit-restored job summaries are separate. Online status and running jobs are live.</p></section>"
+    )
+
+
 def overview_page(service: Any, report: dict[str, Any], now: float) -> str:
     jobs = report["jobs"]
     rows = report["targets"]
@@ -472,7 +521,7 @@ def overview_page(service: Any, report: dict[str, Any], now: float) -> str:
     since = report["history_since"]
     chips = (
         f'<span class="chip mono">privy {esc(str(service.version))}</span>'
-        f'<span class="chip">last {esc(report["range"])}</span>'
+        f'<span class="chip">{esc(report["range_label"])}</span>'
         f'<span class="chip">hub up {fmt_span(now - service.started_at)}</span>'
         f'<span class="chip">{plural(report["kept_jobs"], "job")} kept in memory</span>'
     )
@@ -604,6 +653,7 @@ def overview_page(service: Any, report: dict[str, Any], now: float) -> str:
     )
     return (
         hero("PRIVY HUB · CONTROL PLANE", "What's running through the relays", chips)
+        + overview_controls(report)
         + stats
         + warn
         + activity
@@ -778,7 +828,10 @@ def leases_page(service: Any, query: Mapping[str, list[str]], now: float) -> str
         for value in ("active", "expired", "released", "all")
     )
     toolbar = (
-        '<div class="toolbar"><input type="search" id="leaseq" aria-label="Search leases, clients and groups" '
+        '<div class="toolbar">'
+        f'<button type="button" class="lease-button primary" id="take-lease" '
+        f'data-default-ttl="{store.default_ttl:g}" data-max-ttl="{store.manual_max_ttl:g}">Take lease</button>'
+        '<input type="search" id="leaseq" aria-label="Search leases, clients and groups" '
         f'value="{esc(_last(query, "q"))}" placeholder="filter by client, group, session or purpose…" autocomplete="off">'
         f'<input type="search" id="leaselabel" aria-label="Filter lease labels" value="{esc(_last(query, "label"))}" '
         'placeholder="labels: repo=owner/repo task=leasing" autocomplete="off">'
@@ -796,6 +849,11 @@ def leases_page(service: Any, query: Mapping[str, list[str]], now: float) -> str
             f'<a class="lease-button" href="{esc(link("/ui/jobs", lease=lease_id))}">Jobs</a>'
         )
         if lease["state"] == "active":
+            if lease.get("manual"):
+                actions += (
+                    f'<button class="lease-button" type="button" data-owner-release="{esc(lease_id)}" '
+                    f'data-client="{esc(lease["client_id"])}" hidden>Release</button>'
+                )
             actions += f'<button class="lease-button danger" type="button" data-force-release="{esc(lease_id)}">Force release</button>'
         members = "".join(
             f'<span class="lease-tag" title="{esc(target)}">{esc(layer)}</span>'
@@ -945,6 +1003,7 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
         )
         up = row["status"] == ONLINE
         group = row.get("lease_group")
+        lease = (group or {}).get("lease") or {}
         lease_status = group["state"] if group else "unavailable"
         remote = (
             f'<a class="remote-link" href="{esc(link("/ui/exec", target=row["id"]))}" '
@@ -962,7 +1021,12 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
             row["os"],
             status_sub,
             (row.get("purpose") or {}).get("latest"),
-            json.dumps(group, ensure_ascii=False) if group else "",
+            (group or {}).get("group"),
+            lease_status,
+            lease.get("lease_id"),
+            (lease.get("holder") or {}).get("name"),
+            lease.get("purpose"),
+            json.dumps(lease.get("labels") or {}, ensure_ascii=False),
         )
         body.append(
             f'<tr data-href="{esc(link("/ui/logs", target=row["id"]))}" '
@@ -1317,13 +1381,18 @@ def jobs_page(service: Any, report: dict[str, Any], query: Mapping[str, list[str
 def render(service: Any, page: str, query: Mapping[str, list[str]], base_url: str) -> HttpResponse:
     """One dashboard page (``overview``, ``hycos``, ``logs``, or ``jobs``) as an HTML response."""
     rng = range_of(query)
-    report = build_report(service, rng)
+    try:
+        selection = ReportSelection.parse(query) if page == "overview" else ReportSelection(range_name=rng)
+    except ValueError as exc:
+        return error_response(400, "invalid_argument", str(exc))
+    report = build_report(service, selection=selection)
     enrich_lease_report(service, report)
     now = time.time()
     nonce = secrets.token_urlsafe(18)
     params: dict[str, str | None] = {}
     if page == "overview":
         title, main = "Overview", overview_page(service, report, now)
+        params = {key: _last(query, key) or None for key in ("range", "start", "end", "resolution")}
     elif page == "hycos":
         title, main = "Relay HYCOs", hycos_page(report, now)
         params = {

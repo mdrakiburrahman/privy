@@ -28,6 +28,7 @@ version: 1
 defaults:
   ttl: 30m
   max_ttl: 4h
+  manual_max_ttl: 365d
   cooldown: 15m
   max_leases_per_client: 4
   client_idle_expiry: 24h
@@ -189,6 +190,7 @@ class LeaseStore:
             raise ValueError("defaults must be a mapping")
         self.default_ttl = duration(defaults["ttl"])
         self.max_ttl = duration(defaults["max_ttl"])
+        self.manual_max_ttl = duration(defaults.get("manual_max_ttl", "365d"))
         self.cooldown = duration(defaults["cooldown"])
         self.client_idle_expiry = duration(defaults["client_idle_expiry"])
         self.client_limit = defaults["max_leases_per_client"]
@@ -196,6 +198,8 @@ class LeaseStore:
             raise ValueError("max_leases_per_client must be a positive integer")
         if self.default_ttl > self.max_ttl or self.max_ttl > 4 * 3600:
             raise ValueError("ttl must not exceed max_ttl and max_ttl must not exceed 4h")
+        if self.manual_max_ttl < self.default_ttl:
+            raise ValueError("manual_max_ttl must not be less than the default ttl")
         if not isinstance(config.get("groups"), list):
             raise ValueError("groups must be a list")
         names: set[str] = set()
@@ -249,7 +253,10 @@ class LeaseStore:
                 active_groups.add(lease["group"])
             if not all(timestamp(lease.get(k)) for k in ("acquired_ts", "renewed_ts", "expires_ts")):
                 raise ValueError("invalid lease timestamps")
-            if not timestamp(lease.get("ttl_s")) or not 0 < lease["ttl_s"] <= self.max_ttl:
+            if type(lease.get("manual", False)) is not bool:
+                raise ValueError("invalid manual lease marker")
+            maximum = self.manual_max_ttl if lease.get("manual") else self.max_ttl
+            if not timestamp(lease.get("ttl_s")) or not 0 < lease["ttl_s"] <= maximum:
                 raise ValueError("invalid lease ttl")
             if not isinstance(lease.get("members"), dict) or not isinstance(lease.get("events"), list):
                 raise ValueError("invalid lease members or events")
@@ -507,14 +514,15 @@ class LeaseStore:
                 "leasable_at": view["leasable_at"],
             }
 
-    def _ttl(self, ttl: str | None) -> tuple[str, float]:
+    def _ttl(self, ttl: str | None, *, manual: bool = False) -> tuple[str, float]:
         ttl = self.config["defaults"]["ttl"] if ttl is None else ttl
         try:
             seconds = duration(ttl)
         except ValueError as exc:
             raise LeaseError(str(exc)) from exc
-        if seconds > self.max_ttl:
-            raise LeaseError(f"ttl must not exceed {self.config['defaults']['max_ttl']}")
+        maximum = self.manual_max_ttl if manual else self.max_ttl
+        if seconds > maximum:
+            raise LeaseError(f"ttl must not exceed {maximum:g} seconds")
         return ttl, seconds
 
     def acquire(
@@ -524,8 +532,12 @@ class LeaseStore:
         labels: Any = None,
         purpose: str | None = None,
         ttl: str | None = None,
+        *,
+        manual: bool = False,
     ) -> dict[str, Any]:
-        ttl, seconds = self._ttl(ttl)
+        if type(manual) is not bool:
+            raise LeaseError("manual must be a boolean")
+        ttl, seconds = self._ttl(ttl, manual=manual)
         labels = _labels(labels)
         try:
             purpose = normalize_purpose(purpose)
@@ -586,6 +598,7 @@ class LeaseStore:
                         "state": "active",
                         "ttl": ttl,
                         "ttl_s": seconds,
+                        "manual": manual,
                         "acquired_ts": now,
                         "renewed_ts": now,
                         "expires_ts": now + seconds,
@@ -688,13 +701,15 @@ class LeaseStore:
         self._event(lease, "revived" if revived else "renewed")
         self._save()
 
-    def renew(self, lease_id: str, client_id: str, ttl: str | None = None) -> dict[str, Any]:
-        parsed = self._ttl(ttl) if ttl is not None else None
+    def renew(
+        self, lease_id: str, client_id: str, ttl: str | None = None, *, manual: bool = False
+    ) -> dict[str, Any]:
         with self._lock:
             self._sweep()
             lease = self._lease(lease_id)
             if lease["client_id"] != client_id:
                 raise LeaseError("only the holder may renew this lease", status=403, code="not_lease_holder")
+            parsed = self._ttl(ttl, manual=manual and lease.get("manual", False)) if ttl is not None else None
             if parsed:
                 lease["ttl"], lease["ttl_s"] = parsed
             self._renew(lease)

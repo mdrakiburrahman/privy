@@ -2,7 +2,8 @@
 
 The hub remembers every job it starts (and, after a restart, every job recorded
 in ``audit.jsonl`` during the last week), the probes it makes, and the HTTP calls
-it answers. Nothing here talks to Azure: the numbers are what this hub did.
+it answers. Samples have no age limit and are lost on restart. Nothing here
+talks to Azure: the numbers are what this hub did.
 
 Jobs are kept until the hub exits, including their output buffers, so the
 dashboard can show each target's command history like ``kubectl logs``.
@@ -13,10 +14,11 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import math
 import threading
 import time
 from collections import Counter, deque
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -44,10 +46,12 @@ RANGES: dict[str, tuple[int, int]] = {
     "1h": (60 * 60, 60),
     "24h": (24 * 60 * 60, 15 * 60),
     "7d": (7 * 24 * 60 * 60, 2 * 60 * 60),
+    "30d": (30 * 24 * 60 * 60, 6 * 60 * 60),
 }
 DEFAULT_RANGE = "24h"
-#: Probes and HTTP calls older than this are dropped; jobs are kept until exit.
-SAMPLE_RETENTION_S = RANGES["7d"][0]
+REPORT_RANGES = (*RANGES, "all", "custom")
+RESOLUTIONS = {"auto": 0, "1m": 60, "5m": 300, "15m": 900, "1h": 3600, "6h": 21600, "1d": 86400}
+MAX_BUCKETS = 1000
 #: Audit records older than this are not restored on start.
 BACKFILL_S = RANGES["7d"][0]
 #: Bound on audit bytes read on start (the newest part of the file is read).
@@ -55,6 +59,87 @@ BACKFILL_MAX_BYTES = 64 * 1024 * 1024
 BAD_STATES = frozenset({FAILED, TIMED_OUT, ERROR})
 TRANSFER_TYPES = ("upload", "download", "sync")
 SURFACES = ("rest", "mcp", "ui", "health")
+
+
+@dataclass(frozen=True)
+class ReportSelection:
+    range_name: str = DEFAULT_RANGE
+    resolution: str = "auto"
+    start: float | None = None
+    end: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.range_name not in REPORT_RANGES:
+            raise ValueError(f"range must be one of {', '.join(REPORT_RANGES)}")
+        if self.resolution not in RESOLUTIONS:
+            raise ValueError(f"resolution must be one of {', '.join(RESOLUTIONS)}")
+        if self.range_name == "custom":
+            if (
+                self.start is None
+                or self.end is None
+                or not math.isfinite(self.start)
+                or not math.isfinite(self.end)
+                or self.start >= self.end
+            ):
+                raise ValueError("custom range requires start before end")
+        elif self.start is not None or self.end is not None:
+            raise ValueError("start and end require range=custom")
+
+    @classmethod
+    def parse(cls, query: Mapping[str, list[str]]) -> ReportSelection:
+        def value(name: str, default: str) -> str:
+            values = query.get(name, [default])
+            if len(values) != 1:
+                raise ValueError(f"{name} must appear once")
+            return values[0]
+
+        def timestamp(name: str) -> float | None:
+            if name not in query:
+                return None
+            try:
+                moment = dt.datetime.fromisoformat(value(name, "").replace("Z", "+00:00"))
+                if moment.tzinfo is None:
+                    raise ValueError("timezone missing")
+                return moment.timestamp()
+            except (ValueError, OverflowError, OSError) as exc:
+                raise ValueError(f"{name} must be an ISO 8601 timestamp with a timezone") from exc
+
+        return cls(
+            value("range", DEFAULT_RANGE), value("resolution", "auto"), timestamp("start"), timestamp("end")
+        )
+
+    def window(self, now: float, earliest: float) -> tuple[float, float, int, bool]:
+        if self.range_name == "custom":
+            start, end = self.start, self.end
+            assert start is not None and end is not None
+            default_bucket = self._coarser((end - start) / 100)
+        elif self.range_name == "all":
+            start, end = min(earliest, now), now
+            default_bucket = self._coarser((end - start) / 100)
+        else:
+            span, default_bucket = RANGES[self.range_name]
+            start, end = now - span, now
+        requested = RESOLUTIONS[self.resolution] or default_bucket
+        bucket = max(requested, self._coarser((end - start) / MAX_BUCKETS))
+        if self.range_name in RANGES and self.resolution != "auto":
+            end = math.nextafter(now, math.inf)
+            start = end - RANGES[self.range_name][0]
+        elif self.range_name != "custom":
+            end = (math.floor(now / bucket) + 1) * bucket
+            if self.range_name in RANGES:
+                start = end - RANGES[self.range_name][0]
+            else:
+                start = math.floor(start / bucket) * bucket
+        if math.ceil((end - start) / bucket) > MAX_BUCKETS:
+            bucket = self._coarser((end - start) / MAX_BUCKETS)
+        return start, end, bucket, bucket > requested
+
+    @staticmethod
+    def _coarser(seconds: float) -> int:
+        for step in (60, 300, 900, 1800, 3600, 7200, 21600, 86400, 604800):
+            if step >= seconds:
+                return step
+        return math.ceil(seconds / 604800) * 604800
 
 
 def percentile(values: Sequence[float], fraction: float) -> float | None:
@@ -250,17 +335,10 @@ class HubMetrics:
                 self._status_since[target.id] = result.checked_at
             self._last_probe[target.id] = result
             samples.append(sample)
-            self._trim(samples, lambda item: item.at)
 
     def call(self, surface: str, status: int, seconds: float) -> None:
         with self._lock:
             self._calls.append(CallSample(self._clock(), surface, status, seconds))
-            self._trim(self._calls, lambda item: item.at)
-
-    def _trim(self, samples: deque[Any], at: Callable[[Any], float]) -> None:
-        cutoff = self._clock() - SAMPLE_RETENTION_S
-        while samples and at(samples[0]) < cutoff:
-            samples.popleft()
 
     def restore(self, path: Path) -> int:
         """Load the last week's jobs from the audit log (commands and outcomes, not output)."""
@@ -346,24 +424,27 @@ class HubMetrics:
         probes: dict[str, ProbeResult | None],
         *,
         range_name: str = DEFAULT_RANGE,
+        selection: ReportSelection | None = None,
         jobs_running: int = 0,
         jobs_queued: int = 0,
         max_running: int = 0,
     ) -> dict[str, Any]:
         """Every number on the dashboard, as JSON-ready data."""
-        window, bucket = RANGES[range_name]
+        selection = selection or ReportSelection(range_name=range_name)
+        range_name = selection.range_name
         now = self._clock()
-        count = window // bucket
-        # Buckets end at the next bucket boundary so a refresh does not shift them.
-        end = (int(now) // bucket + 1) * bucket
-        start = end - count * bucket
         with self._lock:
             entries = list(self._entries)
-            calls = [call for call in self._calls if call.at >= start]
-            samples = {key: [s for s in value if s.at >= start] for key, value in self._probes.items()}
+            earliest = min((entry.created_at for entry in entries), default=self.started_at)
+            earliest = min(earliest, self.started_at)
+            start, end, bucket, adjusted = selection.window(now, earliest)
+            calls = [call for call in self._calls if start <= call.at < end]
+            samples = {key: [s for s in value if start <= s.at < end] for key, value in self._probes.items()}
             status_since = dict(self._status_since)
+        window = end - start
+        count = max(1, math.ceil(window / bucket))
 
-        views = [entry.view() for entry in entries if entry.created_at >= start]
+        views = [entry.view() for entry in entries if start <= entry.created_at < end]
         configured = {target.id: target for target in targets}
         target_ids = list(configured) + sorted(
             {view["target"] for view in views} - set(configured), key=str.lower
@@ -458,7 +539,7 @@ class HubMetrics:
                 }
             )
         rows.sort(key=lambda row: (-row["jobs"], -(row["last_used_ts"] or 0), row["id"].lower()))
-        purposes = self.purposes.summaries(target_ids, start=start, end=now)
+        purposes = self.purposes.summaries(target_ids, start=start, end=max(start, min(end, now)))
         for row in rows:
             row["purpose"] = purposes[row["id"]]
         shared = Counter(row["hybrid_connection"].lower() for row in rows)
@@ -496,12 +577,21 @@ class HubMetrics:
         return {
             "generated_at": utc_iso(now),
             "range": range_name,
+            "range_label": "all retained history"
+            if range_name == "all"
+            else "custom interval"
+            if range_name == "custom"
+            else f"last {range_name}",
+            "requested_resolution": selection.resolution,
+            "resolution_adjusted": adjusted,
             "window_s": window,
             "bucket_s": bucket,
             "start": utc_iso(start),
+            "end": utc_iso(end),
             "start_ts": start,
             "end_ts": end,
             "hub_started_at": utc_iso(self.started_at),
+            "telemetry_started_at": utc_iso(self.started_at),
             "restored_jobs": self.restored_jobs,
             "history_since": utc_iso(entries[0].created_at) if entries else None,
             "kept_jobs": len(entries),

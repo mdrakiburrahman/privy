@@ -2,9 +2,33 @@ window.PrivyLeases = (() => {
   "use strict";
   let dialog = null;
   const $ = id => document.getElementById(id);
+  const operatorKey = "privy.manual-operator";
+
+  function operator() {
+    const saved = localStorage.getItem(operatorKey);
+    if (!saved) return null;
+    const value = JSON.parse(saved);
+    if (!value || typeof value.session_id !== "string") throw new Error("Invalid saved manual operator identity.");
+    return value;
+  }
+  function notice(message) {
+    let node = $("lease-action-error");
+    if (!node) {
+      node = element("p", "", "lease-action-error");
+      node.id = "lease-action-error"; node.setAttribute("role", "alert");
+      ($("s-leases") || document.body).append(node);
+    }
+    node.textContent = message;
+  }
 
   function filter() {
     if (!$("leaseq")) return;
+    try {
+      const owner = operator()?.client_id;
+      document.querySelectorAll("[data-owner-release]").forEach(button => {
+        button.hidden = button.dataset.client !== owner;
+      });
+    } catch (error) { notice(`Cannot read manual operator identity: ${error.message}`); }
     const terms = $("leaseq").value.toLowerCase().split(/\s+/).filter(Boolean);
     const tags = $("leaselabel").value.split(/\s+/).filter(Boolean);
     let shown = 0, total = 0;
@@ -59,14 +83,150 @@ window.PrivyLeases = (() => {
       return data;
     } finally { clearTimeout(timer); }
   }
+  async function mutate(path, method, body) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30000);
+    try {
+      const response = await fetch(path, {
+        method, headers: {"Content-Type": "application/json", "X-Privy-UI": "1"},
+        ...(body === undefined ? {} : {body: JSON.stringify(body)}),
+        cache: "no-store", signal: controller.signal
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error?.message || `Lease request failed (${response.status}).`);
+      return result;
+    } finally { clearTimeout(timer); }
+  }
+  async function takeLease(button) {
+    if (dialog) return;
+    const previous = document.activeElement;
+    const panel = element("dialog", "", "lease-dialog");
+    panel.id = "lease-create"; panel.setAttribute("aria-labelledby", "lease-create-title");
+    dialog = panel;
+    const heading = element("h2", "Take a lease"); heading.id = "lease-create-title";
+    const form = element("form", "", "lease-form");
+    function field(title, id, tag = "input") {
+      const label = element("label", title), input = element(tag, "");
+      input.id = id; label.append(input); form.append(label);
+      return input;
+    }
+    const group = field("Devbox / lease group", "lease-group", "select");
+    group.required = true;
+    const loading = element("option", "Loading groups..."); loading.value = ""; group.append(loading);
+    const members = element("p", ""); form.append(members);
+    const holder = field("Holder name", "lease-holder");
+    holder.required = true; holder.maxLength = 240; holder.value = "Manual reservation";
+    const purpose = field("Purpose", "lease-purpose");
+    purpose.required = true; purpose.maxLength = 240;
+    purpose.placeholder = "Reserved for my work";
+    const repo = field("Repository label (optional)", "lease-repo"); repo.maxLength = 1024;
+    const duration = element("div", "", "duration-picker");
+    const maximum = Number(button.dataset.maxTtl), initial = Math.max(1, Math.ceil(Number(button.dataset.defaultTtl) / 60));
+    const timeLabel = minutes => `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+    const inputs = {};
+    for (const [part, label] of [["hours", "Hours"], ["minutes", "Minutes"]]) {
+      const wrap = element("label", label), input = element("input", "");
+      input.type = "number"; input.id = `lease-${part}`; input.min = "0"; input.step = "1"; input.required = true;
+      input.max = part === "hours" ? String(Math.floor(maximum / 3600)) : "59";
+      input.value = String(part === "hours" ? Math.floor(initial / 60) : initial % 60);
+      inputs[part] = input;
+      wrap.append(input); duration.append(wrap);
+      for (const [sign, delta] of [["Decrease", -1], ["Increase", 1]]) {
+        const step = element("button", delta > 0 ? "+" : "-", "lease-button");
+        step.type = "button"; step.setAttribute("aria-label", `${sign} ${part}`);
+        step.onclick = () => {
+          const minutes = Number(inputs.hours.value) * 60 + Number(inputs.minutes.value) + delta * (part === "hours" ? 60 : 1);
+          if (!Number.isInteger(minutes) || minutes < 1 || minutes * 60 > maximum) return;
+          inputs.hours.value = String(Math.floor(minutes / 60)); inputs.minutes.value = String(minutes % 60);
+          updateDuration();
+        };
+        duration.append(step);
+      }
+    }
+    const display = element("output", ""); display.id = "lease-duration"; duration.append(display);
+    const expiry = element("p", "");
+    form.append(duration, expiry, element("p",
+      `Duration HH:MM, up to ${timeLabel(Math.floor(maximum / 60))}. Reserves the whole group. ` +
+      "Advisory: unleased commands can still run. Closing this page does not release or renew the lease."));
+    const error = element("p", "", "lease-action-error"); error.id = "lease-create-error"; error.setAttribute("role", "alert");
+    const actions = element("div", "", "lease-dialog-actions");
+    const cancel = element("button", "Cancel", "lease-button"); cancel.type = "button";
+    const submit = element("button", "Take lease", "lease-button primary"); submit.type = "submit"; submit.disabled = true;
+    actions.append(cancel, submit); form.append(error, actions); panel.append(heading, form);
+    let submitting = false;
+    const close = () => {
+      if (submitting) return;
+      panel.close(); panel.remove(); dialog = null;
+      if (previous?.isConnected) previous.focus();
+    };
+    cancel.onclick = close;
+    panel.addEventListener("cancel", event => { event.preventDefault(); close(); });
+    function updateDuration() {
+      const hours = inputs.hours.valueAsNumber, minutes = inputs.minutes.valueAsNumber;
+      const total = hours * 60 + minutes;
+      const valid = Number.isInteger(hours) && Number.isInteger(minutes) && hours >= 0 &&
+        minutes >= 0 && minutes < 60 && total >= 1 && total * 60 <= maximum;
+      inputs.minutes.setCustomValidity(valid ? "" : `Choose a duration between 00:01 and ${timeLabel(Math.floor(maximum / 60))}.`);
+      display.textContent = valid ? timeLabel(total) : "--:--";
+      expiry.textContent = valid ? `Expires around ${new Date(Date.now() + total * 60000).toLocaleString()} (local time).` : "Enter a valid duration.";
+      return valid ? total * 60 : null;
+    }
+    form.addEventListener("input", updateDuration);
+    form.onsubmit = async event => {
+      event.preventDefault();
+      const ttl = updateDuration();
+      if (submitting || !form.reportValidity() || ttl === null) return;
+      submitting = true; submit.disabled = true; cancel.disabled = true; error.textContent = "";
+      try {
+        let identity = operator() || {session_id: crypto.randomUUID()};
+        localStorage.setItem(operatorKey, JSON.stringify(identity));
+        const client = await mutate("/v1/clients", "POST", {
+          name: holder.value.trim(), kind: "human-ui", session_id: identity.session_id
+        });
+        identity = {...identity, client_id: client.client_id, name: client.name};
+        localStorage.setItem(operatorKey, JSON.stringify(identity));
+        const lease = await mutate("/v1/leases", "POST", {
+          client_id: client.client_id, target: group.value, purpose: purpose.value.trim(),
+          labels: repo.value.trim() ? {repo: repo.value.trim()} : {}, ttl
+        });
+        location.assign(`/ui/leases?state=active&peek=${encodeURIComponent(lease.lease_id)}#s-lease-peek`);
+      } catch (failure) {
+        error.textContent = failure.name === "AbortError"
+          ? "The request timed out. Check the lease list before retrying; the reservation may have succeeded."
+          : failure.message;
+      } finally { submitting = false; submit.disabled = false; cancel.disabled = false; }
+    };
+    document.body.append(panel); panel.showModal(); updateDuration();
+    try {
+      const identity = operator();
+      if (identity?.name) { holder.value = identity.name; holder.readOnly = true; }
+      const groups = await get("/v1/groups");
+      if (!panel.isConnected) return;
+      group.replaceChildren();
+      const placeholder = element("option", "Choose a devbox"); placeholder.value = ""; group.append(placeholder);
+      for (const item of groups) {
+        const option = element("option", `${item.group} (${item.state})`);
+        option.value = item.group; option.disabled = item.state !== "free";
+        group.append(option);
+      }
+      group.onchange = () => {
+        const selected = groups.find(item => item.group === group.value);
+        members.textContent = selected ? `Members: ${Object.values(selected.members).join(", ")}` : "";
+      };
+      submit.disabled = !groups.some(item => item.state === "free");
+      if (submit.disabled) error.textContent = "No group is available. Existing reservations are never overridden here.";
+      group.focus();
+    } catch (failure) { error.textContent = failure.message; }
+  }
   function confirmLease(lease, target, action, force = false) {
     if (dialog) return Promise.resolve(false);
     const previous = document.activeElement;
     const panel = element("dialog", "", "lease-dialog");
     dialog = panel;
     panel.setAttribute("aria-labelledby", "lease-dialog-title");
-    panel.append(element("div", force ? "DASHBOARD ONLY" : "HEADS UP", "eyebrow"));
-    const heading = element("h2", force ? `Force release ${lease.lease_id}?` : `${target} is leased by another session`);
+    const own = action === "Release";
+    panel.append(element("div", force ? "DASHBOARD ONLY" : own ? "YOUR RESERVATION" : "HEADS UP", "eyebrow"));
+    const heading = element("h2", force ? `Force release ${lease.lease_id}?` : own ? `Release ${target}?` : `${target} is leased by another session`);
     heading.id = "lease-dialog-title";
     panel.append(heading);
     const holder = typeof lease.holder === "object" && lease.holder ? lease.holder : {name: lease.holder};
@@ -79,7 +239,7 @@ window.PrivyLeases = (() => {
     const labels = element("p", "");
     for (const [key, value] of Object.entries(lease.labels || {})) labels.append(element("span", `${key}=${value}`, "lease-tag"));
     panel.append(labels, element("p", `Purpose: ${lease.purpose || "not provided"}`));
-    panel.append(element("p", force
+    panel.append(element("p", force || own
       ? "This releases the whole group and skips cooldown. Running jobs keep running; their output remains available."
       : "Your command will still run, but it may disturb their work. It does not renew or take over their lease. It does count as recent use for this group's cooldown.",
     "lease-warning"));
@@ -94,7 +254,7 @@ window.PrivyLeases = (() => {
       actions.append(peek, logs);
     }
     const cancel = element("button", "Cancel", "lease-button");
-    const proceed = element("button", force ? "Force release" : `${action} anyway`, `lease-button ${force ? "danger" : "primary"}`);
+    const proceed = element("button", force ? "Force release" : own ? "Release" : `${action} anyway`, `lease-button ${force ? "danger" : "primary"}`);
     cancel.type = proceed.type = "button";
     actions.append(cancel, proceed);
     panel.append(actions);
@@ -138,28 +298,23 @@ window.PrivyLeases = (() => {
     if (event.target.matches("#leaseq, #leaselabel")) filter();
   });
   document.addEventListener("click", async event => {
-    const button = event.target.closest("[data-force-release]");
+    const take = event.target.closest("#take-lease");
+    if (take) { await takeLease(take); return; }
+    const button = event.target.closest("[data-force-release], [data-owner-release]");
     if (!button || button.disabled) return;
     button.disabled = true;
-    const id = button.dataset.forceRelease;
+    const force = Boolean(button.dataset.forceRelease);
+    const id = button.dataset.forceRelease || button.dataset.ownerRelease;
     try {
       const lease = await get(`/v1/leases/${encodeURIComponent(id)}`);
-      if (!await confirmLease(lease, lease.group, "Force release", true)) return;
-      const response = await fetch(`/v1/leases/${encodeURIComponent(id)}/force-release`, {
-        method: "POST", headers: {"Content-Type": "application/json", "X-Privy-UI": "1"},
-        body: "{}", cache: "no-store"
-      });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error?.message || `Force release failed (${response.status}).`);
+      const owner = force ? null : operator()?.client_id;
+      if (!force && owner !== lease.client_id) throw new Error("This browser does not own the reservation. Use the separately confirmed Force release action if needed.");
+      if (!await confirmLease(lease, lease.group, force ? "Force release" : "Release", force)) return;
+      await mutate(force ? `/v1/leases/${encodeURIComponent(id)}/force-release`
+        : `/v1/leases/${encodeURIComponent(id)}?client_id=${encodeURIComponent(owner)}`, force ? "POST" : "DELETE", force ? {} : undefined);
       location.reload();
     } catch (error) {
-      let notice = $("lease-action-error");
-      if (!notice) {
-        notice = element("p", "", "lease-action-error");
-        notice.id = "lease-action-error"; notice.setAttribute("role", "alert");
-        $("s-leases").append(notice);
-      }
-      notice.textContent = error.message;
+      notice(error.message);
     } finally { button.disabled = false; }
   });
   filter();

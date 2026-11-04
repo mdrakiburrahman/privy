@@ -50,6 +50,54 @@ def acquire(store, client_id, target="raki-windows-big", **kwargs):
     return store.acquire(client_id, target=target, **kwargs)
 
 
+def test_manual_duration_survives_restart_and_excludes_other_clients(leasing, tmp_path):
+    hub, store, now = leasing
+    owner, other = client(store), client(store, "other")
+    lease = acquire(store, owner, ttl="36h", manual=True)
+    restored = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
+    assert restored.get_lease(lease["lease_id"])["manual"] is True
+    assert restored.get_lease(lease["lease_id"])["expires_at"] == lease["expires_at"]
+    with pytest.raises(LeaseError) as error:
+        acquire(restored, other)
+    assert error.value.code == "group_leased"
+    before = restored.get_lease(lease["lease_id"])["expires_at"]
+    now[0] += 60
+    restored.groups()
+    assert restored.get_lease(lease["lease_id"])["expires_at"] == before
+    restored.release(lease["lease_id"], owner)
+    assert acquire(restored, other)["created"]
+
+
+def test_manual_and_agent_duration_limits_are_separate(leasing):
+    _, store, now = leasing
+    owner = client(store)
+    with pytest.raises(LeaseError, match="ttl"):
+        acquire(store, owner, ttl="5h")
+    for ttl in ("0m", "-1h", "366d"):
+        with pytest.raises(LeaseError):
+            acquire(store, owner, ttl=ttl, manual=True)
+    lease = acquire(store, owner, ttl="365d", manual=True)
+    with pytest.raises(LeaseError):
+        store.renew(lease["lease_id"], owner, ttl="5h")
+    assert store.renew(lease["lease_id"], owner, ttl="8h", manual=True)["ttl_s"] == 28800
+    now[0] += 28801
+    assert store.get_lease(lease["lease_id"])["state"] == "expired"
+
+
+def test_legacy_config_and_state_remain_readable(leasing, tmp_path):
+    hub, store, now = leasing
+    lease = acquire(store, client(store))
+    state = json.loads(store.state_path.read_text())
+    state["leases"][lease["lease_id"]].pop("manual", None)
+    store.state_path.write_text(json.dumps(state), encoding="utf-8")
+    restored = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
+    assert restored.get_lease(lease["lease_id"])["ttl_s"] == 1800
+    state["leases"][lease["lease_id"]]["manual"] = "yes"
+    store.state_path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(ValueError, match="manual"):
+        LeaseStore(hub.registry, home=tmp_path)
+
+
 def test_defaults_persistence_and_client_session_idempotency(leasing, tmp_path):
     hub, store, now = leasing
     first = store.register_client(

@@ -1,9 +1,25 @@
 from __future__ import annotations
 
-from hub_fakes import FakeListener, Hub
+from hub_fakes import HOST, FakeListener, Hub
 
 from privy.hub.rest import REST_OPERATIONS, ROUTES, RestApi, write_job_stream
 from privy.hub.service import OPERATIONS
+
+
+def test_long_dashboard_reservation_requires_same_origin_and_preserves_agent_limit(tmp_path):
+    hub = Hub(tmp_path)
+    owner = hub.call("POST", "/v1/clients", {"name": "Manual", "kind": "human"}).payload["client_id"]
+    body = {"client_id": owner, "target": "dev/box1_windows", "ttl": "8h"}
+    assert hub.call("POST", "/v1/leases", body).status == 400
+    assert hub.call("POST", "/v1/leases", body, headers={"X-Privy-UI": "1"}).status == 403
+    headers = {"X-Privy-UI": "1", "Origin": f"http://{HOST}"}
+    response = hub.call("POST", "/v1/leases", body, headers=headers)
+    assert response.status == 201 and response.payload["manual"]
+    assert response.payload["ttl_s"] == 8 * 3600
+    other = hub.call("POST", "/v1/clients", {"name": "Agent"}).payload["client_id"]
+    conflict = hub.call("POST", "/v1/leases", {**body, "client_id": other, "ttl": "1h"})
+    assert conflict.status == 409 and conflict.payload["error"]["code"] == "group_leased"
+    assert hub.call("DELETE", f"/v1/leases/{response.payload['lease_id']}?client_id={owner}").status == 200
 
 
 def test_lease_routes_and_schemas_are_exposed(tmp_path):
