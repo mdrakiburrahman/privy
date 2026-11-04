@@ -9,7 +9,9 @@ from hub_fakes import FakeListener, Hub, blocking_run, exec_result
 from privy.client import RelayHTTPError
 from privy.hub import dashboard
 from privy.hub.dashboard import fmt_bytes, fmt_ms, sparkline
+from privy.hub.jobs import utc_iso
 from privy.hub.metrics import HubMetrics, public_report
+from privy.hub.registry import ProbeResult
 from privy.transfer import TransferResult
 
 NO_LISTENER = '{"error":{"code":"EndpointNotFound","message":"There are no listeners connected"}}'
@@ -203,6 +205,30 @@ def test_stats_report_counts_per_hyco(hub):
     json.dumps(stats)
 
 
+def test_stats_report_status_since_and_last_online_from_probes(hub):
+    target = next(t for t in hub.registry.snapshot().targets if t.id == BOX1)
+    metrics = HubMetrics()
+    start = time.time() - 600
+
+    def row(probe):
+        return public_report(metrics.report([target], {BOX1: probe}, range_name="1h"))["targets"][0]
+
+    metrics.probe(target, ProbeResult("online", start, latency_ms=5))
+    metrics.probe(target, ProbeResult("online", start + 30, latency_ms=5))
+    online = row(ProbeResult("online", start + 30, latency_ms=5))
+    assert online["status_since"] == utc_iso(start) and online["status_since_first_check"] is True
+    assert online["last_online"] == utc_iso(start + 30)
+
+    offline = ProbeResult("offline", start + 60, error="no listener")
+    # A failed job, not a probe, marked it offline: when that happened is unknown.
+    assert row(offline)["status_since"] is None and row(offline)["status_since_first_check"] is None
+    metrics.probe(target, offline)
+    later = row(offline)
+    assert later["status_since"] == utc_iso(start + 60) and later["status_since_first_check"] is False
+    assert later["last_online"] == utc_iso(start + 30)
+    assert not any(key.endswith("_ts") for key in later)
+
+
 def test_stats_rejects_unknown_ranges(hub):
     assert hub.call("GET", "/v1/stats?range=2y").status == 400
     assert hub.call("GET", "/v1/stats?target=x").status == 400
@@ -319,6 +345,23 @@ def test_hycos_page_has_a_search_box_with_per_row_search_keys(hub):
     assert "up" in keys["dev%2Fbox1_windows"].split()
     assert "gpu1_linux" in keys["contoso-lab%2Fgpu1_linux"]
     assert re.search(r'target=dev%2Fbox2_windows" data-q="[^"]*" data-up="0"', text)
+
+
+def test_hycos_page_leads_with_colored_status_last_used_and_last_seen_online(hub):
+    text = html_of(hub.call("GET", "/ui/hycos", headers=BROWSER))
+    table = text.split('<table id="hycos">', 1)[1]
+    head = re.findall(r"<th[^>]*>([^<]+)", table.split("</thead>", 1)[0])
+    assert head[:6] == ["#", "Relay HYCO", "Status", "Last used", "Last seen online", "Lease"]
+
+    def row(target):
+        return re.search(rf'<tr data-href="/ui/logs\?target={target}".*?</tr>', table, re.S).group(0)
+
+    box1, box2 = row("dev%2Fbox1_windows"), row("dev%2Fbox2_windows")
+    assert '<span class="hyco-status online">online</span>' in box1 and "for at least" in box1
+    assert "operator@BOX1 · Windows-11 · privy 0.2.0" in box1 and ">now</td>" in box1
+    assert '<span class="hyco-status offline">offline</span>' in box2
+    assert "no listener is connected" in box2 and "not since hub start" in box2
+    assert 'class="dot' not in table
 
 
 @pytest.mark.parametrize("path", ["/ui", "/ui/hycos", "/ui/leases", "/ui/exec", "/ui/logs", "/ui/jobs"])

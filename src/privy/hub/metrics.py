@@ -301,6 +301,8 @@ class HubMetrics:
         self._probes: dict[str, deque[ProbeSample]] = {}
         self._last_probe: dict[str, ProbeResult] = {}
         self._status_since: dict[str, float] = {}
+        self._status_since_first_check: dict[str, bool] = {}
+        self._last_online: dict[str, float] = {}
         self._calls: deque[CallSample] = deque()
         self.restored_jobs = 0
         self.restored_since: float | None = None
@@ -333,6 +335,9 @@ class HubMetrics:
             previous = self._last_probe.get(target.id)
             if previous is None or previous.status != result.status:
                 self._status_since[target.id] = result.checked_at
+                self._status_since_first_check[target.id] = previous is None
+            if result.status == ONLINE:
+                self._last_online[target.id] = max(self._last_online.get(target.id, 0.0), result.checked_at)
             self._last_probe[target.id] = result
             samples.append(sample)
 
@@ -441,6 +446,9 @@ class HubMetrics:
             calls = [call for call in self._calls if start <= call.at < end]
             samples = {key: [s for s in value if start <= s.at < end] for key, value in self._probes.items()}
             status_since = dict(self._status_since)
+            status_since_first_check = dict(self._status_since_first_check)
+            probed_status = {key: result.status for key, result in self._last_probe.items()}
+            last_online = dict(self._last_online)
         window = end - start
         count = max(1, math.ceil(window / bucket))
 
@@ -496,6 +504,10 @@ class HubMetrics:
             info = (probe.info or {}) if probe is not None else {}
             platform = info.get("platform") or {}
             last_used = all_last_used.get(target_id)
+            status = probe.status if probe is not None else UNKNOWN
+            # A failed job can change the shown status without a probe; then its start is unknown.
+            since = status_since.get(target_id) if probed_status.get(target_id) == status else None
+            seen_online = last_online.get(target_id)
             top_origin = origins.most_common(1)[0] if origins else None
             rows.append(
                 {
@@ -507,8 +519,12 @@ class HubMetrics:
                     "description": target.description if target else None,
                     "configured": target is not None,
                     "auth": ("token" if target.token is not None else "key") if target else None,
-                    "status": probe.status if probe is not None else UNKNOWN,
-                    "status_since": utc_iso(status_since.get(target_id)),
+                    "status": status,
+                    "status_since": utc_iso(since),
+                    "status_since_ts": since,
+                    "status_since_first_check": status_since_first_check.get(target_id, False)
+                    if since is not None
+                    else None,
                     "reason": probe.error if probe is not None else None,
                     "latency_ms": probe.latency_ms if probe is not None else None,
                     "latency_p50_ms": percentile(latencies, 0.5),
@@ -533,6 +549,8 @@ class HubMetrics:
                     else None,
                     "last_used": utc_iso(last_used),
                     "last_used_ts": last_used,
+                    "last_online": utc_iso(seen_online),
+                    "last_online_ts": seen_online,
                     "kept_jobs": sum(1 for entry in entries if entry.target_id == target_id),
                     "series": data["series"],
                     "failed_series": data["failed_series"],
