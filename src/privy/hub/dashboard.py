@@ -125,6 +125,14 @@ def local_time(at: float | None, *, short: bool = False) -> str:
     return time.strftime("%H:%M:%S" if short else "%Y-%m-%d %H:%M:%S", time.localtime(at))
 
 
+def utc_time(at: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(at))
+
+
+def title_attr(text: str | None) -> str:
+    return f' title="{esc(text)}"' if text else ""
+
+
 def fmt_pct(value: float | None) -> str:
     return "—" if value is None else f"{value:g}%"
 
@@ -470,11 +478,49 @@ def job_anchor(entry_or_view: JobEntry | dict[str, Any]) -> str:
     return f"/ui/logs?target={quote(target, safe='')}#j-{quote(job_id, safe='')}"
 
 
+def host_line(row: dict[str, Any]) -> str:
+    who = "@".join(part for part in (row["user"], row["host"]) if part)
+    version = row["listener_version"] and f"privy {row['listener_version']}"
+    return " · ".join(part for part in (who, row["os"], version) if part)
+
+
 def hyco_cell(row: dict[str, Any]) -> str:
+    host = host_line(row)
     return (
-        f'{status_dot(row["status"])}<b class="nw">{esc(row["label"])}</b>'
-        f'<span class="sub">relay {esc(row["relay"])}{"" if row["configured"] else " · no longer configured"}</span>'
+        f'<b class="nw">{esc(row["label"])}</b>'
+        + (f'<span class="sub clip" title="{esc(host)}">{esc(host)}</span>' if host else "")
+        + f'<span class="sub">relay {esc(row["relay"])}{"" if row["configured"] else " · no longer configured"}</span>'
     )
+
+
+def hyco_status_cell(row: dict[str, Any], now: float) -> str:
+    status, since = row["status"], row["status_since_ts"]
+    parts = []
+    if since is not None:
+        at_least = "at least " if row["status_since_first_check"] else ""
+        parts.append(f"for {at_least}{fmt_span(max(0.0, now - since))}")
+    if row["reason"]:
+        parts.append(row["reason"])
+    detail = " · ".join(parts)
+    title = " · ".join(parts + ([f"since {utc_time(since)}"] if since is not None else []))
+    return (
+        f'<td data-v="{esc(status)}"{title_attr(title)}>'
+        f'<span class="hyco-status {esc(status)}">{esc(status.replace("_", " "))}</span>'
+        + (f'<span class="sub clip">{esc(detail)}</span>' if detail else "")
+        + "</td>"
+    )
+
+
+def last_online_cell(row: dict[str, Any], now: float) -> str:
+    seen = row["last_online_ts"]
+    title = title_attr(f"last confirmed online {utc_time(seen)}" if seen is not None else None)
+    if row["status"] == ONLINE:
+        return f'<td class="nw" data-v="{now}"{title}>now</td>'
+    if seen is not None:
+        return f'<td class="nw" data-v="{seen}"{title}>{esc(fmt_ago(seen, now))}</td>'
+    if row["status"] == UNKNOWN:
+        return '<td data-v="0">—</td>'
+    return '<td class="nw faint" data-v="0">not since hub start</td>'
 
 
 # ---- overview -----------------------------------------------------------------------
@@ -720,7 +766,7 @@ def lease_time(value: Any) -> float | None:
 
 def lease_at(value: Any) -> str:
     at = lease_time(value)
-    return esc(time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(at))) if at is not None else "—"
+    return esc(utc_time(at)) if at is not None else "—"
 
 
 def lease_labels(labels: Mapping[str, Any]) -> str:
@@ -977,6 +1023,8 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
         '<tr><th class="r">#</th>'
         + sort_th("Relay HYCO")
         + sort_th("Status")
+        + sort_th("Last used")
+        + sort_th("Last seen online")
         + sort_th("Lease")
         + sort_th("Last reported purpose")
         + sort_th(f"Jobs over {report['range']}", sort=False)
@@ -988,19 +1036,13 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
         + sort_th("Latency", right=True)
         + sort_th("Uptime", right=True)
         + sort_th("Top origin")
-        + sort_th("Last used", right=True)
         + "</tr>"
     )
     body = []
     for i, row in enumerate(rows, 1):
         origin = row["top_origin"]
         origin_text = f"{origin['origin']} ({origin['share_pct']}%)" if origin else "—"
-        os_line = " · ".join(
-            part for part in (row["user"] and f"{row['user']}@{row['host']}", row["os"]) if part
-        )
-        status_sub = (
-            row["reason"] or os_line or (row["listener_version"] and f"privy {row['listener_version']}")
-        )
+        last_used = row["last_used_ts"]
         up = row["status"] == ONLINE
         group = row.get("lease_group")
         lease = (group or {}).get("lease") or {}
@@ -1019,7 +1061,8 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
             row["host"],
             row["user"],
             row["os"],
-            status_sub,
+            host_line(row),
+            row["reason"],
             (row.get("purpose") or {}).get("latest"),
             (group or {}).get("group"),
             lease_status,
@@ -1034,8 +1077,10 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
             f'data-up="{1 if up else 0}" data-lease-state="{esc(lease_status)}">'
             f'<td class="idx">{i:02d}</td>'
             f'<td data-v="{esc(row["label"].lower())}">{hyco_cell(row)}{remote}</td>'
-            f'<td data-v="{esc(row["status"])}">{state_label(row["status"])}'
-            f'<span class="sub">{esc(status_sub or "")}</span></td>'
+            f"{hyco_status_cell(row, now)}"
+            f'<td class="nw" data-v="{last_used or 0}"{title_attr(utc_time(last_used) if last_used else None)}>'
+            f"{esc(fmt_ago(last_used, now))}</td>"
+            f"{last_online_cell(row, now)}"
             f'<td class="lease-cell" data-v="{esc(lease_status)}">{lease_cell(group, now) if group else "—"}</td>'
             f'<td class="purpose-cell" data-v="{esc(((row.get("purpose") or {}).get("latest") or "").lower())}">'
             f"{purpose_cell(row)}</td>"
@@ -1051,8 +1096,7 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
             f"{esc(fmt_ms(row['latency_ms']))}</td>"
             f'<td class="r" data-v="{row["uptime_pct"] if row["uptime_pct"] is not None else -1}">'
             f"{esc(fmt_pct(row['uptime_pct']))}</td>"
-            f"<td>{esc(origin_text)}</td>"
-            f'<td class="r" data-v="{row["last_used_ts"] or 0}">{esc(fmt_ago(row["last_used_ts"], now))}</td></tr>'
+            f"<td>{esc(origin_text)}</td></tr>"
         )
     toolbar = (
         '<div class="toolbar"><input type="search" id="hycoq" placeholder="search HYCOs, e.g. _windows or '
@@ -1081,7 +1125,9 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
     note = (
         '<p class="fine">Most used first; click a header to re-sort and a row for its logs. Sparklines show jobs '
         f"started per {esc(fmt_span(report['bucket_s']))} (red ticks: failures). Latency and uptime come from the hub's "
-        "own listener probes, not from Azure.</p>"
+        "own listener probes, not from Azure. Status times and Last seen online come from the same probes, which run "
+        'when a page or tool asks about a HYCO, so they are approximate; "for at least" means the status has not '
+        "changed since the hub first checked. They are kept in memory and reset when the hub restarts.</p>"
         '<p class="fine purpose-legend">Purpose: colors show reported work; striped gaps mean unknown; '
         "crosshatching means multiple changes in a small interval. Hover or focus for details; click to pin history. "
         "This is not execution duration or exclusive ownership. In memory only; resets on hub restart.</p>"

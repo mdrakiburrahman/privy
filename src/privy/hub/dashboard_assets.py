@@ -80,6 +80,13 @@ text-overflow:ellipsis;white-space:nowrap}
 td .sub{display:block;color:var(--faint);font-size:10px}td.hot{color:var(--orange)}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;background:var(--accent)}
 .dot.off{background:var(--faint)}.dot.bad{background:var(--red)}
+.hyco-status{display:inline-block;font-size:10px;font-weight:600;padding:1px 7px;border-radius:4px;white-space:nowrap;
+background:var(--line);color:var(--muted)}
+.hyco-status.online{background:var(--accent-soft);color:var(--accent)}
+.hyco-status.unreachable{background:var(--orange-soft);color:var(--orange)}
+.hyco-status.offline,.hyco-status.not_found,.hyco-status.unauthorized,.hyco-status.error{background:var(--red-soft);
+color:var(--red)}
+td .sub.clip{max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}td.faint{color:var(--faint)}
 svg.spark{display:block}svg.spark .l{fill:none;stroke:var(--accent);stroke-width:1.5}
 svg.spark .a{fill:var(--accent);opacity:.12}svg.spark .e{fill:var(--red)}svg.spark .z{stroke:var(--line);stroke-width:1}
 svg.bar{display:block;margin-top:5px}svg.bar .t{fill:var(--bg)}svg.bar .f{fill:var(--accent)}svg.bar .f.hot{fill:var(--orange)}

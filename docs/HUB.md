@@ -449,12 +449,22 @@ don't ask for `text/html` still get the Markdown quickstart at `/`.
 | Page        | Shows                                                                                        |
 | ----------- | -------------------------------------------------------------------------------------------- |
 | `/ui`       | Key numbers (jobs, success rate, latency, bytes moved), activity over time, busiest HYCOs    |
-| `/ui/hycos` | Every relay HYCO with job counts, a sparkline over the chosen range, status, and last use    |
+| `/ui/hycos` | Every relay HYCO with status, last use, last seen online, job counts, and a sparkline        |
 | `/ui/jobs`  | Recent jobs, filterable by `state`                                                           |
 | `/ui/logs`  | Per-HYCO commands and output as collapsible terminals, like `kubectl logs`; live jobs follow |
 
 Add `?range=1h`, `24h`, or `7d` to change the window. `GET /ui/jobs/{job_id}/log` returns one job's
 command and output as plain text. `GET /v1/stats` returns the same numbers as JSON.
+
+On **Relay HYCOs**, the **Status** column is color-coded: green for `online`, orange for
+`unreachable`, red for `offline`, `not_found`, `unauthorized`, and `error`, and gray for `unknown`.
+The line under it says how long the HYCO has had that status, such as "for 2h 15m", plus the reason
+when it is not online. "For at least" means the status has not changed since the hub first checked
+that HYCO. **Last seen online** shows "now" for online HYCOs, the last time the hub saw the others
+online, or "not since hub start". Both come from the hub's own listener probes, which run when a
+page or tool asks about a HYCO, so they are approximate. They are kept in memory and reset when the
+hub restarts. `GET /v1/stats` reports them per HYCO as `status_since`, `status_since_first_check`,
+and `last_online`; each is `null` when unknown.
 
 On **Overview**, select **History range** and **Resolution** independently, then choose **Apply**.
 Ranges include `1h`, `24h`, `7d`, `30d`, **All retained history**, and **Custom dates**. Custom
