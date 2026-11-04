@@ -24,7 +24,7 @@ import yaml
 
 from privy.hub.dashboard_assets import CSS, JS
 from privy.hub.leases import LeaseError
-from privy.hub.listener_facts import FACETS, NO_SHELL, UNKNOWN_VALUE, facet_values
+from privy.hub.listener_facts import FACETS, NO_SHELL, UNKNOWN_VALUE, facet_aliases, facet_values
 from privy.hub.metrics import (
     BAD_STATES,
     DEFAULT_RANGE,
@@ -1130,6 +1130,7 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
         lease = (group or {}).get("lease") or {}
         lease_status = group["state"] if group else "unavailable"
         facets = facet_values(row)
+        aliases = facet_aliases(row)
         remote = (
             f'<a class="remote-link" href="{esc(link("/ui/exec", target=row["id"]))}" '
             f'aria-label="Remote execute on {esc(row["label"])}">{TERMINAL_ICON}Remote</a>'
@@ -1159,7 +1160,13 @@ def hycos_page(report: dict[str, Any], now: float) -> str:
             f'<tr data-href="{esc(link("/ui/logs", target=row["id"]))}" '
             f'data-q="{esc(" ".join(str(term) for term in terms if term).lower())}" '
             f'data-up="{1 if up else 0}" data-lease-state="{esc(lease_status)}" '
-            f'data-facets="{esc(json.dumps(facets, ensure_ascii=False, separators=(",", ":")))}">'
+            f'data-facets="{esc(json.dumps(facets, ensure_ascii=False, separators=(",", ":")))}"'
+            + (
+                f' data-facet-aliases="{esc(json.dumps(aliases, ensure_ascii=False, separators=(",", ":")))}"'
+                if aliases
+                else ""
+            )
+            + ">"
             f'<td class="idx">{i:02d}</td>'
             f'<td data-v="{esc(row["label"].lower())}">{hyco_cell(row)}{remote}</td>'
             f"{hyco_status_cell(row, now)}"

@@ -397,7 +397,8 @@ OPERATIONS: tuple[Operation, ...] = (
                     name,
                     "array",
                     f"Only machines whose {label} matches one of these values (case-insensitive, * globs; "
-                    "'Unknown' matches machines that never reported it). Repeat for alternatives.",
+                    "'Unknown' matches machines that never reported it). Repeat or comma-separate "
+                    "alternatives.",
                 )
                 for name, label in FACETS
             ),

@@ -66,6 +66,7 @@ def test_describe_normalizes_os_arch_versions_shells_and_environment():
 def test_filters_are_case_insensitive_globs_or_within_and_across_facets():
     windows = describe(WINDOWS, "box1_windows")
     assert matches(windows, {"os": ["WINDOWS"], "privy_version": ["0.5.*", "0.6.*"]})
+    assert matches(windows, {"os": ["linux, windows"]})
     assert matches(windows, {"os_version": ["26200"]}) and matches(windows, {"os_version": ["11"]})
     assert matches(windows, {"shell": ["bash", "cmd"]})
     assert not matches(windows, {"os": ["windows"], "environment": ["wsl"]})
@@ -118,7 +119,7 @@ def test_list_targets_filters_by_facets_and_shows_last_known_details_offline(tmp
 
     assert ids("os=windows") == ["contoso-lab/box1_windows", BOX1]
     assert ids("os_version=26200&privy_version=0.6.*") == [BOX1]
-    assert ids("shell=cmd&shell=bash") == ["contoso-lab/gpu1_linux", BOX1]
+    assert ids("shell=cmd&shell=bash") == ids("shell=cmd,bash") == ["contoso-lab/gpu1_linux", BOX1]
     assert ids("os=unknown") == ["dev/box2_windows"]
     called = hub.service.invoke("list_targets", {"os": "Linux"}, origin="test")
     assert [target["id"] for target in called["targets"]] == ["contoso-lab/gpu1_linux"]

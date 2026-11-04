@@ -17,6 +17,8 @@ window.PrivyHycoFacets = (() => {
   const button = (text, cls) => { const node = make("button", text, cls); node.type = "button"; return node; };
   const facets = () => $$(".facet-pill[data-facet]").map(pill => ({ name: pill.dataset.facet, label: pill.dataset.label }));
   const rowValues = row => { try { return JSON.parse(row.dataset.facets || "{}"); } catch { return {}; } };
+  const rowAliases = row => { try { return JSON.parse(row.dataset.facetAliases || "{}"); } catch { return {}; } };
+  const glob = value => new RegExp("^" + value.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$", "i");
   const order = (a, b) => (unknown.has(a) ? 1 : 0) - (unknown.has(b) ? 1 : 0) ||
     a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
 
@@ -25,16 +27,19 @@ window.PrivyHycoFacets = (() => {
     loaded = true;
     const params = new URLSearchParams(location.search);
     for (const { name } of facets()) {
-      const values = params.getAll(name).map(value => value.trim()).filter(Boolean);
+      const values = params.getAll(name).flatMap(value => value.split(",")).map(value => value.trim()).filter(Boolean);
       if (values.length) selected.set(name, new Map(values.map(value => [value.toLowerCase(), value])));
     }
   }
+  function hits(row, name, keys) {
+    const have = [...(rowValues(row)[name] || ["Unknown"]), ...(rowAliases(row)[name] || [])];
+    const patterns = keys.map(glob);
+    return have.some(value => patterns.some(pattern => pattern.test(value)));
+  }
   function matches(row, except) {
     load();
-    const values = rowValues(row);
     for (const [name, wanted] of selected) {
-      if (name === except) continue;
-      if (!(values[name] || ["Unknown"]).some(value => wanted.has(value.toLowerCase()))) return false;
+      if (name !== except && !hits(row, name, [...wanted.keys()])) return false;
     }
     return true;
   }
@@ -116,17 +121,20 @@ window.PrivyHycoFacets = (() => {
   function fillFacet() {
     const name = opener.dataset.facet, label = opener.dataset.label;
     pop.setAttribute("aria-label", "Filter by " + label);
-    const counts = new Map(), shown = new Map();
+    const counts = new Map(), shown = new Map(), counted = [];
     for (const row of $$("#hycos tbody tr")) {
-      const counted = row.dataset.base === "1" && matches(row, name);
+      const live = row.dataset.base === "1" && matches(row, name);
+      if (live) counted.push(row);
       for (const value of rowValues(row)[name] || ["Unknown"]) {
         const key = value.toLowerCase();
         if (!shown.has(key)) { shown.set(key, value); counts.set(key, 0); }
-        if (counted) counts.set(key, counts.get(key) + 1);
+        if (live) counts.set(key, counts.get(key) + 1);
       }
     }
     const chosen = selected.get(name) || new Map();
-    for (const [key, value] of chosen) if (!shown.has(key)) { shown.set(key, value); counts.set(key, 0); }
+    for (const [key, value] of chosen) {
+      if (!shown.has(key)) { shown.set(key, value); counts.set(key, counted.filter(row => hits(row, name, [key])).length); }
+    }
     const head = make("header");
     head.append(make("b", label));
     if (chosen.size) { const none = button("Clear"); none.dataset.facetNone = ""; head.append(none); }

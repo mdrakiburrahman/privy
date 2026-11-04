@@ -400,10 +400,10 @@ reported.
 
 `list_targets` filters on these details with the repeatable parameters `os`, `os_version`,
 `environment`, `arch`, `privy_version`, `python_version`, and `shell`. Matching ignores case and
-accepts `*` globs. Values of one parameter are alternatives; different parameters must all match.
-`os_version` also matches the bare release or build, and `Unknown` matches targets that never
-reported a value. For example,
-`GET /v1/targets?os=windows&privy_version=0.6.*&shell=bash&shell=pwsh`. `counts` always covers every
+accepts `*` globs. Values of one parameter, repeated or comma-separated, are alternatives; different
+parameters must all match. `os_version` also matches the bare release or build, and `Unknown` matches
+targets that never reported a value. For example,
+`GET /v1/targets?os=windows&privy_version=0.6.*&shell=bash,pwsh`. `counts` always covers every
 target in the selected relays.
 
 | Status         | Meaning                                                                                                        |

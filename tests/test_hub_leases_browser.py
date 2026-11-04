@@ -183,6 +183,11 @@ def test_hyco_facet_filters_chips_counts_columns_and_url(lease_browser):
     page.reload()
     browser_api.expect(arch).to_be_visible()
     browser_api.expect(page.locator("#hycos td.col-arch", has_text="x86_64").first).to_be_visible()
+
+    page.goto(base + "/ui/hycos?privy_version=0.2.*&environment=WSL,Devcontainer")
+    browser_api.expect(rows).to_have_count(2)
+    page.locator('.facet-pill[data-facet="privy_version"]').click()
+    browser_api.expect(pop.locator("label", has_text="0.2.*").locator("small")).to_have_text("2")
     assert not errors
 
 

@@ -132,16 +132,24 @@ def facet_values(facts: Mapping[str, Any]) -> dict[str, list[str]]:
     return values
 
 
+def facet_aliases(facts: Mapping[str, Any]) -> dict[str, list[str]]:
+    """Values a facet also matches without listing them: ``os_version`` matches the bare release or build."""
+    extra = [value for value in (facts.get("os_release"), facts.get("os_build")) if value]
+    return {"os_version": extra} if extra else {}
+
+
 def matches(facts: Mapping[str, Any], filters: Mapping[str, Sequence[str]]) -> bool:
     """Whether a listener passes every facet filter.
 
-    Values of one facet are alternatives; facets must all match. Matching ignores
-    case and accepts ``*`` globs; ``os_version`` also matches the bare release or build.
+    Values of one facet, repeated or comma-separated, are alternatives; facets must all
+    match. Matching ignores case and accepts ``*`` globs; ``os_version`` also matches the
+    bare release or build.
     """
     values = facet_values(facts)
-    values["os_version"] += [value for value in (facts.get("os_release"), facts.get("os_build")) if value]
+    for name, extra in facet_aliases(facts).items():
+        values[name] += extra
     for name, wanted in filters.items():
-        patterns = [item.strip().lower() for item in wanted if item.strip()]
+        patterns = [part.strip().lower() for item in wanted for part in item.split(",") if part.strip()]
         if not patterns:
             continue
         have = [value.lower() for value in values[name]]

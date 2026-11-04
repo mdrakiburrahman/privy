@@ -606,7 +606,7 @@ def _parameter(param: Param, location: str, *, required: bool) -> dict[str, Any]
         "schema": schema,
     }
     if param.type == "array":
-        entry.update(style="form", explode=param.name == "label")
+        entry.update(style="form", explode=param.name != "targets")
     return entry
 
 
