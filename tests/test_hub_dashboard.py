@@ -81,6 +81,19 @@ def test_every_page_renders_without_jobs(hub, path):
     assert 'id="main"' in text and 'id="nav"' in text
 
 
+def test_favicon_is_referenced_and_served_for_dashboard_pages(hub):
+    for path in ("/", "/ui/hycos"):
+        page = hub.call("GET", path, headers=BROWSER)
+        assert '<link rel="icon" href="/favicon.svg" type="image/svg+xml">' in html_of(page)
+        assert "img-src 'self' data:" in page.headers["Content-Security-Policy"]
+
+    favicon = hub.call("GET", "/favicon.svg")
+    assert favicon.status == 200
+    assert favicon.media_type() == "image/svg+xml"
+    assert '<text ' in favicon.text and ">P</text>" in favicon.text
+    assert favicon.headers["X-Content-Type-Options"] == "nosniff"
+
+
 def test_dashboard_pages_are_read_only(hub):
     assert hub.call("POST", "/ui/hycos").status == 405
     assert hub.call("POST", "/v1/stats").status == 405

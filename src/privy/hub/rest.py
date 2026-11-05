@@ -292,6 +292,7 @@ class RestApi:
         ui = dashboard.PAGES
         documents: dict[str, Callable[[], HttpResponse]] = {
             "/": lambda: self.home(query, headers, base_url),
+            "/favicon.svg": dashboard.favicon_response,
             "/llms.txt": lambda: HttpResponse(200, text=guide.quickstart(self.service, base_url)),
             "/ui/": lambda: dashboard.render(self.service, "overview", query, base_url),
             **{
