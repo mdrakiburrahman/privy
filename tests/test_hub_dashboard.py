@@ -90,7 +90,7 @@ def test_favicon_is_referenced_and_served_for_dashboard_pages(hub):
     favicon = hub.call("GET", "/favicon.svg")
     assert favicon.status == 200
     assert favicon.media_type() == "image/svg+xml"
-    assert '<text ' in favicon.text and ">P</text>" in favicon.text
+    assert "<text " in favicon.text and ">P</text>" in favicon.text
     assert favicon.headers["X-Content-Type-Options"] == "nosniff"
 
 
