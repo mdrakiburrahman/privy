@@ -51,6 +51,11 @@ DEFAULT_JOB_LIMIT = 200
 MAX_LIMIT = 5000
 #: Terminals opened by default (besides running ones).
 OPEN_NEWEST = 3
+FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<rect x="2" y="2" width="60" height="60" rx="14" fill="#132c31"/>
+<text x="32" y="47" fill="#67c7b7" font-family="Arial,sans-serif" font-size="46" font-weight="700"
+text-anchor="middle">P</text>
+</svg>"""
 
 PAGES = {
     "overview": ("/ui", "Overview"),
@@ -394,6 +399,7 @@ def shell(
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex"><title>{esc(title)} · privy hub</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style nonce="{nonce}">{CSS}{EXEC_CSS}</style></head>
 <body>
 <aside class="sidebar"><div class="brand"><b>privy hub</b><small>CONTROL PLANE</small></div>
@@ -414,7 +420,7 @@ def shell(
 
 def html_response(text: str, nonce: str, status: int = 200) -> HttpResponse:
     csp = (
-        f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; img-src data:; "
+        f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; img-src 'self' data:; "
         "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     )
     headers = {
@@ -424,6 +430,15 @@ def html_response(text: str, nonce: str, status: int = 200) -> HttpResponse:
         "X-Frame-Options": "DENY",
     }
     return HttpResponse(status, headers=headers, text=text, content_type=HTML_TYPE)
+
+
+def favicon_response() -> HttpResponse:
+    return HttpResponse(
+        200,
+        headers={"X-Content-Type-Options": "nosniff"},
+        text=FAVICON_SVG,
+        content_type="image/svg+xml",
+    )
 
 
 def hero(eyebrow: str, title: str, chips: str = "") -> str:
