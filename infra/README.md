@@ -39,7 +39,7 @@ The script rejects automatic changes to existing target server identity,
 authentication, location, TLS/network settings or database SKU/backup/collation.
 Use a reviewed Azure operation for intentional changes, then rerun.
 
-The default server name is `privy-ce859648-sql`; override `-ServerName` if needed
+The default server name is `privy-sql`; override `-ServerName` if needed
 for global uniqueness. Database names and supported starting SKUs are parameters.
 All Azure operations pass the explicit subscription; the script does not run
 `az account set`. Deployment outputs are nonsecret resource IDs, FQDN, tiers,

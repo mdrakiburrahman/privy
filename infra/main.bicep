@@ -3,7 +3,7 @@ targetScope = 'subscription'
 param resourceGroupName string = 'privy'
 param resourceGroupLocation string = 'canadacentral'
 param location string = 'canadacentral'
-param serverName string = 'privy-ce859648-sql'
+param serverName string = 'privy-sql'
 param databaseName string = 'privy'
 param testDatabaseName string = 'privy_test'
 param administratorObjectId string

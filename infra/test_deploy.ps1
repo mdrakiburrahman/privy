@@ -22,7 +22,7 @@ function az {
             if ($global:PrivyInfraExistingServer) { '[{"name":"privy","location":"canadacentral"}]' } else { '[]' }
         }
         "sql server list" {
-            '[{"name":"privy-ce859648-sql","location":"canadacentral","minimalTlsVersion":"1.2","publicNetworkAccess":"Enabled"}]'
+            '[{"name":"privy-sql","location":"canadacentral","minimalTlsVersion":"1.2","publicNetworkAccess":"Enabled"}]'
         }
         "sql server ad-admin" { ,@(@{sid=$objectId; tenantId=$tenant}) | ConvertTo-Json -AsArray }
         "sql server ad-only-auth" { '{"azureAdOnlyAuthentication":true}' }
