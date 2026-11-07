@@ -307,8 +307,12 @@ class SqlBackend:
         self._thread: threading.Thread | None = None
         self.bootstrap()
         self.outbox = DurableOutbox(home / "sql-outbox.sqlite3", max_bytes=settings.outbox_max_bytes)
-        log.info("Storage: azure_sql (%s/%s); owner incarnation %s; no file fallback",
-                 settings.server, settings.database, self.owner)
+        log.info(
+            "Storage: azure_sql (%s/%s); owner incarnation %s; no file fallback",
+            settings.server,
+            settings.database,
+            self.owner,
+        )
         if start_worker:
             self._thread = threading.Thread(target=self._work, name="privy-sql-delivery", daemon=True)
             self._thread.start()
@@ -407,9 +411,19 @@ class SqlBackend:
                 at = payload.get("created_at", payload.get("at", time.time()))
                 if not isinstance(at, (int, float)):
                     at = time.time()
-                batch.append({"kind": kind, "id": key, "payload": payload, "owner": owner,
-                              "revision": seq, "at": at, "target": payload.get("target"),
-                              "lease_id": payload.get("lease_id"), "client_id": payload.get("client_id")})
+                batch.append(
+                    {
+                        "kind": kind,
+                        "id": key,
+                        "payload": payload,
+                        "owner": owner,
+                        "revision": seq,
+                        "at": at,
+                        "target": payload.get("target"),
+                        "lease_id": payload.get("lease_id"),
+                        "client_id": payload.get("client_id"),
+                    }
+                )
             with self.transaction() as cursor:
                 cursor.execute(_FLUSH_BATCH, json.dumps(batch, ensure_ascii=True))
             self.outbox.ack_batch([row[0] for row in rows])

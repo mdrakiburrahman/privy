@@ -135,7 +135,9 @@ def _translated_errors() -> Iterator[None]:
     except HubBusyError as exc:
         raise HubError(str(exc), status=429, code="busy") from None
     except StorageError as exc:
-        raise HubError("shared storage is unavailable; retry later", status=503, code="storage_unavailable") from exc
+        raise HubError(
+            "shared storage is unavailable; retry later", status=503, code="storage_unavailable"
+        ) from exc
 
 
 def _require_text(name: str, value: str) -> str:

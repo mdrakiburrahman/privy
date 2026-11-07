@@ -18,8 +18,11 @@ class _SharedEntry(JobEntry):
     def view(self):
         result = super().view()
         if self.job._record.get("imported"):
-            result.update(restored=True, command_truncated=self.job._record.get("command_truncated", False),
-                          duration_ms=self.job._record.get("duration_ms"))
+            result.update(
+                restored=True,
+                command_truncated=self.job._record.get("command_truncated", False),
+                duration_ms=self.job._record.get("duration_ms"),
+            )
         return result
 
     def output(self, limit):
@@ -33,7 +36,7 @@ class _SharedEntry(JobEntry):
             index = max(0, count - 200)
             pieces, _, _ = self.job.next_pieces(index, 0)
             dropped |= len(pieces) < count - index
-            for piece in reversed(pieces[:count - index]):
+            for piece in reversed(pieces[: count - index]):
                 room = max(0, limit - size)
                 if not room:
                     dropped = True
@@ -49,10 +52,17 @@ class _SharedEntry(JobEntry):
 def _entry(backend, record):
     job = SharedJob(backend, record, snapshot=True)
     return _SharedEntry(
-        id=job.id, target_id=job.target.id, type=job.type,
-        language=job.spec.get("language"), command=command_of(job.type, job.spec),
-        origin=job.origin, created_at=job.created_at, broadcast_id=job.broadcast_id,
-        lease_id=job.lease_id, client_id=job.client_id, job=job,
+        id=job.id,
+        target_id=job.target.id,
+        type=job.type,
+        language=job.spec.get("language"),
+        command=command_of(job.type, job.spec),
+        origin=job.origin,
+        created_at=job.created_at,
+        broadcast_id=job.broadcast_id,
+        lease_id=job.lease_id,
+        client_id=job.client_id,
+        job=job,
     )
 
 
@@ -64,10 +74,19 @@ class _SharedPurposes:
         # Explicit non-job usage (e.g. a terminal) has no admission record.
         at = self._clock()
         key = uuid.uuid4().hex
-        self.backend.enqueue("purpose", key, shared_payload({
-            "id": key, "owner": self.backend.owner, "created_at": at,
-            "target": target_id, "purpose": normalize_purpose(purpose),
-        }))
+        self.backend.enqueue(
+            "purpose",
+            key,
+            shared_payload(
+                {
+                    "id": key,
+                    "owner": self.backend.owner,
+                    "created_at": at,
+                    "target": target_id,
+                    "purpose": normalize_purpose(purpose),
+                }
+            ),
+        )
 
     def _snapshot(self, *, target_id=None, start=None, rows=None):
         if rows is None:
@@ -116,18 +135,38 @@ class SharedMetrics(HubMetrics):
         job.owner = self.backend.owner
 
     def probe(self, target, result) -> None:
-        self.backend.enqueue("probe", uuid.uuid4().hex, shared_payload({
-            "owner": self.backend.owner, "created_at": result.checked_at, "at": result.checked_at,
-            "target": target.id, "status": result.status, "latency_ms": result.latency_ms,
-            "info": result.info, "legacy": result.legacy, "error": result.error,
-        }))
+        self.backend.enqueue(
+            "probe",
+            uuid.uuid4().hex,
+            shared_payload(
+                {
+                    "owner": self.backend.owner,
+                    "created_at": result.checked_at,
+                    "at": result.checked_at,
+                    "target": target.id,
+                    "status": result.status,
+                    "latency_ms": result.latency_ms,
+                    "info": result.info,
+                    "legacy": result.legacy,
+                    "error": result.error,
+                }
+            ),
+        )
 
     def call(self, surface, status, seconds) -> None:
         at = self._clock()
-        self.backend.enqueue("call", uuid.uuid4().hex, {
-            "owner": self.backend.owner, "created_at": at, "at": at,
-            "surface": surface, "status": status, "seconds": seconds,
-        })
+        self.backend.enqueue(
+            "call",
+            uuid.uuid4().hex,
+            {
+                "owner": self.backend.owner,
+                "created_at": at,
+                "at": at,
+                "surface": surface,
+                "status": status,
+                "seconds": seconds,
+            },
+        )
 
     def restore(self, path) -> int:
         # SQL is authoritative. No local audit file or outputs are loaded on startup.
@@ -135,8 +174,10 @@ class SharedMetrics(HubMetrics):
 
     def entries(self, target_id=None, *, after=None, before=None):
         return sorted(
-            (_entry(self.backend, row) for row in
-             shared_records(self.backend, "job", target=target_id, after=after, before=before)),
+            (
+                _entry(self.backend, row)
+                for row in shared_records(self.backend, "job", target=target_id, after=after, before=before)
+            ),
             key=lambda entry: (entry.created_at, entry.id),
         )
 
@@ -151,8 +192,12 @@ class SharedMetrics(HubMetrics):
     @staticmethod
     def _probe_result(row):
         return ProbeResult(
-            status=row["status"], checked_at=row["at"], latency_ms=row.get("latency_ms"),
-            info=row.get("info"), legacy=row.get("legacy", False), error=row.get("error"),
+            status=row["status"],
+            checked_at=row["at"],
+            latency_ms=row.get("latency_ms"),
+            info=row.get("info"),
+            legacy=row.get("legacy", False),
+            error=row.get("error"),
         )
 
     def report(self, targets, probes, **kwargs):
@@ -171,14 +216,18 @@ class SharedMetrics(HubMetrics):
             if hasattr(self.backend, "latest_before"):
                 purpose_rows += self.backend.latest_before(after)
             else:
-                target_ids = {target.id for target in targets} | {entry.target_id for entry in snapshot._entries}
+                target_ids = {target.id for target in targets} | {
+                    entry.target_id for entry in snapshot._entries
+                }
                 for target_id in target_ids:
                     for kind in ("job", "purpose"):
                         purpose_rows += self.backend.list(kind, target=target_id, before=after, limit=1)
         snapshot.purposes = self.purposes._snapshot(rows=purpose_rows)
         earliest = [entry.created_at for entry in snapshot._entries]
         shared_probes = dict(probes)
-        for row in sorted(shared_records(self.backend, "probe", after=after, before=before), key=lambda r: r["at"]):
+        for row in sorted(
+            shared_records(self.backend, "probe", after=after, before=before), key=lambda r: r["at"]
+        ):
             target_id = row["target"]
             result = self._probe_result(row)
             # HubMetrics.probe needs only the target's id.

@@ -214,10 +214,17 @@ class ListenerInfoStore:
             from privy.hub.shared_jobs import shared_payload
 
             info = shared_payload(info)
-            self._backend.enqueue("listener", target.id, {
-                "target": target.id, "owner": self._backend.owner, "created_at": result.checked_at,
-                "seen_at": result.checked_at, "info": info,
-            })
+            self._backend.enqueue(
+                "listener",
+                target.id,
+                {
+                    "target": target.id,
+                    "owner": self._backend.owner,
+                    "created_at": result.checked_at,
+                    "seen_at": result.checked_at,
+                    "info": info,
+                },
+            )
         with self._lock:
             previous = self._known.get(target.id)
             self._known[target.id] = {"seen_at": result.checked_at, "info": info}

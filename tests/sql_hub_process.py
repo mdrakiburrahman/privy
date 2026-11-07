@@ -43,8 +43,10 @@ class SimulatedListener:
 
     def listener_info(self, **kwargs):
         return {
-            "kind": "listener_info", "hostname": "sql-test-simulator",
-            "platform": {"system": "Windows"}, "privy_version": "test",
+            "kind": "listener_info",
+            "hostname": "sql-test-simulator",
+            "platform": {"system": "Windows"},
+            "privy_version": "test",
             "capabilities": {"languages": ["python"], "terminal": {"shells": []}},
         }
 
@@ -58,8 +60,13 @@ class SimulatedListener:
         cancelled = request.code == "block" and self._cancel.wait(60)
         return ExecResult(
             exit_code=130 if cancelled else 0,
-            stdout=data.decode(), stderr="", stdout_bytes=data, stderr_bytes=b"",
-            duration_ms=1, timed_out=False, error="cancelled" if cancelled else None,
+            stdout=data.decode(),
+            stderr="",
+            stdout_bytes=data,
+            stderr_bytes=b"",
+            duration_ms=1,
+            timed_out=False,
+            error="cancelled" if cancelled else None,
         )
 
     def cancel(self, request, remote_id):
@@ -76,11 +83,18 @@ def main() -> None:
     if args.port == 7748:
         parser.error("the live hub port is forbidden in this harness")
     args.home.mkdir(parents=True, exist_ok=True)
-    document = {"version": 1, "relays": [{
-        "name": "sqltest", "namespace": "simulated.invalid",
-        "keyrule": "test-only", "key": "not-a-real-credential",
-        "hybrid_connections": [f"testbox{i:02d}_windows" for i in range(20)],
-    }]}
+    document = {
+        "version": 1,
+        "relays": [
+            {
+                "name": "sqltest",
+                "namespace": "simulated.invalid",
+                "keyrule": "test-only",
+                "key": "not-a-real-credential",
+                "hybrid_connections": [f"testbox{i:02d}_windows" for i in range(20)],
+            }
+        ],
+    }
     (args.home / "relays.json").write_text(json.dumps(document), encoding="utf-8")
     listeners = {}
     logging.basicConfig(level=logging.WARNING)
@@ -89,7 +103,10 @@ def main() -> None:
         parser.error("an explicitly isolated *_test database is required")
     connections = TestConnections(settings)
     runtime = build_hub(
-        home=args.home, settings_file=args.settings, port=args.port, version="sql-test",
+        home=args.home,
+        settings_file=args.settings,
+        port=args.port,
+        version="sql-test",
         client_factory=lambda target: listeners.setdefault(target.id, SimulatedListener()),
         sql_connect=connections,
     )

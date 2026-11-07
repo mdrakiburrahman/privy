@@ -179,10 +179,18 @@ def test_real_sql_committed_unacked_batch_replay_is_idempotent(stores, monkeypat
     key = uuid.uuid4().hex
     payload = {"job_id": key, "owner": one.owner, "state": "running", "created_at": time.time()}
     one.enqueue("job", key, payload)
-    one.enqueue("output", key + ":0", {
-        "job_id": key, "index": 0, "stream": "stdout", "start": 0, "end": 5,
-        "data": base64.b64encode(b"hello").decode(),
-    })
+    one.enqueue(
+        "output",
+        key + ":0",
+        {
+            "job_id": key,
+            "index": 0,
+            "stream": "stdout",
+            "start": 0,
+            "end": 5,
+            "data": base64.b64encode(b"hello").decode(),
+        },
+    )
     one.enqueue("job", key, {**payload, "state": "succeeded"})
     ack = one.outbox.ack_batch
 
@@ -228,7 +236,9 @@ def test_real_sql_summary_scan_has_no_gaps_at_equal_timestamp_boundaries(stores)
     key = uuid.uuid4().hex
     at = time.time()
     for index in range(1103):
-        one.enqueue("audit", f"{key}:{index:04d}", {"id": f"{key}:{index:04d}", "created_at": at, "target": key})
+        one.enqueue(
+            "audit", f"{key}:{index:04d}", {"id": f"{key}:{index:04d}", "created_at": at, "target": key}
+        )
     try:
         assert one.flush(timeout=60)
         rows = list(two.scan("audit", target=key, after=at, before=at + 1))

@@ -27,10 +27,10 @@ if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
 fi
 
 echo ">> syncing binary build dependencies"
-uv sync --locked --group binary
+uv sync --locked --group binary --extra sql
 
 echo ">> building $BIN"
-uv run --group binary pyinstaller --clean --noconfirm privy.spec
+uv run --locked --group binary --extra sql pyinstaller --clean --noconfirm privy.spec
 
 if [[ ! -x "$BIN" ]]; then
   echo "build produced no executable at $BIN" >&2
@@ -56,7 +56,7 @@ if [[ "${PRIVY_SKIP_STATICX:-0}" != "1" ]]; then
   fi
 
   echo ">> statifying $BIN (staticx)"
-  uv run --group binary staticx "$BIN" "${BIN}.static"
+  uv run --locked --group binary --extra sql staticx "$BIN" "${BIN}.static"
   mv "${BIN}.static" "$BIN"
   chmod +x "$BIN"
 fi

@@ -48,13 +48,44 @@ IMPORT_HISTORY_S = 7 * 24 * 60 * 60
 _IMPORT_SECRET = re.compile(
     r"""(?i)(\b(?:password|passwd|token|secret|accountkey|sharedaccesskey|connection_string|api_key)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s;,]+)"""
 )
-_IMPORT_FIELDS = frozenset({
-    "ts", "event", "job_id", "type", "target", "origin", "lease_id", "client_id", "broadcast_id",
-    "purpose", "language", "mode", "timeout_s", "code_sha256", "code", "code_truncated",
-    "local_path", "remote_path", "overwrite", "destination_type", "chunk_size", "state",
-    "exit_code", "error", "duration_ms", "stdout_bytes", "stderr_bytes", "size", "sha256",
-    "files_total", "files_copied", "files_skipped", "files_done", "bytes_copied",
-})
+_IMPORT_FIELDS = frozenset(
+    {
+        "ts",
+        "event",
+        "job_id",
+        "type",
+        "target",
+        "origin",
+        "lease_id",
+        "client_id",
+        "broadcast_id",
+        "purpose",
+        "language",
+        "mode",
+        "timeout_s",
+        "code_sha256",
+        "code",
+        "code_truncated",
+        "local_path",
+        "remote_path",
+        "overwrite",
+        "destination_type",
+        "chunk_size",
+        "state",
+        "exit_code",
+        "error",
+        "duration_ms",
+        "stdout_bytes",
+        "stderr_bytes",
+        "size",
+        "sha256",
+        "files_total",
+        "files_copied",
+        "files_skipped",
+        "files_done",
+        "bytes_copied",
+    }
+)
 
 
 def _audit_lines(stream):
@@ -86,10 +117,15 @@ def _audit_lines(stream):
 
 def _import_redacted(record, local_path=None):
     local_path = local_path or record.get("local_path")
-    secrets = [value for name, value in record.items()
-               if name.lower() in _PRIVATE and isinstance(value, str) and value]
-    safe = shared_payload({key: value for key, value in record.items() if key in _IMPORT_FIELDS},
-                          local_path=local_path if isinstance(local_path, str) else None)
+    secrets = [
+        value
+        for name, value in record.items()
+        if name.lower() in _PRIVATE and isinstance(value, str) and value
+    ]
+    safe = shared_payload(
+        {key: value for key, value in record.items() if key in _IMPORT_FIELDS},
+        local_path=local_path if isinstance(local_path, str) else None,
+    )
 
     def scrub(value):
         if isinstance(value, dict):
@@ -109,15 +145,29 @@ def _import_job(start, finish, digest, at, import_hash):
     target_id = start.get("target")
     job_id = start.get("job_id")
     job_type = start.get("type", "exec")
-    if (not isinstance(target_id, str) or not target_id or not isinstance(job_id, str) or not job_id
-            or len(job_id) > 80 or job_type not in ("exec", "upload", "download", "sync")):
+    if (
+        not isinstance(target_id, str)
+        or not target_id
+        or not isinstance(job_id, str)
+        or not job_id
+        or len(job_id) > 80
+        or job_type not in ("exec", "upload", "download", "sync")
+    ):
         return None
     if job_type == "exec":
-        spec = {"language": start.get("language") or "python", "code": str(start.get("code") or ""),
-                "mode": start.get("mode") or "subprocess", "timeout_s": start.get("timeout_s")}
+        spec = {
+            "language": start.get("language") or "python",
+            "code": str(start.get("code") or ""),
+            "mode": start.get("mode") or "subprocess",
+            "timeout_s": start.get("timeout_s"),
+        }
     else:
-        spec = {"local_path": "<owner-local>", "remote_path": str(start.get("remote_path") or "?"),
-                "overwrite": bool(start.get("overwrite")), "chunk_size": start.get("chunk_size")}
+        spec = {
+            "local_path": "<owner-local>",
+            "remote_path": str(start.get("remote_path") or "?"),
+            "overwrite": bool(start.get("overwrite")),
+            "chunk_size": start.get("chunk_size"),
+        }
         if job_type == "sync":
             spec["destination_type"] = start.get("destination_type") or "directory"
     terminal = finish is not None and finish[1].get("state") in TERMINAL_STATES
@@ -128,23 +178,46 @@ def _import_job(start, finish, digest, at, import_hash):
     if job_type in ("upload", "download") and terminal:
         transfer = {key: outcome[key] for key in ("size", "sha256") if key in outcome}
     elif job_type == "sync" and terminal:
-        transfer = {key: outcome[key] for key in
-                    ("files_copied", "files_skipped", "files_done", "bytes_copied") if key in outcome}
+        transfer = {
+            key: outcome[key]
+            for key in ("files_copied", "files_skipped", "files_done", "bytes_copied")
+            if key in outcome
+        }
     return {
-        "job_id": job_id, "target": target_id, "owner": f"file-import:{import_hash[:32]}",
-        "type": job_type, "spec": spec, "created_at": at, "origin": start.get("origin") or "file-import",
-        "purpose": start.get("purpose"), "lease_id": start.get("lease_id"), "client_id": start.get("client_id"),
-        "broadcast_id": start.get("broadcast_id"), "lease_warning": None,
+        "job_id": job_id,
+        "target": target_id,
+        "owner": f"file-import:{import_hash[:32]}",
+        "type": job_type,
+        "spec": spec,
+        "created_at": at,
+        "origin": start.get("origin") or "file-import",
+        "purpose": start.get("purpose"),
+        "lease_id": start.get("lease_id"),
+        "client_id": start.get("client_id"),
+        "broadcast_id": start.get("broadcast_id"),
+        "lease_warning": None,
         "state": outcome["state"] if terminal else "unknown",
         "exit_code": outcome.get("exit_code"),
-        "error": outcome.get("error") if terminal else "file hub stopped without a durable outcome; owner unavailable",
-        "started_at": None, "finished_at": finish[0] if terminal else None, "duration_ms": duration,
-        "remote_job_id": None, "cancel_requested": False, "progress": None,
-        "sync_progress": None, "transfer": transfer,
-        "stdout_bytes": 0, "stderr_bytes": 0, "chunk_count": 0,
+        "error": outcome.get("error")
+        if terminal
+        else "file hub stopped without a durable outcome; owner unavailable",
+        "started_at": None,
+        "finished_at": finish[0] if terminal else None,
+        "duration_ms": duration,
+        "remote_job_id": None,
+        "cancel_requested": False,
+        "progress": None,
+        "sync_progress": None,
+        "transfer": transfer,
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "chunk_count": 0,
         "legacy_stdout_bytes": outcome.get("stdout_bytes", 0),
         "legacy_stderr_bytes": outcome.get("stderr_bytes", 0),
-        "output_unavailable": True, "imported": True, "import_sha256": import_hash, "start_sha256": digest,
+        "output_unavailable": True,
+        "imported": True,
+        "import_sha256": import_hash,
+        "start_sha256": digest,
         "command_truncated": bool(start.get("code_truncated")),
     }
 
@@ -155,12 +228,16 @@ def shared_payload(value: Any, *, local_path: str | None = None) -> Any:
         return {
             key: "<owner-local>" if key == "local_path" else shared_payload(item, local_path=local_path)
             for key, item in value.items()
-            if isinstance(key, str) and key.lower() not in _PRIVATE
+            if isinstance(key, str)
+            and key.lower() not in _PRIVATE
             and (item is None or isinstance(item, (str, bool, int, float, dict, list, tuple)))
         }
     if isinstance(value, (list, tuple)):
-        return [shared_payload(item, local_path=local_path) for item in value
-                if item is None or isinstance(item, (str, bool, int, float, dict, list, tuple))]
+        return [
+            shared_payload(item, local_path=local_path)
+            for item in value
+            if item is None or isinstance(item, (str, bool, int, float, dict, list, tuple))
+        ]
     if isinstance(value, str):
         value = value.replace(local_path, "<owner-local>") if local_path else value
         return redact_relay_secrets(value)
@@ -170,15 +247,30 @@ def shared_payload(value: Any, *, local_path: str | None = None) -> Any:
 def job_record(job: HubJob, owner: str) -> dict[str, Any]:
     with job.cond:
         record = {
-            "job_id": job.id, "owner": owner, "created_at": job.created_at,
-            "target": job.target.id, "type": job.type, "spec": job.spec, "origin": job.origin,
-            "broadcast_id": job.broadcast_id, "purpose": job.purpose, "lease_id": job.lease_id,
-            "client_id": job.client_id, "lease_warning": job.lease_warning,
-            "state": job.state, "exit_code": job.exit_code, "error": job.error,
-            "started_at": job.started_at, "finished_at": job.finished_at,
-            "remote_job_id": job.remote_job_id, "cancel_requested": job.cancel_requested,
-            "progress": job.progress, "transfer": job.transfer, "sync_progress": job.sync_progress,
-            "stdout_bytes": job.stdout.total, "stderr_bytes": job.stderr.total,
+            "job_id": job.id,
+            "owner": owner,
+            "created_at": job.created_at,
+            "target": job.target.id,
+            "type": job.type,
+            "spec": job.spec,
+            "origin": job.origin,
+            "broadcast_id": job.broadcast_id,
+            "purpose": job.purpose,
+            "lease_id": job.lease_id,
+            "client_id": job.client_id,
+            "lease_warning": job.lease_warning,
+            "state": job.state,
+            "exit_code": job.exit_code,
+            "error": job.error,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+            "remote_job_id": job.remote_job_id,
+            "cancel_requested": job.cancel_requested,
+            "progress": job.progress,
+            "transfer": job.transfer,
+            "sync_progress": job.sync_progress,
+            "stdout_bytes": job.stdout.total,
+            "stderr_bytes": job.stderr.total,
             "chunk_count": job.chunks_base + len(job.chunks),
         }
         return shared_payload(record, local_path=job.spec.get("local_path"))
@@ -215,8 +307,11 @@ class SharedJob(HubJob):
         target_id = record["target"]
         relay, _, path = target_id.partition("/")
         super().__init__(
-            job_type=record["type"], target=Target(target_id, relay, "", path),
-            spec=record["spec"], origin=record["origin"], output_limit=0,
+            job_type=record["type"],
+            target=Target(target_id, relay, "", path),
+            spec=record["spec"],
+            origin=record["origin"],
+            output_limit=0,
         )
         self.id = record["job_id"]
         self.stdout = _SharedBuffer()
@@ -227,9 +322,25 @@ class SharedJob(HubJob):
     def _apply(self, record: dict[str, Any]) -> None:
         self._record = record
         for name in (
-            "owner", "created_at", "type", "spec", "origin", "broadcast_id", "purpose",
-            "lease_id", "client_id", "lease_warning", "state", "exit_code", "error",
-            "started_at", "finished_at", "remote_job_id", "cancel_requested", "transfer", "sync_progress",
+            "owner",
+            "created_at",
+            "type",
+            "spec",
+            "origin",
+            "broadcast_id",
+            "purpose",
+            "lease_id",
+            "client_id",
+            "lease_warning",
+            "state",
+            "exit_code",
+            "error",
+            "started_at",
+            "finished_at",
+            "remote_job_id",
+            "cancel_requested",
+            "transfer",
+            "sync_progress",
         ):
             setattr(self, name, record.get(name))
         progress = record.get("progress")
@@ -274,7 +385,7 @@ class SharedJob(HubJob):
             raw = base64.b64decode(chunk["data"])
             right = min(end, chunk["end"])
             if right > position:
-                data.extend(raw[position - chunk["start"]:right - chunk["start"]])
+                data.extend(raw[position - chunk["start"] : right - chunk["start"]])
                 position = right
         return begin, bytes(data)
 
@@ -284,11 +395,16 @@ class SharedJob(HubJob):
         begin, data = self._bytes(stream, offset, limit)
         total = self.buffer(stream).total
         if begin + len(data) < total or not done:
-            data = data[:_utf8_safe_length(data)]
+            data = data[: _utf8_safe_length(data)]
         return {
-            "job_id": self.id, "stream": stream, "offset": begin, "next_offset": begin + len(data),
-            "total_bytes": total, "data": data.decode("utf-8", "replace"),
-            "eof": done and begin + len(data) >= total, "done": done,
+            "job_id": self.id,
+            "stream": stream,
+            "offset": begin,
+            "next_offset": begin + len(data),
+            "total_bytes": total,
+            "data": data.decode("utf-8", "replace"),
+            "eof": done and begin + len(data) >= total,
+            "done": done,
         }
 
     def peek(self, stream: str, since: int, limit: int) -> tuple[int, bytes]:
@@ -306,8 +422,10 @@ class SharedJob(HubJob):
             if self.progress is not None:
                 result["progress"] = {"bytes_done": self.progress[0], "bytes_total": self.progress[1]}
             if self.type == "sync":
-                result.update(destination_type=self.spec["destination_type"],
-                              progress=dict(self.sync_progress or {"phase": "queued"}))
+                result.update(
+                    destination_type=self.spec["destination_type"],
+                    progress=dict(self.sync_progress or {"phase": "queued"}),
+                )
             if self.transfer is not None:
                 result["result"] = dict(self.transfer)
             return result
@@ -323,7 +441,7 @@ class SharedJob(HubJob):
             lead = _skip_continuation_bytes(data)
             begin, data = begin + lead, data[lead:]
             if begin + len(data) < self.buffer(stream).total or self.state not in TERMINAL_STATES:
-                data = data[:_utf8_safe_length(data)]
+                data = data[: _utf8_safe_length(data)]
             end = begin + len(data)
             if advance and explicit is None and data:
                 previous = self.backend.advance_cursor(self.id, stream, end)
@@ -368,7 +486,9 @@ class SharedJobManager(JobManager):
         self._stop = threading.Event()
         self._pending_lock = threading.Lock()
         self._pending_finishes: dict[str, HubJob] = {}
-        self._cancel_thread = threading.Thread(target=self._monitor_cancels, name="privy-shared-cancel", daemon=True)
+        self._cancel_thread = threading.Thread(
+            target=self._monitor_cancels, name="privy-shared-cancel", daemon=True
+        )
         self._cancel_thread.start()
 
     def import_audit(self, path: Path, *, now: float | None = None, timeout: float = 10) -> int:
@@ -442,30 +562,54 @@ class SharedJobManager(JobManager):
                     if self.backend.get("job", job_id) is None:
                         self.backend.enqueue("job", job_id, record)
                         imported += 1
-                    self.backend.enqueue("audit", f"file:{line_hash}", {
-                        **start, "created_at": at, "owner": record["owner"], "imported": True,
-                    })
+                    self.backend.enqueue(
+                        "audit",
+                        f"file:{line_hash}",
+                        {
+                            **start,
+                            "created_at": at,
+                            "owner": record["owner"],
+                            "imported": True,
+                        },
+                    )
                 # Read again for deterministic finish audit keys, without keeping
                 # all raw audit lines or loading any shared output.
                 stream.seek(begin)
                 if begin:
                     stream.readline(IMPORT_LINE_BYTES + 1)
                 for line_hash, at, raw in _audit_lines(stream):
-                    if (cutoff <= at <= now and raw["event"] == "job.finish"
-                            and isinstance(raw.get("job_id"), str) and raw["job_id"] in starts):
-                        self.backend.enqueue("audit", f"file:{line_hash}", {
-                            **_import_redacted(raw, local_paths.get(raw["job_id"])), "created_at": at,
-                            "owner": f"file-import:{digest[:32]}", "imported": True,
-                        })
+                    if (
+                        cutoff <= at <= now
+                        and raw["event"] == "job.finish"
+                        and isinstance(raw.get("job_id"), str)
+                        and raw["job_id"] in starts
+                    ):
+                        self.backend.enqueue(
+                            "audit",
+                            f"file:{line_hash}",
+                            {
+                                **_import_redacted(raw, local_paths.get(raw["job_id"])),
+                                "created_at": at,
+                                "owner": f"file-import:{digest[:32]}",
+                                "imported": True,
+                            },
+                        )
                 final_stat = os.fstat(stream.fileno())
                 if final_stat.st_size != size or final_stat.st_mtime_ns != initial_stat.st_mtime_ns:
                     raise StorageError("migration audit changed during import; no marker committed")
                 if not self.backend.flush(timeout=timeout):
                     raise StorageError("cannot commit audit import before durable delivery")
-                self.backend.put("import", marker_key, {
-                    "owner": self.backend.owner, "created_at": now, "sha256": digest,
-                    "jobs": len(starts), "window_s": IMPORT_HISTORY_S,
-                })
+                self.backend.put(
+                    "import",
+                    marker_key,
+                    {
+                        "owner": self.backend.owner,
+                        "created_at": now,
+                        "sha256": digest,
+                        "jobs": len(starts),
+                        "window_s": IMPORT_HISTORY_S,
+                    },
+                )
                 return imported
 
     def _admit(self, job: HubJob) -> None:
@@ -531,11 +675,21 @@ class SharedJobManager(JobManager):
 
     def _output_record(self, job: HubJob, stream: str, start: int, data: bytes) -> None:
         index = job.chunks_base + len(job.chunks)
-        self.backend.enqueue("output", f"{job.id}:{index:020d}", {
-            "job_id": job.id, "owner": self.backend.owner, "target": job.id, "index": index,
-            "stream": stream, "start": start, "end": start + len(data),
-            "data": base64.b64encode(data).decode("ascii"), "created_at": time.time(),
-        })
+        self.backend.enqueue(
+            "output",
+            f"{job.id}:{index:020d}",
+            {
+                "job_id": job.id,
+                "owner": self.backend.owner,
+                "target": job.id,
+                "index": index,
+                "stream": stream,
+                "start": start,
+                "end": start + len(data),
+                "data": base64.b64encode(data).decode("ascii"),
+                "created_at": time.time(),
+            },
+        )
 
     def _launch(self, job, body):
         super()._launch(job, body)
@@ -556,9 +710,16 @@ class SharedJobManager(JobManager):
         return SharedJob(self.backend, record)
 
     def list(self, *, target_id=None, limit=20, lease_id=None, client_id=None):
-        return [SharedJob(self.backend, row, snapshot=True) for row in self.backend.list(
-            "job", limit=limit, target=target_id, lease_id=lease_id, client_id=client_id,
-        )]
+        return [
+            SharedJob(self.backend, row, snapshot=True)
+            for row in self.backend.list(
+                "job",
+                limit=limit,
+                target=target_id,
+                lease_id=lease_id,
+                client_id=client_id,
+            )
+        ]
 
     def counts(self):
         return self.backend.count_jobs()
@@ -572,8 +733,9 @@ class SharedJobManager(JobManager):
         record = self.backend.get("broadcast", broadcast_id.strip())
         if record is None:
             raise JobLookupError(f"unknown broadcast {broadcast_id!r}")
-        broadcast = Broadcast(**{name: record[name] for name in
-                                 ("id", "created_at", "patterns", "job_ids", "skipped")})
+        broadcast = Broadcast(
+            **{name: record[name] for name in ("id", "created_at", "patterns", "job_ids", "skipped")}
+        )
         return broadcast, [self.get(job_id) for job_id in broadcast.job_ids]
 
     def cancel(self, job_id):
@@ -648,7 +810,9 @@ def shared_records(backend: Any, kind: str, *, before=None, **filters):
         # advancing, otherwise equally timed jobs/probes silently disappear.
         limit = 200
         while True:
-            boundary = backend.list(kind, limit=limit, before=math.nextafter(next_before, math.inf), **filters)
+            boundary = backend.list(
+                kind, limit=limit, before=math.nextafter(next_before, math.inf), **filters
+            )
             equal = [row for row in boundary if row.get("created_at", row.get("at", 0)) == next_before]
             if len(boundary) < limit or len(equal) < len(boundary):
                 yield from equal

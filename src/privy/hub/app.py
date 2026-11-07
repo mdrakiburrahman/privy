@@ -172,11 +172,19 @@ class HubApp:
                     try:
                         storage = backend.health()
                     except StorageError:
-                        return error_response(503, "storage_unavailable", "Authoritative SQL backing store is unavailable")
+                        return error_response(
+                            503, "storage_unavailable", "Authoritative SQL backing store is unavailable"
+                        )
                 else:
                     storage = {"mode": "file"}
                 response = HttpResponse(
-                    200, {"status": "ok", "service": "privy-hub", "version": self.service.version, "storage": storage}
+                    200,
+                    {
+                        "status": "ok",
+                        "service": "privy-hub",
+                        "version": self.service.version,
+                        "storage": storage,
+                    },
                 )
             response.surface = "health"
             return response
@@ -395,7 +403,9 @@ def build_hub(
 
         storage = SqlBackend(sql_settings, home, connect=sql_connect)
         try:
-            jobs = SharedJobManager(registry, backend=storage, max_running=max_jobs, audit=SharedAuditLog(storage))
+            jobs = SharedJobManager(
+                registry, backend=storage, max_running=max_jobs, audit=SharedAuditLog(storage)
+            )
             leases = LeaseStore(registry, home=home, audit=jobs.audit, sql_backend=storage)
             listener_infos = ListenerInfoStore(home, backend=storage)
             jobs.import_audit(home / AUDIT_FILENAME)
@@ -424,7 +434,9 @@ def build_hub(
             storage.close()
         raise
     app.set_port(server.server_address[1])
-    runtime = HubRuntime(service=service, server=server, app=app, home=home, relays_file=relays_path, storage=storage)
+    runtime = HubRuntime(
+        service=service, server=server, app=app, home=home, relays_file=relays_path, storage=storage
+    )
     write_state(
         home,
         {

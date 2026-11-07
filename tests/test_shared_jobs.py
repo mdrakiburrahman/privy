@@ -93,9 +93,9 @@ class Backend:
 
     def pending_cancels(self):
         return [
-            key for (kind, key), value in list(self.records.items())
-            if kind == "cancel" and not value["acknowledged"]
-            and self.get("job", key)["owner"] == self.owner
+            key
+            for (kind, key), value in list(self.records.items())
+            if kind == "cancel" and not value["acknowledged"] and self.get("job", key)["owner"] == self.owner
         ]
 
     def ack_cancel(self, job_id):
@@ -115,25 +115,44 @@ def manager(hub, backend, **kwargs):
 
 def start(jobs, hub, **kwargs):
     return jobs.start_exec(
-        hub.registry.resolve("dev/box1_windows"), language="bash", code="hello",
-        mode="subprocess", timeout_s=30, origin="test", **kwargs,
+        hub.registry.resolve("dev/box1_windows"),
+        language="bash",
+        code="hello",
+        mode="subprocess",
+        timeout_s=30,
+        origin="test",
+        **kwargs,
     )
 
 
 def test_completed_job_cursor_pages_preserve_multibyte_output(tmp_path):
     backend = Backend()
     hub = Hub(tmp_path)
-    job = HubJob(job_type="exec", target=hub.registry.resolve("dev/box1_windows"),
-                 spec={"language": "python", "code": "text"}, origin="test", output_limit=100)
+    job = HubJob(
+        job_type="exec",
+        target=hub.registry.resolve("dev/box1_windows"),
+        spec={"language": "python", "code": "text"},
+        origin="test",
+        output_limit=100,
+    )
     data = ("\u20ac" * 2).encode()
     job.stdout.append(data)
     job.chunks.append(("stdout", 0, len(data)))
     job.state = SUCCEEDED
     backend.put("job", job.id, job_record(job, backend.owner))
-    backend.put("output", job.id + ":0", {
-        "target": job.id, "job_id": job.id, "index": 0, "stream": "stdout",
-        "start": 0, "end": len(data), "data": base64.b64encode(data).decode(),
-    })
+    backend.put(
+        "output",
+        job.id + ":0",
+        {
+            "target": job.id,
+            "job_id": job.id,
+            "index": 0,
+            "stream": "stdout",
+            "start": 0,
+            "end": len(data),
+            "data": base64.b64encode(data).decode(),
+        },
+    )
     shared = SharedJob(backend, backend.get("job", job.id))
     first = shared.view(max_output_bytes=4)
     second = shared.view(max_output_bytes=4)
@@ -212,8 +231,13 @@ def test_list_summaries_use_one_snapshot_without_per_job_queries(tmp_path):
     jobs = manager(hub, backend)
     try:
         for index in range(200):
-            job = HubJob(job_type="exec", target=hub.registry.resolve("dev/box1_windows"),
-                         spec={"code": "summary", "language": "python"}, origin="test", output_limit=0)
+            job = HubJob(
+                job_type="exec",
+                target=hub.registry.resolve("dev/box1_windows"),
+                spec={"code": "summary", "language": "python"},
+                origin="test",
+                output_limit=0,
+            )
             job.id = f"summary-{index}"
             backend.put("job", job.id, job_record(job, backend.owner))
         page = jobs.list(limit=200)
@@ -228,8 +252,13 @@ def test_list_summaries_use_one_snapshot_without_per_job_queries(tmp_path):
 def test_shared_cursors_are_atomic_and_do_not_reserve_missing_output(tmp_path):
     hub = Hub(tmp_path)
     backend = Backend()
-    job = HubJob(job_type="exec", target=hub.registry.resolve("dev/box1_windows"),
-                 spec={"language": "bash", "code": "x"}, origin="test", output_limit=100)
+    job = HubJob(
+        job_type="exec",
+        target=hub.registry.resolve("dev/box1_windows"),
+        spec={"language": "bash", "code": "x"},
+        origin="test",
+        output_limit=100,
+    )
     jobs = manager(hub, backend)
     try:
         jobs._admit(job)
@@ -250,8 +279,13 @@ def test_shared_partial_utf8_and_missing_chunks_do_not_create_cursor_gaps(tmp_pa
     hub = Hub(tmp_path)
     backend = Backend()
     jobs = manager(hub, backend)
-    job = HubJob(job_type="exec", target=hub.registry.resolve("dev/box1_windows"),
-                 spec={"language": "bash", "code": "x"}, origin="test", output_limit=100)
+    job = HubJob(
+        job_type="exec",
+        target=hub.registry.resolve("dev/box1_windows"),
+        spec={"language": "bash", "code": "x"},
+        origin="test",
+        output_limit=100,
+    )
     try:
         jobs._admit(job)
         jobs._append_output(job, "stdout", b"\xc3")
@@ -273,8 +307,13 @@ def test_pieces_page_in_arrival_order_and_wait_refreshes_remote_jobs(tmp_path):
     hub = Hub(tmp_path)
     backend = Backend()
     jobs = manager(hub, backend)
-    job = HubJob(job_type="exec", target=hub.registry.resolve("dev/box1_windows"),
-                 spec={"language": "bash", "code": "x"}, origin="test", output_limit=2)
+    job = HubJob(
+        job_type="exec",
+        target=hub.registry.resolve("dev/box1_windows"),
+        spec={"language": "bash", "code": "x"},
+        origin="test",
+        output_limit=2,
+    )
     try:
         jobs._admit(job)
         for i in range(205):
@@ -285,6 +324,7 @@ def test_pieces_page_in_arrival_order_and_wait_refreshes_remote_jobs(tmp_path):
         second, index, _ = proxy.next_pieces(index, 0)
         assert len(second) == 5 and index == 205
         assert second[0].stream == "stdout"
+
         def finish():
             with job.cond:
                 jobs._finish_locked(job, SUCCEEDED)
@@ -329,9 +369,13 @@ def test_job_and_audit_payloads_do_not_contain_credentials_or_local_paths(tmp_pa
     backend = Backend()
     jobs = manager(hub, backend)
     target = hub.registry.resolve("dev/box1_windows")
-    job = HubJob(job_type="upload", target=target,
-                 spec={"local_path": r"C:\private\input", "remote_path": "/remote/input", "overwrite": True},
-                 origin="test", output_limit=0)
+    job = HubJob(
+        job_type="upload",
+        target=target,
+        spec={"local_path": r"C:\private\input", "remote_path": "/remote/input", "overwrite": True},
+        origin="test",
+        output_limit=0,
+    )
     job.client = object()
     job.request = object()
     try:
@@ -381,8 +425,13 @@ def test_output_records_have_absolute_offsets_and_immutable_chunk_ids(tmp_path):
     hub = Hub(tmp_path)
     backend = Backend()
     jobs = manager(hub, backend)
-    job = HubJob(job_type="exec", target=hub.registry.resolve("dev/box1_windows"),
-                 spec={"language": "bash", "code": "x"}, origin="test", output_limit=2)
+    job = HubJob(
+        job_type="exec",
+        target=hub.registry.resolve("dev/box1_windows"),
+        spec={"language": "bash", "code": "x"},
+        origin="test",
+        output_limit=2,
+    )
     try:
         jobs._admit(job)
         jobs._append_output(job, "stdout", b"abc")
@@ -390,7 +439,9 @@ def test_output_records_have_absolute_offsets_and_immutable_chunk_ids(tmp_path):
         jobs._append_output(job, "stdout", b"ef")
         rows = sorted(backend.list("output", target=job.id), key=lambda r: r["index"])
         assert [(r["stream"], r["start"], r["end"]) for r in rows] == [
-            ("stdout", 0, 3), ("stderr", 0, 1), ("stdout", 3, 5),
+            ("stdout", 0, 3),
+            ("stderr", 0, 1),
+            ("stdout", 3, 5),
         ]
         assert b"".join(base64.b64decode(r["data"]) for r in rows) == b"abcdef"
     finally:
@@ -456,8 +507,13 @@ def test_async_summary_does_not_move_cursor_over_uncommitted_output(tmp_path):
     hub = Hub(tmp_path)
     backend = Backend()
     jobs = manager(hub, backend)
-    job = HubJob(job_type="exec", target=hub.registry.resolve("dev/box1_windows"),
-                 spec={"language": "bash", "code": "x"}, origin="test", output_limit=2)
+    job = HubJob(
+        job_type="exec",
+        target=hub.registry.resolve("dev/box1_windows"),
+        spec={"language": "bash", "code": "x"},
+        origin="test",
+        output_limit=2,
+    )
     try:
         jobs._admit(job)
         jobs._append_output(job, "stdout", b"abc")
@@ -504,8 +560,14 @@ def test_broadcast_recovery_and_history_filters(tmp_path):
     jobs = manager(hub, backend)
     try:
         broadcast, children = jobs.start_broadcast(
-            [(hub.registry.resolve("dev/box1_windows"), "bash")], patterns=["box1*"], skipped=[],
-            code="hello", mode="subprocess", timeout_s=30, origin="test", lease_id="lease",
+            [(hub.registry.resolve("dev/box1_windows"), "bash")],
+            patterns=["box1*"],
+            skipped=[],
+            code="hello",
+            mode="subprocess",
+            timeout_s=30,
+            origin="test",
+            lease_id="lease",
         )
         jobs.wait_all(children, 5)
         other = manager(hub, Backend("two", backend.records))
@@ -525,8 +587,9 @@ def test_service_reports_sql_status_and_storage_errors_as_503(tmp_path):
     hub = Hub(tmp_path)
     backend = Backend()
     jobs = manager(hub, backend)
-    service = HubService(registry=hub.registry, jobs=jobs, version="test",
-                         metrics=SharedHubMetrics(backend, hub.registry))
+    service = HubService(
+        registry=hub.registry, jobs=jobs, version="test", metrics=SharedHubMetrics(backend, hub.registry)
+    )
     try:
         assert service.summary()["storage"] == backend.status()
         backend.get = lambda *args: (_ for _ in ()).throw(StorageError("credential-bearing SQL error"))
@@ -544,8 +607,13 @@ def test_shared_history_pagination_keeps_equal_timestamp_records(tmp_path):
     jobs = manager(hub, backend)
     try:
         for i in range(405):
-            job = HubJob(job_type="exec", target=hub.registry.resolve("dev/box1_windows"),
-                         spec={"language": "bash", "code": str(i)}, origin="test", output_limit=0)
+            job = HubJob(
+                job_type="exec",
+                target=hub.registry.resolve("dev/box1_windows"),
+                spec={"language": "bash", "code": str(i)},
+                origin="test",
+                output_limit=0,
+            )
             job.created_at = 100.0 if i < 305 else 200.0
             jobs._admit(job)
         metrics = SharedMetrics(backend)
@@ -571,8 +639,13 @@ def test_restart_keeps_running_owner_metadata_without_recreating_worker(tmp_path
     hub = Hub(tmp_path)
     backend = Backend()
     jobs = manager(hub, backend)
-    job = HubJob(job_type="exec", target=hub.registry.resolve("dev/box1_windows"),
-                 spec={"language": "bash", "code": "x"}, origin="test", output_limit=0)
+    job = HubJob(
+        job_type="exec",
+        target=hub.registry.resolve("dev/box1_windows"),
+        spec={"language": "bash", "code": "x"},
+        origin="test",
+        output_limit=0,
+    )
     job.state = RUNNING
     try:
         jobs._admit(job)
@@ -595,8 +668,13 @@ def test_history_output_tail_pages_more_than_200_chunks(tmp_path):
     hub = Hub(tmp_path)
     backend = Backend()
     jobs = manager(hub, backend)
-    job = HubJob(job_type="exec", target=hub.registry.resolve("dev/box1_windows"),
-                 spec={"language": "bash", "code": "x"}, origin="test", output_limit=2)
+    job = HubJob(
+        job_type="exec",
+        target=hub.registry.resolve("dev/box1_windows"),
+        spec={"language": "bash", "code": "x"},
+        origin="test",
+        output_limit=2,
+    )
     try:
         jobs._admit(job)
         for _ in range(405):
@@ -619,14 +697,40 @@ def test_audit_import_aggregates_recent_history_and_is_idempotent(tmp_path):
     now = time.time()
     records = [
         {"ts": utc_iso(now - 8 * 86400), "event": "job.start", "job_id": "old", "target": "dev/box1_windows"},
-        {"ts": utc_iso(now - 60), "event": "job.start", "job_id": "legacy",
-         "target": "dev/box1_windows", "type": "exec", "language": "bash", "code": "echo imported",
-         "purpose": "migration", "lease_id": "file-lease", "client_id": "file-client", "origin": "rest"},
-        {"ts": utc_iso(now - 59), "event": "job.finish", "job_id": "legacy",
-         "state": SUCCEEDED, "exit_code": 0, "duration_ms": 25, "stdout_bytes": 100},
-        {"ts": utc_iso(now - 50), "event": "job.start", "job_id": "unfinished",
-         "target": "dev/box1_windows", "type": "upload", "local_path": r"C:\private\source",
-         "remote_path": "/remote/source", "overwrite": True, "token": "SECRET", "lease_id": "pinned"},
+        {
+            "ts": utc_iso(now - 60),
+            "event": "job.start",
+            "job_id": "legacy",
+            "target": "dev/box1_windows",
+            "type": "exec",
+            "language": "bash",
+            "code": "echo imported",
+            "purpose": "migration",
+            "lease_id": "file-lease",
+            "client_id": "file-client",
+            "origin": "rest",
+        },
+        {
+            "ts": utc_iso(now - 59),
+            "event": "job.finish",
+            "job_id": "legacy",
+            "state": SUCCEEDED,
+            "exit_code": 0,
+            "duration_ms": 25,
+            "stdout_bytes": 100,
+        },
+        {
+            "ts": utc_iso(now - 50),
+            "event": "job.start",
+            "job_id": "unfinished",
+            "target": "dev/box1_windows",
+            "type": "upload",
+            "local_path": r"C:\private\source",
+            "remote_path": "/remote/source",
+            "overwrite": True,
+            "token": "SECRET",
+            "lease_id": "pinned",
+        },
     ]
     path = audit_fixture(tmp_path / "audit.jsonl", records)
     fixture_home = tmp_path / "fixture"
@@ -669,10 +773,20 @@ def test_audit_import_aggregates_recent_history_and_is_idempotent(tmp_path):
 def test_audit_import_marks_only_after_durable_flush_and_retries(tmp_path):
     hub = Hub(tmp_path)
     now = time.time()
-    path = audit_fixture(tmp_path / "legacy-audit.jsonl", [
-        {"ts": utc_iso(now - 1), "event": "job.start", "job_id": "imported", "target": "dev/box1_windows",
-         "type": "exec", "language": "bash", "code": "echo safe"},
-    ])
+    path = audit_fixture(
+        tmp_path / "legacy-audit.jsonl",
+        [
+            {
+                "ts": utc_iso(now - 1),
+                "event": "job.start",
+                "job_id": "imported",
+                "target": "dev/box1_windows",
+                "type": "exec",
+                "language": "bash",
+                "code": "echo safe",
+            },
+        ],
+    )
     backend = Backend()
     jobs = manager(hub, backend)
     enqueue = backend.enqueue
@@ -708,10 +822,20 @@ def test_audit_import_rejects_unflushed_spool_and_never_overwrites_shared_jobs(t
         live = start(jobs, hub)
         jobs.wait(live, 5)
         before = backend.get("job", live.id)
-        path = audit_fixture(tmp_path / "legacy.jsonl", [
-            {"ts": utc_iso(now), "event": "job.start", "job_id": live.id,
-             "target": live.target.id, "type": "exec", "language": "bash", "code": "replace"},
-        ])
+        path = audit_fixture(
+            tmp_path / "legacy.jsonl",
+            [
+                {
+                    "ts": utc_iso(now),
+                    "event": "job.start",
+                    "job_id": live.id,
+                    "target": live.target.id,
+                    "type": "exec",
+                    "language": "bash",
+                    "code": "replace",
+                },
+            ],
+        )
         backend.flush = lambda timeout=10: False
         with pytest.raises(StorageError):
             jobs.import_audit(path, now=now)
@@ -727,12 +851,30 @@ def test_audit_import_skips_malformed_lines_and_finish_only_history(tmp_path):
     hub = Hub(tmp_path)
     now = time.time()
     path = tmp_path / "legacy.jsonl"
-    path.write_text("\n".join([
-        "not-json", "[]", '{"ts":"invalid","event":"job.start"}',
-        json.dumps({"ts": utc_iso(now), "event": "job.finish", "job_id": "finish-only", "state": SUCCEEDED}),
-        json.dumps({"ts": utc_iso(now), "event": "job.start", "job_id": "valid",
-                    "target": "dev/box1_windows", "type": "exec", "language": "bash"}),
-    ]) + "\n", encoding="utf-8")
+    path.write_text(
+        "\n".join(
+            [
+                "not-json",
+                "[]",
+                '{"ts":"invalid","event":"job.start"}',
+                json.dumps(
+                    {"ts": utc_iso(now), "event": "job.finish", "job_id": "finish-only", "state": SUCCEEDED}
+                ),
+                json.dumps(
+                    {
+                        "ts": utc_iso(now),
+                        "event": "job.start",
+                        "job_id": "valid",
+                        "target": "dev/box1_windows",
+                        "type": "exec",
+                        "language": "bash",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     backend = Backend()
     jobs = manager(hub, backend)
     try:
@@ -751,8 +893,13 @@ def test_shared_report_query_count_is_page_bounded_not_per_job(tmp_path):
     at = time.time()
     try:
         for _ in range(150):
-            job = HubJob(job_type="exec", target=target, spec={"language": "bash", "code": "x"},
-                         origin="test", output_limit=0)
+            job = HubJob(
+                job_type="exec",
+                target=target,
+                spec={"language": "bash", "code": "x"},
+                origin="test",
+                output_limit=0,
+            )
             job.created_at = at - 10
             jobs._admit(job)
         metrics = SharedMetrics(backend, hub.registry, clock=lambda: at)
@@ -773,10 +920,18 @@ def test_audit_import_pending_delivery_never_commits_marker(tmp_path):
     backend = Backend()
     jobs = manager(hub, backend)
     now = time.time()
-    path = audit_fixture(tmp_path / "legacy.jsonl", [
-        {"ts": utc_iso(now), "event": "job.start", "job_id": "partial",
-         "target": "dev/box1_windows", "type": "exec"},
-    ])
+    path = audit_fixture(
+        tmp_path / "legacy.jsonl",
+        [
+            {
+                "ts": utc_iso(now),
+                "event": "job.start",
+                "job_id": "partial",
+                "target": "dev/box1_windows",
+                "type": "exec",
+            },
+        ],
+    )
     calls = []
 
     def flush(timeout=10):
@@ -799,10 +954,18 @@ def test_audit_import_detects_source_mutation_before_marker(tmp_path):
     backend = Backend()
     jobs = manager(hub, backend)
     now = time.time()
-    path = audit_fixture(tmp_path / "legacy.jsonl", [
-        {"ts": utc_iso(now), "event": "job.start", "job_id": "partial",
-         "target": "dev/box1_windows", "type": "exec"},
-    ])
+    path = audit_fixture(
+        tmp_path / "legacy.jsonl",
+        [
+            {
+                "ts": utc_iso(now),
+                "event": "job.start",
+                "job_id": "partial",
+                "target": "dev/box1_windows",
+                "type": "exec",
+            },
+        ],
+    )
     enqueue = backend.enqueue
 
     def changing_source(kind, key, payload):
@@ -828,8 +991,15 @@ def test_audit_import_uses_bounded_tail_and_skips_oversized_records(tmp_path, mo
     jobs = manager(hub, backend)
     now = time.time()
     path = tmp_path / "legacy.jsonl"
-    valid = json.dumps({"ts": utc_iso(now), "event": "job.start", "job_id": "tail",
-                       "target": "dev/box1_windows", "type": "exec"})
+    valid = json.dumps(
+        {
+            "ts": utc_iso(now),
+            "event": "job.start",
+            "job_id": "tail",
+            "target": "dev/box1_windows",
+            "type": "exec",
+        }
+    )
     path.write_text("x" * 1500 + "\n" + valid + "\n", encoding="utf-8")
     monkeypatch.setattr(shared, "IMPORT_MAX_BYTES", 512)
     monkeypatch.setattr(shared, "IMPORT_LINE_BYTES", 256)
@@ -848,8 +1018,14 @@ def test_shared_window_report_uses_sql_lower_bound_and_reuses_purpose_snapshot(t
     target = hub.registry.resolve("dev/box1_windows")
     try:
         for seconds in (2 * 86400, 5):
-            job = HubJob(job_type="exec", target=target, spec={"language": "bash", "code": "x"},
-                         origin="test", output_limit=0, purpose="same work")
+            job = HubJob(
+                job_type="exec",
+                target=target,
+                spec={"language": "bash", "code": "x"},
+                origin="test",
+                output_limit=0,
+                purpose="same work",
+            )
             job.created_at = now - seconds
             jobs._admit(job)
         observed = []
@@ -865,8 +1041,7 @@ def test_shared_window_report_uses_sql_lower_bound_and_reuses_purpose_snapshot(t
         assert report["targets"][0]["purpose"]["latest"] == "same work"
         job_pages = [kwargs for kind, kwargs in observed if kind == "job" and kwargs["limit"] == 200]
         assert len(job_pages) == 1 and job_pages[0]["after"] is not None
-        assert all(kwargs.get("after") is not None for kind, kwargs in observed
-                   if kind in ("probe", "call"))
+        assert all(kwargs.get("after") is not None for kind, kwargs in observed if kind in ("probe", "call"))
     finally:
         jobs.close()
 
@@ -876,18 +1051,38 @@ def test_audit_import_redacts_command_secrets_and_finish_local_paths(tmp_path):
     backend = Backend()
     jobs = manager(hub, backend)
     now = time.time()
-    path = audit_fixture(tmp_path / "legacy.jsonl", [
-        {"ts": utc_iso(now - 1), "event": "job.start", "job_id": "transfer",
-         "target": "dev/box1_windows", "type": "download", "local_path": r"C:\sensitive\file",
-         "remote_path": "/remote/file"},
-        {"ts": utc_iso(now), "event": "job.finish", "job_id": "transfer", "state": "failed",
-         "error": r"unable to write C:\sensitive\file"},
-        {"ts": utc_iso(now), "event": "job.start", "job_id": "code",
-         "target": "dev/box1_windows", "type": "exec",
-         "code": "password='do-not-store'; token=abc123; echo SharedAccessSignature sr=secret&sig=abc",
-         "connection_string": "private-database", "cwd": r"C:\another\private\path",
-         "stdout": "do-not-store-arbitrary-output"},
-    ])
+    path = audit_fixture(
+        tmp_path / "legacy.jsonl",
+        [
+            {
+                "ts": utc_iso(now - 1),
+                "event": "job.start",
+                "job_id": "transfer",
+                "target": "dev/box1_windows",
+                "type": "download",
+                "local_path": r"C:\sensitive\file",
+                "remote_path": "/remote/file",
+            },
+            {
+                "ts": utc_iso(now),
+                "event": "job.finish",
+                "job_id": "transfer",
+                "state": "failed",
+                "error": r"unable to write C:\sensitive\file",
+            },
+            {
+                "ts": utc_iso(now),
+                "event": "job.start",
+                "job_id": "code",
+                "target": "dev/box1_windows",
+                "type": "exec",
+                "code": "password='do-not-store'; token=abc123; echo SharedAccessSignature sr=secret&sig=abc",
+                "connection_string": "private-database",
+                "cwd": r"C:\another\private\path",
+                "stdout": "do-not-store-arbitrary-output",
+            },
+        ],
+    )
     try:
         jobs.import_audit(path, now=now)
         serialized = json.dumps(backend.events)
@@ -933,8 +1128,11 @@ class ProcessCursor:
         elif "SELECT payload" in sql and "id='targets'" in sql:
             self.rows = [(self.backend.coordination["config", "targets"],)]
         elif "SELECT kind,id,payload" in sql:
-            self.rows = [(kind, key, raw) for (kind, key), raw in self.backend.coordination.items()
-                         if kind in ("client", "lease", "use")]
+            self.rows = [
+                (kind, key, raw)
+                for (kind, key), raw in self.backend.coordination.items()
+                if kind in ("client", "lease", "use")
+            ]
         elif sql.startswith("INSERT dbo.privy_coordination"):
             kind, key, raw = args
             self.backend.coordination[kind, key] = raw
@@ -973,7 +1171,10 @@ def test_sql_process_harness_starts_and_serves_with_fake_backend():
     )
     process = subprocess.Popen(
         [sys.executable, "-u", "-c", script, "--home", str(home), "--settings", str(settings), "--port", "0"],
-        cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
     lines = queue.Queue()
 
@@ -1008,10 +1209,17 @@ def test_sql_process_harness_starts_and_serves_with_fake_backend():
         response = requests.get(ready["url"] + "/v1", timeout=5)
         assert response.status_code == 200
         assert response.json()["status"]["storage"]["mode"] == "azure_sql"
-        response = requests.post(ready["url"] + "/v1/jobs", json={
-            "target": "sqltest/testbox00_windows", "language": "python", "code": "process verification",
-            "wait_s": 5, "purpose": "SQL harness verification",
-        }, timeout=10)
+        response = requests.post(
+            ready["url"] + "/v1/jobs",
+            json={
+                "target": "sqltest/testbox00_windows",
+                "language": "python",
+                "code": "process verification",
+                "wait_s": 5,
+                "purpose": "SQL harness verification",
+            },
+            timeout=10,
+        )
         assert response.status_code == 200, response.text
         job = response.json()
         assert job["state"] == SUCCEEDED, job.get("error")

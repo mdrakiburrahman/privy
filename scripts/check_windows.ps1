@@ -14,7 +14,7 @@ try {
     }
 
     if (-not $SkipSync) {
-        & uv sync --locked --group dev --group binary
+        & uv sync --locked --group dev --group binary --extra sql
         if ($LASTEXITCODE -ne 0) {
             throw "uv sync failed with exit code $LASTEXITCODE"
         }
@@ -24,7 +24,7 @@ try {
         @("run", "--no-sync")
     }
     else {
-        @("run", "--locked")
+        @("run", "--locked", "--group", "dev", "--group", "binary", "--extra", "sql")
     }
 
     & uv @runArguments ruff check .
