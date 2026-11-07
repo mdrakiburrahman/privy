@@ -4,7 +4,7 @@ param(
     [string] $ResourceGroupName = "privy",
     [string] $Location = "canadacentral",
     [ValidatePattern('^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')]
-    [string] $ServerName = "privy-ce859648-sql",
+    [string] $ServerName = "privy-sql",
     [ValidatePattern('^[A-Za-z][A-Za-z0-9_]{0,127}$')]
     [string] $DatabaseName = "privy",
     [ValidatePattern('^[A-Za-z][A-Za-z0-9_]{0,127}$')]
