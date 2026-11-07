@@ -165,8 +165,18 @@ class HubApp:
             if method not in ("GET", "HEAD"):
                 response = error_response(405, "method_not_allowed", "use GET", {"Allow": "GET, HEAD"})
             else:
+                backend = getattr(self.service.jobs, "backend", None)
+                if backend is not None:
+                    from privy.hub.sql_store import StorageError
+
+                    try:
+                        storage = backend.health()
+                    except StorageError:
+                        return error_response(503, "storage_unavailable", "Authoritative SQL backing store is unavailable")
+                else:
+                    storage = {"mode": "file"}
                 response = HttpResponse(
-                    200, {"status": "ok", "service": "privy-hub", "version": self.service.version}
+                    200, {"status": "ok", "service": "privy-hub", "version": self.service.version, "storage": storage}
                 )
             response.surface = "health"
             return response
@@ -329,6 +339,7 @@ class HubRuntime:
     app: HubApp
     home: Path
     relays_file: Path
+    storage: Any = None
 
     @property
     def url(self) -> str:
@@ -346,6 +357,9 @@ class HubRuntime:
         self.server.shutdown()
         self.server.server_close()
         self.service.listener_infos.flush()
+        if self.storage is not None:
+            self.service.jobs.close()
+            self.storage.close()
 
 
 def build_hub(
@@ -358,6 +372,8 @@ def build_hub(
     probe_ttl_s: float = DEFAULT_PROBE_TTL_S,
     version: str,
     client_factory: Any = None,
+    settings_file: Path | None = None,
+    sql_connect: Any = None,
 ) -> HubRuntime:
     """Create the hub's components and bind its HTTP server (without serving yet)."""
     ensure_home(home)
@@ -365,20 +381,50 @@ def build_hub(
     store = RelaysStore(relays_path)
     store.snapshot()
     registry = TargetRegistry(store, client_factory=client_factory, probe_ttl_s=probe_ttl_s)
-    jobs = JobManager(registry, max_running=max_jobs, audit=AuditLog(home / AUDIT_FILENAME))
-    leases = LeaseStore(registry, home=home, audit=jobs.audit)
+    from privy.hub.settings import load_settings
+
+    sql_settings = load_settings(home, settings_file)
+    storage = None
+    if sql_settings is None:
+        jobs = JobManager(registry, max_running=max_jobs, audit=AuditLog(home / AUDIT_FILENAME))
+        leases = LeaseStore(registry, home=home, audit=jobs.audit)
+        listener_infos = ListenerInfoStore(home)
+    else:
+        from privy.hub.shared_jobs import SharedAuditLog, SharedJobManager
+        from privy.hub.sql_store import SqlBackend
+
+        storage = SqlBackend(sql_settings, home, connect=sql_connect)
+        try:
+            jobs = SharedJobManager(registry, backend=storage, max_running=max_jobs, audit=SharedAuditLog(storage))
+            leases = LeaseStore(registry, home=home, audit=jobs.audit, sql_backend=storage)
+            listener_infos = ListenerInfoStore(home, backend=storage)
+            jobs.import_audit(home / AUDIT_FILENAME)
+        except BaseException:
+            storage.close()
+            raise
     service = HubService(
         registry=registry,
         jobs=jobs,
         version=version,
         leases=leases,
-        listener_infos=ListenerInfoStore(home),
+        listener_infos=listener_infos,
     )
-    service.metrics.restore(home / AUDIT_FILENAME)
+    if storage is None:
+        service.metrics.restore(home / AUDIT_FILENAME)
+    else:
+        from privy.hub.shared_metrics import SharedHubMetrics
+
+        service.metrics = SharedHubMetrics(storage, registry)
     app = HubApp(service, port=port)
-    server = HubHTTPServer((host, port), app)
+    try:
+        server = HubHTTPServer((host, port), app)
+    except BaseException:
+        if storage is not None:
+            jobs.close()
+            storage.close()
+        raise
     app.set_port(server.server_address[1])
-    runtime = HubRuntime(service=service, server=server, app=app, home=home, relays_file=relays_path)
+    runtime = HubRuntime(service=service, server=server, app=app, home=home, relays_file=relays_path, storage=storage)
     write_state(
         home,
         {

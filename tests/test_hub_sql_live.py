@@ -1,0 +1,240 @@
+"""Opt-in real Azure SQL tests. Never use a production database or live hub."""
+
+from __future__ import annotations
+
+import base64
+import os
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from hub_fakes import Hub, relays_document, write_relays
+
+from privy.hub.leases import LeaseError, LeaseStore
+from privy.hub.settings import load_settings
+from privy.hub.sql_store import AzureSqlConnections, SqlBackend, StorageError
+
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("PRIVY_SQL_TEST_SETTINGS"), reason="requires isolated Azure SQL test settings"
+)
+
+
+class TestConnections:
+    """Bounded retries for this test environment's rotating authorized egress."""
+
+    __test__ = False
+
+    def __init__(self, settings):
+        self.pool = AzureSqlConnections(settings)
+
+    def __call__(self):
+        for attempt in range(6):
+            try:
+                return self.pool()
+            except StorageError as exc:
+                if attempt == 5 or "40615" not in str(exc.__cause__):
+                    raise
+                time.sleep(0.5)
+        raise AssertionError("bounded connection attempts exhausted")
+
+    def close(self):
+        self.pool.close()
+
+
+@pytest.fixture(scope="module")
+def stores(tmp_path_factory):
+    tmp_path = tmp_path_factory.mktemp("isolated-sql")
+    settings = load_settings(tmp_path, Path(os.environ["PRIVY_SQL_TEST_SETTINGS"]))
+    assert settings is not None and settings.database.endswith("_test"), "production database is forbidden"
+    hub = Hub(tmp_path)
+    document = relays_document()
+    document["relays"] = [
+        {
+            "name": "sqltest",
+            "namespace": "simulated.invalid",
+            "keyrule": "test-only",
+            "key": "not-a-real-credential",
+            "hybrid_connections": [f"testbox{i:02d}_windows" for i in range(20)],
+        }
+    ]
+    write_relays(hub.relays_file, document)
+    # Hub's fake client factory returns a listener for unknown fixture targets.
+    hub.service.invoke("list_targets", {}, origin="test")
+    one = SqlBackend(settings, tmp_path, connect=TestConnections(settings), start_worker=False)
+    other_home = tmp_path / "other"
+    other_home.mkdir()
+    two = SqlBackend(settings, other_home, connect=TestConnections(settings), start_worker=False)
+    try:
+        yield (
+            LeaseStore(hub.registry, home=tmp_path, sql_backend=one),
+            LeaseStore(hub.registry, home=other_home, sql_backend=two),
+            one,
+            two,
+        )
+    finally:
+        one.close()
+        two.close()
+
+
+def test_real_sql_racing_admission_renew_release_and_session_idempotency(stores):
+    a, b, _, _ = stores
+    session = uuid.uuid4().hex
+    registered = a.register_client("race-owner", session_id=session)
+    assert b.register_client("same-session", session_id=session)["client_id"] == registered["client_id"]
+    other = b.register_client("race-other")["client_id"]
+    barrier = threading.Barrier(2)
+
+    def allocate(store, client):
+        barrier.wait()
+        try:
+            return store.acquire(client, target="sqltest/testbox00")
+        except LeaseError as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(2) as pool:
+        results = list(pool.map(lambda args: allocate(*args), [(a, registered["client_id"]), (b, other)]))
+    winners = [r for r in results if isinstance(r, dict)]
+    assert len(winners) == 1 and "group_leased" in results
+    winner = winners[0]
+    assert b.renew(winner["lease_id"], winner["client_id"])["state"] == "active"
+    a.release(winner["lease_id"], winner["client_id"])
+    replacement = b.acquire(other, target="sqltest/testbox00")
+    with pytest.raises(LeaseError) as exc:
+        a.renew(winner["lease_id"], winner["client_id"])
+    assert exc.value.code == "lease_released"
+    b.release(replacement["lease_id"], other)
+
+
+def test_real_sql_pins_require_executing_owner_and_survive_new_incarnation(stores):
+    a, b, one, two = stores
+    client = a.register_client("pin-test")["client_id"]
+    lease = a.acquire(client, target="sqltest/testbox01")
+    job = SimpleNamespace(
+        id=uuid.uuid4().hex,
+        target=a.registry.resolve("sqltest/testbox01_windows"),
+        lease_id=lease["lease_id"],
+        origin="test",
+        purpose=None,
+        state="running",
+    )
+    a.job_started(job)
+    try:
+        assert b.get_lease(lease["lease_id"])["running_jobs"] == [job.id]
+        with pytest.raises(LeaseError, match="pinned"):
+            b.release(lease["lease_id"], force=True)
+        with pytest.raises(LeaseError, match="executing hub"):
+            b.job_finished(job)
+        assert a.get_lease(lease["lease_id"])["running_jobs"] == [job.id]
+        # Stale heartbeat cannot unpin remote work.
+        with one.transaction() as cursor:
+            cursor.execute(
+                "UPDATE dbo.privy_coordination SET updated=DATEADD(day,-8,SYSUTCDATETIME()) WHERE kind='hub' AND id=?",
+                one.owner,
+            )
+        # Even terminal-looking old metadata cannot defeat an unresolved work pin.
+        old = time.time() - 8 * 86400
+        one.put("job", job.id, {"job_id": job.id, "state": "error", "owner": one.owner, "created_at": old})
+        one.put("audit", job.id + ":audit", {"job_id": job.id, "created_at": old})
+        one.put("broadcast", job.id + ":broadcast", {"job_ids": [job.id], "created_at": old})
+        two.collect()
+        assert b.get_lease(lease["lease_id"])["running_jobs"] == [job.id]
+        assert two.get("job", job.id) is not None
+        assert two.get("audit", job.id + ":audit") is not None
+        assert two.get("broadcast", job.id + ":broadcast") is not None
+    finally:
+        job.state = "succeeded"
+        a.job_finished(job)
+        a.release(lease["lease_id"], client)
+        one.delete("job", job.id)
+        one.delete("audit", job.id + ":audit")
+        one.delete("broadcast", job.id + ":broadcast")
+
+
+def test_real_sql_outage_replays_without_independent_file_fallback(stores):
+    a, b, one, two = stores
+    saved = one._connect
+
+    def unavailable():
+        raise StorageError("test-owned connection outage")
+
+    one._connect = unavailable
+    key = uuid.uuid4().hex
+    one.enqueue("audit", key, {"event": "outage-test", "created_at": 1_800_000_000})
+    assert one.flush() is False
+    with pytest.raises(StorageError):
+        a.register_client("must-not-register-offline")
+    assert one.outbox.status()["pending_writes"] == 1
+    one._connect = saved
+    assert one.flush(timeout=30)
+    assert two.get("audit", key)["event"] == "outage-test"
+    two.delete("audit", key)
+
+
+def test_real_sql_committed_unacked_batch_replay_is_idempotent(stores, monkeypatch):
+    _, _, one, two = stores
+    key = uuid.uuid4().hex
+    payload = {"job_id": key, "owner": one.owner, "state": "running", "created_at": time.time()}
+    one.enqueue("job", key, payload)
+    one.enqueue("output", key + ":0", {
+        "job_id": key, "index": 0, "stream": "stdout", "start": 0, "end": 5,
+        "data": base64.b64encode(b"hello").decode(),
+    })
+    one.enqueue("job", key, {**payload, "state": "succeeded"})
+    ack = one.outbox.ack_batch
+
+    def crash_before_ack(sequences):
+        raise StorageError("test crash after SQL commit before local acknowledgment")
+
+    monkeypatch.setattr(one.outbox, "ack_batch", crash_before_ack)
+    with pytest.raises(StorageError):
+        one._drain()
+    assert two.get("job", key)["state"] == "succeeded"
+    assert one.outbox.status()["pending_writes"] == 3
+    monkeypatch.setattr(one.outbox, "ack_batch", ack)
+    assert one.flush(timeout=30)
+    assert len(two.output(key, "stdout", 0, 100)) == 1
+    assert two.get("job", key)["state"] == "succeeded"
+    with one.transaction() as cursor:
+        cursor.execute("DELETE dbo.privy_output WHERE job_id=?", key)
+    one.delete("job", key)
+
+
+def test_real_sql_cancel_acknowledgment_and_cursors_are_owner_coordinated(stores):
+    _, _, one, two = stores
+    key = uuid.uuid4().hex
+    one.put("job", key, {"job_id": key, "owner": one.owner, "state": "running", "created_at": time.time()})
+    assert two.request_cancel(key)["acknowledged"] is False
+    assert key in one.pending_cancels() and key not in two.pending_cancels()
+    two.ack_cancel(key)
+    assert two.request_cancel(key)["acknowledged"] is False
+    one.ack_cancel(key)
+    assert two.request_cancel(key)["acknowledged"] is True
+    assert one.advance_cursor(key, "stdout", 10) == 0
+    assert two.advance_cursor(key, "stdout", 5) == 10
+    assert two.advance_cursor(key, "stdout", 20) == 10
+    assert one.advance_cursor(key, "stdout", 0) == 20
+    with one.transaction() as cursor:
+        cursor.execute("DELETE dbo.privy_cancels WHERE job_id=?", key)
+        cursor.execute("DELETE dbo.privy_cursors WHERE job_id=?", key)
+    one.delete("job", key)
+
+
+def test_real_sql_summary_scan_has_no_gaps_at_equal_timestamp_boundaries(stores):
+    _, _, one, two = stores
+    key = uuid.uuid4().hex
+    at = time.time()
+    for index in range(1103):
+        one.enqueue("audit", f"{key}:{index:04d}", {"id": f"{key}:{index:04d}", "created_at": at, "target": key})
+    try:
+        assert one.flush(timeout=60)
+        rows = list(two.scan("audit", target=key, after=at, before=at + 1))
+        assert [row["id"] for row in rows] == [f"{key}:{index:04d}" for index in reversed(range(1103))]
+        assert list(two.scan("audit", target=key, before=at)) == []
+    finally:
+        for _ in range(4):
+            with one.transaction() as cursor:
+                cursor.execute("DELETE TOP(300) dbo.privy_records WHERE kind='audit' AND target=?", key)

@@ -1,0 +1,803 @@
+"""Azure SQL coordination and ordered, restart-replayable local write-behind.
+
+SQL is the authority. The SQLite outbox is a local delivery journal, not a
+leasing fallback. Acknowledgments follow SQL commit and replay is idempotent.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import logging
+import sqlite3
+import struct
+import threading
+import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+from privy.hub.settings import SqlSettings
+
+log = logging.getLogger("privy.hub")
+
+
+class StorageError(RuntimeError):
+    """An authoritative operation or durable delivery could not complete."""
+
+
+class DurableOutbox:
+    def __init__(self, path: Path, *, max_bytes: int) -> None:
+        self._lock = threading.RLock()
+        self._db = sqlite3.connect(path, check_same_thread=False, timeout=10)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=FULL")
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS pending (seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, key TEXT, payload TEXT, owner TEXT, size INTEGER)"
+        )
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS usage(value INTEGER NOT NULL, rejected INTEGER NOT NULL DEFAULT 0)"
+        )
+        if "rejected" not in {r[1] for r in self._db.execute("PRAGMA table_info(usage)")}:
+            self._db.execute("ALTER TABLE usage ADD COLUMN rejected INTEGER NOT NULL DEFAULT 0")
+        self._db.execute(
+            "INSERT INTO usage(value) SELECT COALESCE(SUM(size),0) FROM pending HAVING NOT EXISTS(SELECT 1 FROM usage)"
+        )
+        self._db.execute(
+            "CREATE TRIGGER IF NOT EXISTS usage_insert AFTER INSERT ON pending BEGIN UPDATE usage SET value=value+NEW.size; END"
+        )
+        self._db.execute(
+            "CREATE TRIGGER IF NOT EXISTS usage_delete AFTER DELETE ON pending BEGIN UPDATE usage SET value=value-OLD.size; END"
+        )
+        self._db.commit()
+        self.max_bytes = max_bytes
+
+    def append(self, kind: str, key: str, payload: dict, owner: str) -> int:
+        raw = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+        size = len(raw.encode()) + len(key.encode()) + len(kind.encode()) + len(owner.encode())
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            used = self._db.execute("SELECT value FROM usage").fetchone()[0]
+            if used + size > self.max_bytes:
+                self._db.execute("UPDATE usage SET rejected=rejected+1")
+                self._db.commit()
+                log.error("SQL delivery outbox is full; rejecting write without dropping pending data")
+                raise StorageError("SQL delivery outbox is full; new writes rejected")
+            try:
+                cursor = self._db.execute(
+                    "INSERT INTO pending(kind,key,payload,owner,size) VALUES(?,?,?,?,?)",
+                    (kind, key, raw, owner, size),
+                )
+                self._db.commit()
+                return cursor.lastrowid
+            except sqlite3.Error as exc:
+                self._db.rollback()
+                log.error("Cannot durably append SQL delivery journal; rejecting write")
+                raise StorageError("Cannot durably append SQL delivery journal") from exc
+
+    def pending(self, limit: int = 100) -> list:
+        with self._lock:
+            return self._db.execute(
+                "SELECT seq,kind,key,payload,owner FROM pending ORDER BY seq LIMIT ?", (limit,)
+            ).fetchall()
+
+    def ack(self, seq: int) -> None:
+        with self._lock:
+            self._db.execute("DELETE FROM pending WHERE seq=?", (seq,))
+            self._db.commit()
+
+    def ack_batch(self, sequences: list[int]) -> None:
+        with self._lock:
+            self._db.executemany("DELETE FROM pending WHERE seq=?", ((seq,) for seq in sequences))
+            self._db.commit()
+
+    def status(self) -> dict:
+        with self._lock:
+            count, size = self._db.execute("SELECT COUNT(*),COALESCE(SUM(size),0) FROM pending").fetchone()
+            return {
+                "pending_writes": count,
+                "pending_bytes": size,
+                "max_bytes": self.max_bytes,
+                "rejected_writes": self._db.execute("SELECT rejected FROM usage").fetchone()[0],
+            }
+
+    def close(self) -> None:
+        with self._lock:
+            self._db.close()
+
+
+class AzureSqlConnections:
+    """Each transaction gets its own encrypted connection and a fresh-enough CLI token."""
+
+    def __init__(self, settings: SqlSettings) -> None:
+        try:
+            import pyodbc
+            from azure.identity import AzureCliCredential
+        except ImportError as exc:
+            raise StorageError("Azure SQL mode requires privy[sql] and Microsoft ODBC Driver 18") from exc
+        if settings.driver not in pyodbc.drivers():
+            raise StorageError("Install Microsoft ODBC Driver 18 for SQL Server to use Azure SQL mode")
+        self._odbc = pyodbc
+        self._credential = AzureCliCredential(process_timeout=30)
+        self._token = None
+        self._lock = threading.Lock()
+        self._slots = threading.BoundedSemaphore(8)
+        self._idle: list[tuple[Any, float]] = []
+        self._closed = False
+        self.settings = settings
+
+    def __call__(self):
+        if not self._slots.acquire(timeout=15):
+            raise StorageError("Azure SQL connection pool is busy; retry the request")
+        try:
+            return self._checkout()
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def _checkout(self):
+        with self._lock:
+            if self._closed:
+                raise StorageError("Azure SQL connection pool has closed")
+            while self._idle:
+                connection, expiry = self._idle.pop()
+                if expiry > time.time() + 300:
+                    return _PooledConnection(self, connection, expiry)
+                connection.close()
+            if self._token is None or self._token.expires_on <= time.time() + 300:
+                try:
+                    self._token = self._credential.get_token("https://database.windows.net/.default")
+                except Exception as exc:
+                    raise StorageError(
+                        "AzureCliCredential could not obtain an Azure SQL token; sign in with Azure CLI"
+                    ) from exc
+            raw = self._token.token.encode("utf-16-le")
+            token = struct.pack("<I", len(raw)) + raw
+            expiry = self._token.expires_on
+        s = self.settings
+        try:
+            connection = self._odbc.connect(
+                f"Driver={{{s.driver}}};Server=tcp:{s.server},1433;Database={s.database};"
+                "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=10;",
+                attrs_before={1256: token},
+                autocommit=False,
+            )
+            connection.timeout = 15
+            return _PooledConnection(self, connection, expiry)
+        except Exception as exc:
+            raise StorageError("Cannot connect to authoritative Azure SQL backing store") from exc
+
+    def _release(self, connection, expiry: float, broken: bool) -> None:
+        try:
+            with self._lock:
+                if broken or self._closed or expiry <= time.time() + 300:
+                    connection.close()
+                else:
+                    self._idle.append((connection, expiry))
+        finally:
+            self._slots.release()
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            for connection, _ in self._idle:
+                connection.close()
+            self._idle.clear()
+
+
+class _PooledConnection:
+    def __init__(self, pool: AzureSqlConnections, connection, expiry: float) -> None:
+        self._pool, self._connection, self._expiry = pool, connection, expiry
+        self._broken = False
+        self._returned = False
+
+    def cursor(self):
+        return self._connection.cursor()
+
+    def commit(self) -> None:
+        self._connection.commit()
+
+    def rollback(self) -> None:
+        try:
+            self._connection.rollback()
+        except Exception:
+            self._broken = True
+            raise
+
+    def invalidate(self) -> None:
+        self._broken = True
+
+    def close(self) -> None:
+        if not self._returned:
+            self._returned = True
+            self._pool._release(self._connection, self._expiry, self._broken)
+
+
+_SCHEMA = """
+IF OBJECT_ID('dbo.privy_schema') IS NULL
+    CREATE TABLE dbo.privy_schema(version int NOT NULL);
+IF NOT EXISTS(SELECT 1 FROM dbo.privy_schema)
+    INSERT dbo.privy_schema VALUES(1);
+IF OBJECT_ID('dbo.privy_records') IS NULL
+BEGIN
+    CREATE TABLE dbo.privy_records(
+        kind nvarchar(32) NOT NULL, id nvarchar(400) NOT NULL,
+        payload nvarchar(max) NOT NULL, owner nvarchar(64) NOT NULL,
+        revision bigint NOT NULL, at float NOT NULL,
+        target nvarchar(300) NULL, lease_id nvarchar(80) NULL, client_id nvarchar(80) NULL,
+        updated datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_privy_records PRIMARY KEY(kind,id));
+    CREATE INDEX IX_privy_records_at ON dbo.privy_records(kind,at DESC);
+    CREATE INDEX IX_privy_records_target ON dbo.privy_records(kind,target,at DESC);
+    CREATE INDEX IX_privy_records_lease ON dbo.privy_records(kind,lease_id,at DESC);
+    CREATE INDEX IX_privy_records_client ON dbo.privy_records(kind,client_id,at DESC);
+END;
+IF OBJECT_ID('dbo.privy_coordination') IS NULL
+BEGIN
+    CREATE TABLE dbo.privy_coordination(
+        kind nvarchar(32) NOT NULL, id nvarchar(400) NOT NULL, payload nvarchar(max) NOT NULL,
+        ordinal bigint IDENTITY NOT NULL, updated datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_privy_coordination PRIMARY KEY(kind,id));
+    CREATE INDEX IX_privy_coordination_gc ON dbo.privy_coordination(kind,updated);
+END;
+IF OBJECT_ID('dbo.privy_cancels') IS NULL
+    CREATE TABLE dbo.privy_cancels(
+        job_id nvarchar(80) PRIMARY KEY, owner nvarchar(64) NOT NULL,
+        requested datetime2 NOT NULL DEFAULT SYSUTCDATETIME(), acknowledged datetime2 NULL);
+IF OBJECT_ID('dbo.privy_cursors') IS NULL
+    CREATE TABLE dbo.privy_cursors(job_id nvarchar(80), stream nvarchar(8), offset bigint NOT NULL,
+        updated datetime2 NOT NULL DEFAULT SYSUTCDATETIME(), PRIMARY KEY(job_id,stream));
+IF OBJECT_ID('dbo.privy_output') IS NULL
+BEGIN
+    CREATE TABLE dbo.privy_output(job_id nvarchar(80), chunk_index bigint, stream nvarchar(8),
+        start_offset bigint NOT NULL, end_offset bigint NOT NULL, payload nvarchar(max) NOT NULL,
+        PRIMARY KEY(job_id,chunk_index));
+    CREATE INDEX IX_privy_output_read ON dbo.privy_output(job_id,stream,start_offset) INCLUDE(end_offset);
+END;
+"""
+
+_FLUSH_BATCH = """
+DECLARE @rows TABLE(kind nvarchar(32), id nvarchar(400), payload nvarchar(max),
+    owner nvarchar(64), revision bigint, at float, target nvarchar(300),
+    lease_id nvarchar(80), client_id nvarchar(80));
+INSERT @rows SELECT * FROM OPENJSON(?)
+WITH(kind nvarchar(32), id nvarchar(400), payload nvarchar(max) AS JSON,
+     owner nvarchar(64), revision bigint, at float, target nvarchar(300),
+     lease_id nvarchar(80), client_id nvarchar(80));
+DECLARE @latest TABLE(kind nvarchar(32), id nvarchar(400), payload nvarchar(max),
+    owner nvarchar(64), revision bigint, at float, target nvarchar(300),
+    lease_id nvarchar(80), client_id nvarchar(80), PRIMARY KEY(kind,id));
+INSERT @latest SELECT r.* FROM @rows r WHERE revision=(
+    SELECT MAX(revision) FROM @rows p WHERE p.kind=r.kind AND p.id=r.id);
+IF EXISTS(SELECT 1 FROM @latest n JOIN dbo.privy_records p WITH(UPDLOCK,HOLDLOCK)
+    ON p.kind=n.kind AND p.id=n.id WHERE n.kind='job' AND p.owner<>n.owner)
+    THROW 51001, 'Privy job ownership conflict', 1;
+UPDATE p SET payload=n.payload,owner=n.owner,revision=n.revision,at=n.at,
+    target=n.target,lease_id=n.lease_id,client_id=n.client_id,updated=SYSUTCDATETIME()
+FROM dbo.privy_records p WITH(UPDLOCK,HOLDLOCK)
+JOIN @latest n ON p.kind=n.kind AND p.id=n.id
+WHERE n.kind<>'output' AND (
+    (p.owner=n.owner AND p.revision<n.revision) OR
+    (n.kind<>'job' AND p.owner<>n.owner AND p.at<n.at));
+INSERT dbo.privy_records(kind,id,payload,owner,revision,at,target,lease_id,client_id)
+SELECT n.kind,n.id,n.payload,n.owner,n.revision,n.at,n.target,n.lease_id,n.client_id
+FROM @latest n WHERE n.kind<>'output' AND NOT EXISTS(
+    SELECT 1 FROM dbo.privy_records p WITH(UPDLOCK,HOLDLOCK) WHERE p.kind=n.kind AND p.id=n.id);
+INSERT dbo.privy_output(job_id,chunk_index,stream,start_offset,end_offset,payload)
+SELECT JSON_VALUE(n.payload,'$.job_id'),CAST(JSON_VALUE(n.payload,'$.index') AS bigint),
+    JSON_VALUE(n.payload,'$.stream'),CAST(JSON_VALUE(n.payload,'$.start') AS bigint),
+    CAST(JSON_VALUE(n.payload,'$.end') AS bigint),n.payload
+FROM @latest n WHERE n.kind='output' AND NOT EXISTS(
+    SELECT 1 FROM dbo.privy_output p WITH(UPDLOCK,HOLDLOCK)
+    WHERE p.job_id=JSON_VALUE(n.payload,'$.job_id')
+      AND p.chunk_index=CAST(JSON_VALUE(n.payload,'$.index') AS bigint));
+"""
+
+
+class SqlBackend:
+    def __init__(self, settings: SqlSettings, home: Path, *, connect=None, start_worker: bool = True) -> None:
+        self.settings = settings
+        self.owner = uuid.uuid4().hex
+        self._connect = connect or AzureSqlConnections(settings)
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._flush_lock = threading.Lock()
+        self._last_error: str | None = None
+        self._thread: threading.Thread | None = None
+        self.bootstrap()
+        self.outbox = DurableOutbox(home / "sql-outbox.sqlite3", max_bytes=settings.outbox_max_bytes)
+        log.info("Storage: azure_sql (%s/%s); owner incarnation %s; no file fallback",
+                 settings.server, settings.database, self.owner)
+        if start_worker:
+            self._thread = threading.Thread(target=self._work, name="privy-sql-delivery", daemon=True)
+            self._thread.start()
+
+    @contextmanager
+    def transaction(self, lock: str | None = None):
+        connection = self._connect()
+        try:
+            cursor = connection.cursor()
+            cursor.execute("SET NOCOUNT ON; SET XACT_ABORT ON; SET LOCK_TIMEOUT 15000;")
+            if lock:
+                cursor.execute(
+                    "DECLARE @r int; EXEC @r=sys.sp_getapplock @Resource=?, @LockMode='Exclusive', "
+                    "@LockOwner='Transaction', @LockTimeout=15000; SELECT @r;",
+                    lock,
+                )
+                if cursor.fetchone()[0] < 0:
+                    raise StorageError("SQL coordination lock timed out")
+            yield cursor
+            connection.commit()
+        except BaseException as exc:
+            if type(exc).__module__ == "pyodbc" and hasattr(connection, "invalidate"):
+                connection.invalidate()
+            try:
+                connection.rollback()
+            except Exception as rollback_error:
+                log.error("Azure SQL rollback failed; connection discarded, no file fallback")
+                raise StorageError("Authoritative SQL transaction rollback failed") from rollback_error
+            if type(exc).__module__ == "pyodbc":
+                raise StorageError("Authoritative Azure SQL transaction failed; no file fallback") from exc
+            raise
+        finally:
+            connection.close()
+
+    def bootstrap(self) -> None:
+        with self.transaction("privy.schema.v1") as cursor:
+            cursor.execute(_SCHEMA)
+            cursor.execute("SELECT version FROM dbo.privy_schema")
+            versions = [row[0] for row in cursor.fetchall()]
+            if versions != [1]:
+                raise StorageError("Unsupported Privy SQL schema version")
+            cursor.execute("SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id='storage'")
+            row = cursor.fetchone()
+            config = {"retention_days": self.settings.retention_days}
+            if row and json.loads(row[0]) != config:
+                raise StorageError("SQL storage configuration differs between hubs")
+            if not row:
+                cursor.execute(
+                    "INSERT dbo.privy_coordination(kind,id,payload) VALUES('config','storage',?)",
+                    json.dumps(config),
+                )
+
+    def check_config(self, name: str, payload: dict) -> None:
+        with self.transaction("privy.leases") as cursor:
+            cursor.execute("SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id=?", name)
+            row = cursor.fetchone()
+            if row and json.loads(row[0]) != payload:
+                raise StorageError(
+                    f"Shared hub {name} configuration differs; refusing independent coordination"
+                )
+            if not row:
+                cursor.execute(
+                    "INSERT dbo.privy_coordination(kind,id,payload) VALUES('config',?,?)",
+                    name,
+                    json.dumps(payload, sort_keys=True),
+                )
+
+    def enqueue(self, kind: str, key: str, payload: dict) -> None:
+        self._enqueue(kind, key, payload)
+
+    def _enqueue(self, kind: str, key: str, payload: dict) -> int:
+        if not kind or len(kind) > 32 or not key or len(key) > 400:
+            raise StorageError("SQL record identity is invalid")
+        result = self.outbox.append(kind, key, payload, self.owner)
+        self._wake.set()
+        return result
+
+    def put(self, kind: str, key: str, payload: dict) -> None:
+        seq = self._enqueue(kind, key, payload)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            self._drain()
+            pending = self.outbox.pending(1)
+            if not pending or pending[0][0] > seq:
+                return
+        raise StorageError("SQL synchronous write did not complete; retained in delivery journal")
+
+    def _drain(self) -> None:
+        with self._flush_lock:
+            rows = self.outbox.pending(100)
+            if not rows:
+                return
+            batch = []
+            for seq, kind, key, raw, owner in rows:
+                payload = json.loads(raw)
+                at = payload.get("created_at", payload.get("at", time.time()))
+                if not isinstance(at, (int, float)):
+                    at = time.time()
+                batch.append({"kind": kind, "id": key, "payload": payload, "owner": owner,
+                              "revision": seq, "at": at, "target": payload.get("target"),
+                              "lease_id": payload.get("lease_id"), "client_id": payload.get("client_id")})
+            with self.transaction() as cursor:
+                cursor.execute(_FLUSH_BATCH, json.dumps(batch, ensure_ascii=True))
+            self.outbox.ack_batch([row[0] for row in rows])
+            self._last_error = None
+
+    def get(self, kind: str, key: str) -> dict | None:
+        with self.transaction() as cursor:
+            cursor.execute("SELECT payload FROM dbo.privy_records WHERE kind=? AND id=?", kind, key)
+            row = cursor.fetchone()
+            return json.loads(row[0]) if row else None
+
+    def list(
+        self,
+        kind: str,
+        *,
+        limit: int = 200,
+        before: float | None = None,
+        after: float | None = None,
+        target: str | None = None,
+        lease_id: str | None = None,
+        client_id: str | None = None,
+    ) -> list[dict]:
+        if not 1 <= limit <= 100_000:
+            raise StorageError("SQL page size must be between 1 and 100000")
+        clauses, params = ["kind=?"], [kind]
+        for column, value in (("target", target), ("lease_id", lease_id), ("client_id", client_id)):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                params.append(value)
+        if before is not None:
+            clauses.append("at<?")
+            params.append(before)
+        if after is not None:
+            clauses.append("at>=?")
+            params.append(after)
+        with self.transaction() as cursor:
+            cursor.execute(
+                f"SELECT TOP (?) payload FROM dbo.privy_records WHERE {' AND '.join(clauses)} ORDER BY at DESC,id DESC",
+                limit,
+                *params,
+            )
+            return [json.loads(row[0]) for row in cursor.fetchall()]
+
+    def count_jobs(self) -> dict:
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT JSON_VALUE(payload,'$.state'),COUNT_BIG(*) FROM dbo.privy_records WHERE kind='job' GROUP BY JSON_VALUE(payload,'$.state')"
+            )
+            counts = {row[0]: int(row[1]) for row in cursor.fetchall()}
+            return {
+                "queued": counts.get("queued", 0),
+                "running": counts.get("running", 0),
+                "retained": sum(counts.values()),
+            }
+
+    def scan(self, kind: str, *, before=None, after=None, target=None, lease_id=None, client_id=None):
+        clauses, params = ["kind=?"], [kind]
+        for column, value in (("target", target), ("lease_id", lease_id), ("client_id", client_id)):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                params.append(value)
+        if before is not None:
+            clauses.append("at<?")
+            params.append(before)
+        if after is not None:
+            clauses.append("at>=?")
+            params.append(after)
+        boundary = None
+        while True:
+            page_clauses, page_params = list(clauses), list(params)
+            if boundary is not None:
+                at, key = boundary
+                page_clauses.append("(at<? OR (at=? AND id<?))")
+                page_params.extend((at, at, key))
+            with self.transaction() as cursor:
+                cursor.execute(
+                    f"SELECT TOP (1000) at,id,payload FROM dbo.privy_records "
+                    f"WHERE {' AND '.join(page_clauses)} ORDER BY at DESC,id DESC",
+                    *page_params,
+                )
+                page = cursor.fetchall()
+            yield from (json.loads(row[2]) for row in page)
+            if len(page) < 1000:
+                return
+            boundary = page[-1][0], page[-1][1]
+
+    def latest_before(self, before: float) -> list[dict]:
+        with self.transaction() as cursor:
+            cursor.execute(
+                "WITH ranked AS (SELECT payload,ROW_NUMBER() OVER(PARTITION BY kind,target ORDER BY at DESC,id DESC) AS n "
+                "FROM dbo.privy_records WHERE kind IN('job','purpose') AND at<?) SELECT payload FROM ranked WHERE n=1",
+                before,
+            )
+            return [json.loads(row[0]) for row in cursor.fetchall()]
+
+    def health(self) -> dict:
+        with self.transaction() as cursor:
+            cursor.execute("SELECT 1")
+            if cursor.fetchone()[0] != 1:
+                raise StorageError("Azure SQL health probe failed")
+        return self.status()
+
+    def delete(self, kind: str, key: str) -> None:
+        with self.transaction() as cursor:
+            cursor.execute("DELETE dbo.privy_records WHERE kind=? AND id=?", kind, key)
+
+    def output(self, job_id: str, stream: str, offset: int, limit: int) -> list[dict]:
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT payload FROM dbo.privy_output WHERE job_id=? AND stream=? AND end_offset>? AND start_offset<? ORDER BY start_offset",
+                job_id,
+                stream,
+                offset,
+                offset + limit,
+            )
+            return [json.loads(row[0]) for row in cursor.fetchall()]
+
+    def pieces(self, job_id: str, index: int, limit: int = 200) -> list[dict]:
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT TOP (?) payload FROM dbo.privy_output WHERE job_id=? AND chunk_index>=? ORDER BY chunk_index",
+                limit,
+                job_id,
+                index,
+            )
+            return [json.loads(row[0]) for row in cursor.fetchall()]
+
+    def advance_cursor(self, job_id: str, stream: str, end: int) -> int:
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT offset FROM dbo.privy_cursors WITH(UPDLOCK,HOLDLOCK) WHERE job_id=? AND stream=?",
+                job_id,
+                stream,
+            )
+            row = cursor.fetchone()
+            previous = row[0] if row else 0
+            if row:
+                cursor.execute(
+                    "UPDATE dbo.privy_cursors SET offset=?,updated=SYSUTCDATETIME() WHERE job_id=? AND stream=?",
+                    max(previous, end),
+                    job_id,
+                    stream,
+                )
+            else:
+                cursor.execute(
+                    "INSERT dbo.privy_cursors(job_id,stream,offset) VALUES(?,?,?)", job_id, stream, end
+                )
+            return previous
+
+    def request_cancel(self, job_id: str) -> dict:
+        with self.transaction() as cursor:
+            cursor.execute("SELECT owner FROM dbo.privy_records WHERE kind='job' AND id=?", job_id)
+            row = cursor.fetchone()
+            if row is None:
+                raise StorageError("Cannot cancel an unknown shared job")
+            cursor.execute(
+                "IF NOT EXISTS(SELECT 1 FROM dbo.privy_cancels WITH(UPDLOCK,HOLDLOCK) WHERE job_id=?) INSERT dbo.privy_cancels(job_id,owner) VALUES(?,?)",
+                job_id,
+                job_id,
+                row[0],
+            )
+            cursor.execute("SELECT acknowledged FROM dbo.privy_cancels WHERE job_id=?", job_id)
+            acknowledged = cursor.fetchone()[0] is not None
+            return {"job_id": job_id, "requested": True, "acknowledged": acknowledged}
+
+    def pending_cancels(self) -> list[str]:
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT TOP(100) job_id FROM dbo.privy_cancels WHERE owner=? AND acknowledged IS NULL ORDER BY requested",
+                self.owner,
+            )
+            return [row[0] for row in cursor.fetchall()]
+
+    def ack_cancel(self, job_id: str) -> None:
+        with self.transaction() as cursor:
+            cursor.execute(
+                "UPDATE dbo.privy_cancels SET acknowledged=SYSUTCDATETIME() WHERE job_id=? AND owner=?",
+                job_id,
+                self.owner,
+            )
+
+    def heartbeat(self) -> None:
+        with self.transaction() as cursor:
+            cursor.execute(
+                "UPDATE dbo.privy_coordination SET payload=?,updated=SYSUTCDATETIME() WHERE kind='hub' AND id=?; "
+                "IF @@ROWCOUNT=0 INSERT dbo.privy_coordination(kind,id,payload) VALUES('hub',?,?)",
+                json.dumps({"owner": self.owner}),
+                self.owner,
+                self.owner,
+                json.dumps({"owner": self.owner}),
+            )
+
+    def collect(self, batch: int = 500) -> dict:
+        if not 1 <= batch <= 1000:
+            raise StorageError("GC batch must be between 1 and 1000")
+        counts = {}
+        with self.transaction("privy.gc") as cursor:
+            cursor.execute(
+                "DECLARE @r int; EXEC @r=sys.sp_getapplock @Resource='privy.leases', @LockMode='Exclusive', "
+                "@LockOwner='Transaction', @LockTimeout=15000; SELECT @r;"
+            )
+            if cursor.fetchone()[0] < 0:
+                raise StorageError("SQL lease cleanup coordination lock timed out")
+            # Never collect a running/queued job, its output, or its control records.
+            cursor.execute("DROP TABLE IF EXISTS #expired; CREATE TABLE #expired(id nvarchar(400) NOT NULL)")
+            cursor.execute(
+                "INSERT #expired SELECT TOP (?) r.id FROM dbo.privy_records r WHERE r.kind='job' "
+                "AND r.at < DATEDIFF_BIG(second,'1970-01-01',SYSUTCDATETIME())-604800 "
+                "AND JSON_VALUE(r.payload,'$.state') IN ('succeeded','failed','timed_out','cancelled','error') "
+                "AND NOT EXISTS(SELECT 1 FROM dbo.privy_coordination c CROSS APPLY OPENJSON(c.payload,'$.running_jobs') pin "
+                "WHERE (c.kind='lease' AND pin.value=r.id) OR (c.kind='use' AND pin.[key] COLLATE DATABASE_DEFAULT=r.id)) ORDER BY r.at",
+                batch,
+            )
+            cursor.execute(
+                "DELETE TOP (?) FROM dbo.privy_output WHERE job_id IN(SELECT id FROM #expired)", batch
+            )
+            counts["output"] = cursor.rowcount
+            cursor.execute("DELETE FROM #expired WHERE id IN(SELECT job_id FROM dbo.privy_output)")
+            cursor.execute("DELETE FROM dbo.privy_cursors WHERE job_id IN(SELECT id FROM #expired)")
+            cursor.execute("DELETE FROM dbo.privy_cancels WHERE job_id IN(SELECT id FROM #expired)")
+            cursor.execute(
+                "DELETE FROM dbo.privy_records WHERE kind='job' AND id IN(SELECT id FROM #expired)"
+            )
+            counts["jobs"] = cursor.rowcount
+            cursor.execute(
+                "DELETE TOP (?) r FROM dbo.privy_records r WHERE r.kind<>'job' "
+                "AND r.at<DATEDIFF_BIG(second,'1970-01-01',SYSUTCDATETIME())-604800 "
+                "AND NOT EXISTS(SELECT 1 FROM dbo.privy_records j WHERE j.kind='job' AND j.id=JSON_VALUE(r.payload,'$.job_id')) "
+                "AND NOT EXISTS(SELECT 1 FROM OPENJSON(r.payload,'$.job_ids') child JOIN dbo.privy_records j ON j.kind='job' AND j.id=child.value)",
+                batch,
+            )
+            counts["history"] = cursor.rowcount
+            cursor.execute(
+                "DELETE TOP (?) FROM dbo.privy_coordination WHERE kind='lease' AND updated<DATEADD(day,-7,SYSUTCDATETIME()) "
+                "AND JSON_VALUE(payload,'$.state')<>'active' AND JSON_QUERY(payload,'$.running_jobs')='[]'",
+                batch,
+            )
+            counts["leases"] = cursor.rowcount
+            cursor.execute(
+                "DELETE TOP (?) FROM dbo.privy_coordination WHERE kind='hub' AND updated<DATEADD(day,-7,SYSUTCDATETIME())",
+                batch,
+            )
+            cursor.execute("DROP TABLE #expired")
+        return counts
+
+    def flush(self, timeout: float = 10) -> bool:
+        deadline = time.monotonic() + timeout
+        while self.outbox.pending(1):
+            if time.monotonic() >= deadline:
+                return False
+            try:
+                self._drain()
+            except Exception:
+                self._last_error = "SQL delivery unavailable; journal retained for replay"
+                self._wake.set()
+                return False
+        return True
+
+    def status(self) -> dict:
+        return {"mode": "azure_sql", "owner": self.owner, "error": self._last_error, **self.outbox.status()}
+
+    def _work(self) -> None:
+        maintenance = 0.0
+        while not self._stop.is_set():
+            try:
+                self._drain()
+                if time.monotonic() >= maintenance:
+                    self.heartbeat()
+                    self.collect()
+                    maintenance = time.monotonic() + 30
+                    self._last_error = None
+            except Exception:
+                if self._last_error is None:
+                    log.error("SQL delivery/maintenance failed; journal retained, no file leasing fallback")
+                self._last_error = "SQL delivery unavailable; journal retained for replay"
+                self._stop.wait(1)
+            self._wake.wait(0.25)
+            self._wake.clear()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._thread is not None:
+            self._thread.join(timeout=35)
+            if self._thread.is_alive():
+                raise StorageError("SQL delivery thread did not stop; journal remains open")
+        if not self.flush():
+            log.error("SQL journal has pending writes on shutdown; next start will replay them")
+        self.outbox.close()
+        if hasattr(self._connect, "close"):
+            self._connect.close()
+
+
+class SqlLeaseLock:
+    """Refresh only inside a database lock, then commit changed keyed records."""
+
+    def __init__(self, store, backend: SqlBackend) -> None:
+        self.store, self.backend = store, backend
+        self._lock = threading.RLock()
+        self._local = threading.local()
+
+    def __enter__(self):
+        self._lock.acquire()
+        depth = getattr(self._local, "depth", 0)
+        self._local.depth = depth + 1
+        if depth:
+            return self
+        try:
+            self._local.transaction = None
+            transaction = self.backend.transaction("privy.leases")
+            cursor = transaction.__enter__()
+            self._local.transaction = transaction
+            self._local.cursor = cursor
+            cursor.execute("SELECT DATEDIFF_BIG(millisecond,'1970-01-01',SYSUTCDATETIME())/1000.0")
+            self._local.now = float(cursor.fetchone()[0])
+            cursor.execute("SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id='targets'")
+            row = cursor.fetchone()
+            targets = {
+                "targets": [
+                    {"id": t.id, "namespace": t.namespace, "path": t.path}
+                    for t in self.store.registry.snapshot().targets
+                ]
+            }
+            if row is None or json.loads(row[0]) != targets:
+                raise StorageError(
+                    "Local target configuration changed or differs from shared SQL configuration"
+                )
+            cursor.execute(
+                "SELECT kind,id,payload FROM dbo.privy_coordination WHERE kind IN('client','lease','use') ORDER BY ordinal"
+            )
+            state = {"client": {}, "lease": {}, "use": {}}
+            for kind, key, raw in cursor.fetchall():
+                state[kind][key] = json.loads(raw)
+            self.store._clients, self.store._leases, self.store._uses = (
+                state["client"],
+                state["lease"],
+                state["use"],
+            )
+            self._local.before = copy.deepcopy(state)
+            return self
+        except BaseException as exc:
+            try:
+                if getattr(self._local, "transaction", None) is not None:
+                    self._local.transaction.__exit__(type(exc), exc, exc.__traceback__)
+            finally:
+                self._local.transaction = None
+                self._local.depth = 0
+                self._lock.release()
+            raise
+
+    def now(self) -> float:
+        return self._local.now
+
+    def __exit__(self, typ, value, trace):
+        self._local.depth -= 1
+        try:
+            if self._local.depth:
+                return False
+            if typ is None:
+                cursor = self._local.cursor
+                current = {
+                    "client": self.store._clients,
+                    "lease": self.store._leases,
+                    "use": self.store._uses,
+                }
+                for kind, records in current.items():
+                    previous = self._local.before[kind]
+                    for key in previous.keys() - records.keys():
+                        cursor.execute("DELETE dbo.privy_coordination WHERE kind=? AND id=?", kind, key)
+                    for key, payload in records.items():
+                        if key not in previous:
+                            cursor.execute(
+                                "INSERT dbo.privy_coordination(kind,id,payload) VALUES(?,?,?)",
+                                kind,
+                                key,
+                                json.dumps(payload),
+                            )
+                        elif payload != previous[key]:
+                            cursor.execute(
+                                "UPDATE dbo.privy_coordination SET payload=?,updated=SYSUTCDATETIME() WHERE kind=? AND id=?",
+                                json.dumps(payload),
+                                kind,
+                                key,
+                            )
+            return self._local.transaction.__exit__(typ, value, trace)
+        except BaseException as exc:
+            if typ is None:
+                self._local.transaction.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+        finally:
+            self._lock.release()

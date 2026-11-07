@@ -17,6 +17,10 @@ dependencies = [
 privy = "privy.cli:main"
 
 [project.optional-dependencies]
+sql = [
+    "azure-identity>=1.19",
+    "pyodbc>=5.2",
+]
 dev = [
     "pytest>=8",
     "build>=1.2",

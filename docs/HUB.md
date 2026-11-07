@@ -17,7 +17,89 @@ flowchart LR
 ```
 
 The hub never calls Azure Resource Manager. It signs a one-hour SAS token from the hydrated key for
-every request, so startup is instant and works without an Azure login.
+every Relay request. The default file-backed mode works without an Azure login; optional Azure SQL
+mode uses Azure CLI authentication for its shared backing store.
+
+## Shared Azure SQL backing store
+
+Install `privy[sql]`, Microsoft **ODBC Driver 18 for SQL Server**, and Azure CLI on each hub machine.
+Sign in with `az login` as an identity authorized in the database. The application uses
+`azure.identity.AzureCliCredential` explicitly, caches its access token and refreshes it five minutes
+before expiry. Connections require encryption and validate the server certificate. The driver and
+Azure CLI remain machine prerequisites, not components bundled into `privy.exe`.
+
+Copy `appsettings.template.yaml` to a **local, gitignored** `appsettings.yaml`, set `storage.server`
+and `storage.database`, and hydrate identical target names/namespaces and `leases.yaml` rules in
+each hub home. Relay keys remain local and need not be committed or sent to SQL.
+
+```yaml
+version: 1
+storage:
+  mode: azure_sql
+  server: YOUR-SERVER.database.windows.net
+  database: privy
+  driver: ODBC Driver 18 for SQL Server
+  retention_days: 7
+  outbox_max_bytes: 268435456
+```
+
+Start each hub explicitly with its own home, for example:
+
+```powershell
+privy hub serve --home C:\privy-shared-home --settings C:\privy-local\appsettings.yaml --port 17749
+```
+
+Settings resolution is `--settings`, then `PRIVY_HUB_SETTINGS`, then
+`<home>\appsettings.yaml`, then the current directory's `appsettings.yaml`. Without any settings,
+existing file behavior is unchanged. Explicitly selected missing files, invalid settings, SQL
+authentication/connection failures and conflicting shared configurations are errors: **they never
+fall back to independent file leasing**. To deliberately choose file mode, use
+`version: 1` and `storage: {mode: file}`.
+
+Startup bootstraps versioned SQL tables under a transaction-owned SQL application lock. Concurrent
+starts are safe. SQL is authoritative for clients, leases, use/cooldown records and job pins:
+each operation reads current keyed records inside a database transaction, uses database time and
+commits only changed records. Admission, session registration, holder checks, renewal, client limits
+and release therefore coordinate across hubs. A differing target topology or lease/storage
+configuration is rejected; hydrate the complete intended topology before the first SQL start.
+
+Job workers stay on their originating hub. Shared job summaries, output pages, broadcasts, audit,
+listener facts, purposes and dashboard telemetry are journaled locally before asynchronous delivery
+to SQL. The bounded SQLite delivery journal uses full durability, ordered replay and SQL
+owner/revision checks. It is **not** a second leasing authority. Outages retain pending deliveries;
+full journals reject new writes and report errors/backpressure rather than dropping old data.
+Keep each home and its `sql-outbox.sqlite3` files until all pending deliveries have been flushed.
+
+Either hub can inspect/follow shared jobs and request cancellation. Cancellation is durably recorded
+in SQL and only acknowledged by the executing hub after it processes the request. Acceptance does
+not promise immediate cancellation while that owner is offline. A new process incarnation does not
+restart another process's work or clear its pins. **Stale heartbeats do not prove remote execution
+stopped.** SQL mode refuses lease release, including force release, while leased jobs are pinned;
+unleased running jobs also keep their group unavailable for fresh lease admission. If an owner dies
+with unresolved work, confirm remote completion before administrator-led reconciliation. This
+conservative behavior differs intentionally from file mode's restart pin clearing and force release.
+
+If a new SQL-enabled home already contains `leases-state.json`, startup imports it once under the
+same SQL lock, preserving active pins and rejecting conflicting client identities/allocations.
+Imports never access another home. File state with released/expired pinned work is rejected until
+that unresolved work has been checked. Local PID discovery files, Relay secrets, sockets, interactive
+terminal sessions and hub-local transfer paths do not migrate through SQL. Metadata is shared;
+files and interactive resources still belong to the machine hosting them.
+
+SQL cleanup runs in indexed, bounded batches with seven-day retention. It protects active leases,
+unfinished jobs, their output and control records, and unresolved pins. Job summaries and output are
+read lazily; startup does not load seven days of output. Both hubs must use SQL mode against the same
+database: a database-backed lease does **not** coordinate with an existing file-mode hub.
+
+The startup log names `storage: azure_sql`, server/database and the process owner incarnation;
+the dashboard sidebar shows `storage Azure SQL` and pending/rejected delivery counts. `/healthz`
+probes SQL and `/v1` includes detailed storage health. The isolated Basic-tier SQL benchmark
+(20 simulated devboxes, 3,360 jobs over seven days, 4 KiB output per job) measured a 200-job page
+at 0.63 seconds, seven-day statistics at 4.21 seconds, dashboard HTML at 5.35 seconds and an
+output page at 1.42 seconds. This is not a production-tier or two-physical-machine measurement.
+
+For isolated second-machine verification, rollback and a copy-paste checklist, see
+[the Azure SQL bug-bash runbook](SQL_BUG_BASH.md).
 
 ## Quick start
 

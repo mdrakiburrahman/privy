@@ -40,6 +40,7 @@ from privy.hub.registry import (
     language_from,
     machine_name,
 )
+from privy.hub.sql_store import StorageError
 from privy.hub.sync import validate_source
 from privy.transfer import TransferError
 
@@ -85,8 +86,8 @@ reading leases or filtering job history does not renew them.
 5. Use purpose on work submissions, e.g. "privy: Implementing HYCO purpose history." Reuse the
    same short sentence across related commands and transfers. A lease supplies its purpose when
    omitted; otherwise omission creates an unknown gap.
-   Purpose history is hub-only and resets on restart; a lease's default purpose persists with
-   its lease. Never include secrets.
+   Purpose history resets on restart in file mode; SQL mode shares and persists it. A lease's
+   default purpose persists with its lease. Never include secrets.
 The same API is plain HTTP at this server's / (a quickstart) and /openapi.json. Commands run with the
 listener user's privileges: prefer read-only commands unless the user asked for changes."""
 
@@ -133,6 +134,8 @@ def _translated_errors() -> Iterator[None]:
         raise HubError(str(exc), status=404, code="not_found") from None
     except HubBusyError as exc:
         raise HubError(str(exc), status=429, code="busy") from None
+    except StorageError as exc:
+        raise HubError("shared storage is unavailable; retry later", status=503, code="storage_unavailable") from exc
 
 
 def _require_text(name: str, value: str) -> str:
@@ -800,7 +803,8 @@ class _ProgressReporter:
         self._marks: dict[str, dict[str, int]] = {}
         for job in jobs:
             with job.cond:
-                self._marks[job.id] = dict(job.cursor)
+                shared_cursor = getattr(job, "read_cursor", None)
+                self._marks[job.id] = shared_cursor() if shared_cursor is not None else dict(job.cursor)
         self._started = time.monotonic()
         #: When a message was last sent; the first output goes out immediately.
         self._last = float("-inf")
@@ -941,7 +945,7 @@ class HubService:
 
     def summary(self) -> dict[str, Any]:
         snapshot = self.registry.snapshot()
-        return {
+        result = {
             "version": self.version,
             "uptime_s": int(time.time() - self.started_at),
             "relays_file": self._relays_file_view(snapshot),
@@ -949,6 +953,10 @@ class HubService:
             "targets": len(snapshot.targets),
             "jobs": self.jobs.counts(),
         }
+        backend = getattr(self.jobs, "backend", None)
+        if backend is not None:
+            result["storage"] = backend.status()
+        return result
 
     # ---- views --------------------------------------------------------------
 

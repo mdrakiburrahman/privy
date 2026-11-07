@@ -3,7 +3,7 @@
 
 import sys
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 terminal_data = collect_data_files("winpty", includes=["*.exe"]) if sys.platform == "win32" else []
 
@@ -25,6 +25,12 @@ a = Analysis(
         "privy.hub.home",
         "privy.hub.jobs",
         "privy.hub.leases",
+        "privy.hub.settings",
+        "privy.hub.sql_store",
+        "privy.hub.shared_jobs",
+        "privy.hub.shared_metrics",
+        "pyodbc",
+        *collect_submodules("azure.identity"),
         "yaml",
         "privy.hub.mcp",
         "privy.hub.registry",

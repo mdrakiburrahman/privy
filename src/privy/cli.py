@@ -799,6 +799,7 @@ Point an LLM at http://127.0.0.1:7748/ and ask it to run something.
         help="hydrated relays file (default: HOME/relays.json)",
     )
     hub_serve.add_argument("--max-jobs", type=_positive_int, default=32, help="jobs that may run at once")
+    hub_serve.add_argument("--settings", help="Explicit local appsettings.yaml (missing/invalid is an error)")
     hub_serve.add_argument(
         "--probe-ttl-s",
         type=_positive_float,
@@ -1008,6 +1009,8 @@ def _cmd_hub_serve(args: argparse.Namespace) -> int:
     from privy.executor import set_echo_output
     from privy.hub.app import LOOPBACK_HOSTS, build_hub
     from privy.hub.home import LEGACY_TOKEN_FILENAME
+    from privy.hub.settings import SettingsError
+    from privy.hub.sql_store import StorageError
 
     echo_output = _resolve_echo_output(args)
     if max(args.verbose, getattr(args, "verbose_sub", 0)) == 0:
@@ -1025,9 +1028,12 @@ def _cmd_hub_serve(args: argparse.Namespace) -> int:
             max_jobs=args.max_jobs,
             probe_ttl_s=args.probe_ttl_s,
             version=__version__,
+            settings_file=Path(args.settings).expanduser() if args.settings else None,
         )
     except OSError as exc:
         raise CliError(f"cannot start the hub on {args.host}:{args.port}: {exc}") from exc
+    except (SettingsError, StorageError) as exc:
+        raise CliError(str(exc)) from exc
 
     log = logging.getLogger("privy.hub")
     summary = runtime.service.summary()
@@ -1060,6 +1066,9 @@ def _cmd_hub_serve(args: argparse.Namespace) -> int:
         log.info("Stopping hub.")
     finally:
         runtime.server.server_close()
+        if runtime.storage is not None:
+            runtime.service.jobs.close()
+            runtime.storage.close()
     return 0
 
 
