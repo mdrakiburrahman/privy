@@ -98,9 +98,6 @@ probes SQL and `/v1` includes detailed storage health. The isolated Basic-tier S
 at 0.63 seconds, seven-day statistics at 4.21 seconds, dashboard HTML at 5.35 seconds and an
 output page at 1.42 seconds. This is not a production-tier or two-physical-machine measurement.
 
-For isolated second-machine verification, rollback and a copy-paste checklist, see
-[the Azure SQL bug-bash runbook](SQL_BUG_BASH.md).
-
 ## Quick start
 
 1. Hydrate keys into the hub's hosting folder with `Sync-PrivyHubRelays.ps1` from
