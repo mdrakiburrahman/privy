@@ -25,6 +25,85 @@ from privy.hub.settings import SqlSettings
 log = logging.getLogger("privy.hub")
 
 
+def _profile_sql_enabled() -> bool:
+    return os.environ.get("PRIVY_SQL_PROFILE") == "1"
+
+
+class _ProfileCursor:
+    def __init__(self, cursor) -> None:
+        self._cursor = cursor
+        self._query = ""
+
+    def execute(self, query, *params):
+        self._query = query
+        started = time.perf_counter()
+        try:
+            return self._cursor.execute(query, *params)
+        except Exception as exc:
+            log.exception(
+                "sql_profile execute failed thread=%s error_type=%s error=%s query=%r",
+                threading.get_ident(),
+                type(exc).__name__,
+                exc,
+                query,
+            )
+            raise
+        finally:
+            log.info(
+                "sql_profile execute thread=%s duration_ms=%.1f query=%r",
+                threading.get_ident(),
+                (time.perf_counter() - started) * 1000,
+                query,
+            )
+
+    def fetchall(self):
+        started = time.perf_counter()
+        try:
+            rows = self._cursor.fetchall()
+        except Exception as exc:
+            log.exception(
+                "sql_profile fetchall failed thread=%s error_type=%s error=%s query=%r",
+                threading.get_ident(),
+                type(exc).__name__,
+                exc,
+                self._query,
+            )
+            raise
+        log.info(
+            "sql_profile fetchall thread=%s duration_ms=%.1f rows=%d query=%r",
+            threading.get_ident(),
+            (time.perf_counter() - started) * 1000,
+            len(rows),
+            self._query,
+        )
+        return rows
+
+    def fetchone(self):
+        started = time.perf_counter()
+        try:
+            row = self._cursor.fetchone()
+        except Exception as exc:
+            log.exception(
+                "sql_profile fetchone failed thread=%s error_type=%s error=%s query=%r",
+                threading.get_ident(),
+                type(exc).__name__,
+                exc,
+                self._query,
+            )
+            raise
+        log.info(
+            "sql_profile fetchone thread=%s duration_ms=%.1f rows=%d query=%r",
+            threading.get_ident(),
+            (time.perf_counter() - started) * 1000,
+            int(row is not None),
+            self._query,
+        )
+        return row
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
 class StorageError(RuntimeError):
     """An authoritative operation or durable delivery could not complete."""
 
@@ -285,12 +364,21 @@ BEGIN
         revision bigint NOT NULL, at float NOT NULL,
         target nvarchar(300) NULL, lease_id nvarchar(80) NULL, client_id nvarchar(80) NULL,
         updated datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        probe_status AS (CONVERT(nvarchar(32), JSON_VALUE(payload,'$.status'))),
+        probe_latency_ms AS (TRY_CONVERT(int, JSON_VALUE(payload,'$.latency_ms'))),
         CONSTRAINT PK_privy_records PRIMARY KEY(kind,id));
     CREATE INDEX IX_privy_records_at ON dbo.privy_records(kind,at DESC);
     CREATE INDEX IX_privy_records_target ON dbo.privy_records(kind,target,at DESC);
     CREATE INDEX IX_privy_records_lease ON dbo.privy_records(kind,lease_id,at DESC);
     CREATE INDEX IX_privy_records_client ON dbo.privy_records(kind,client_id,at DESC);
 END;
+IF COL_LENGTH('dbo.privy_records','probe_status') IS NULL
+    ALTER TABLE dbo.privy_records ADD probe_status AS (CONVERT(nvarchar(32), JSON_VALUE(payload,'$.status')));
+IF COL_LENGTH('dbo.privy_records','probe_latency_ms') IS NULL
+    ALTER TABLE dbo.privy_records ADD probe_latency_ms AS (TRY_CONVERT(int, JSON_VALUE(payload,'$.latency_ms')));
+IF NOT EXISTS(SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.privy_records') AND name='IX_privy_probe_history')
+    CREATE INDEX IX_privy_probe_history ON dbo.privy_records(at DESC)
+        INCLUDE(target,probe_status,probe_latency_ms) WHERE kind='probe';
 IF OBJECT_ID('dbo.privy_coordination') IS NULL
 BEGIN
     CREATE TABLE dbo.privy_coordination(
@@ -398,9 +486,28 @@ class SqlBackend:
 
     @contextmanager
     def transaction(self, lock: str | None = None):
-        connection = self._connect()
+        profile = _profile_sql_enabled()
+        connection_started = time.perf_counter()
         try:
-            cursor = connection.cursor()
+            connection = self._connect()
+        except Exception as exc:
+            if profile:
+                log.exception(
+                    "sql_profile connection_acquire failed thread=%s error_type=%s error=%s",
+                    threading.get_ident(),
+                    type(exc).__name__,
+                    exc,
+                )
+            raise
+        if profile:
+            log.info(
+                "sql_profile connection_acquire thread=%s duration_ms=%.1f",
+                threading.get_ident(),
+                (time.perf_counter() - connection_started) * 1000,
+            )
+        try:
+            raw_cursor = connection.cursor()
+            cursor = _ProfileCursor(raw_cursor) if profile else raw_cursor
             cursor.execute("SET NOCOUNT ON; SET XACT_ABORT ON; SET LOCK_TIMEOUT 15000;")
             if lock:
                 cursor.execute(
@@ -685,6 +792,68 @@ class SqlBackend:
                 "retained": sum(counts.values()),
             }
 
+    def probe_history(self, *, after=None, before=None):
+        clauses = ["kind='probe'"]
+        params = []
+        if after is not None:
+            clauses.append("at>=?")
+            params.append(after)
+        if before is not None:
+            clauses.append("at<?")
+            params.append(before)
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT target,at,id,probe_status,probe_latency_ms "
+                "FROM dbo.privy_records WHERE " + " AND ".join(clauses),
+                *params,
+            )
+            rows = cursor.fetchall()
+            latest = {}
+            for target, at, key, *_ in rows:
+                candidate = (float(at), str(key))
+                if target not in latest or candidate > latest[target]:
+                    latest[target] = candidate
+            latest_ids = [key for _, key in latest.values()]
+            payloads = {}
+            if latest_ids:
+                cursor.execute(
+                    "SELECT id,payload FROM dbo.privy_records WHERE kind='probe' "
+                    "AND id IN (SELECT value FROM OPENJSON(?))",
+                    json.dumps(latest_ids),
+                )
+                payload_rows = cursor.fetchall()
+                decode_started = time.perf_counter()
+                payloads = {str(key): json.loads(payload) for key, payload in payload_rows}
+                if _profile_sql_enabled():
+                    log.info(
+                        "sql_profile record_decode thread=%s kind=probe_latest rows=%d duration_ms=%.1f",
+                        threading.get_ident(),
+                        len(payload_rows),
+                        (time.perf_counter() - decode_started) * 1000,
+                    )
+
+        decode_started = time.perf_counter()
+        result = []
+        for target, at, key, status, latency_ms in rows:
+            row = {
+                "target": target,
+                "at": float(at),
+                "status": status,
+                "latency_ms": latency_ms,
+            }
+            if latest.get(target) == (float(at), str(key)) and str(key) in payloads:
+                row.update(payloads[str(key)])
+            result.append(row)
+        if _profile_sql_enabled():
+            log.info(
+                "sql_profile record_decode thread=%s kind=probe rows=%d latest_payloads=%d duration_ms=%.1f",
+                threading.get_ident(),
+                len(rows),
+                len(payloads),
+                (time.perf_counter() - decode_started) * 1000,
+            )
+        return result
+
     def scan(self, kind: str, *, before=None, after=None, target=None, lease_id=None, client_id=None):
         page_size = 5000
         clauses, params = ["kind=?"], [kind]
@@ -712,7 +881,17 @@ class SqlBackend:
                     *page_params,
                 )
                 page = cursor.fetchall()
-            yield from (json.loads(row[2]) for row in page)
+            decode_started = time.perf_counter()
+            decoded = [json.loads(row[2]) for row in page]
+            if _profile_sql_enabled():
+                log.info(
+                    "sql_profile record_decode thread=%s kind=%s rows=%d duration_ms=%.1f",
+                    threading.get_ident(),
+                    kind,
+                    len(decoded),
+                    (time.perf_counter() - decode_started) * 1000,
+                )
+            yield from decoded
             if len(page) < page_size:
                 return
             boundary = page[-1][0], page[-1][1]

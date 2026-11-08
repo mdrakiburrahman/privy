@@ -231,6 +231,31 @@ def test_real_sql_cancel_acknowledgment_and_cursors_are_owner_coordinated(stores
     one.delete("job", key)
 
 
+def test_real_sql_probe_history_uses_covering_projection(stores):
+    _, _, one, two = stores
+    key = f"{uuid.uuid4().hex}:probe"
+    at = time.time()
+    target = "sqltest/testbox02"
+    one.put(
+        "probe",
+        key,
+        {"target": target, "created_at": at, "status": "online", "latency_ms": 123},
+    )
+    try:
+        with two.transaction() as cursor:
+            cursor.execute(
+                "SELECT probe_status,probe_latency_ms FROM dbo.privy_records WHERE kind='probe' AND id=?",
+                key,
+            )
+            assert cursor.fetchone() == ("online", 123)
+        rows = [row for row in two.probe_history(after=at - 1, before=at + 1) if row["target"] == target]
+        assert len(rows) == 1
+        assert rows[0]["status"] == "online"
+        assert rows[0]["latency_ms"] == 123
+    finally:
+        one.delete("probe", key)
+
+
 def test_real_sql_summary_scan_has_no_gaps_at_equal_timestamp_boundaries(stores):
     _, _, one, two = stores
     key = uuid.uuid4().hex

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import os
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -12,6 +15,8 @@ from privy.hub.metrics import DEFAULT_RANGE, CallSample, HubMetrics, JobEntry, R
 from privy.hub.purpose import PurposeHistory, normalize_purpose
 from privy.hub.registry import ProbeResult
 from privy.hub.shared_jobs import SharedJob, shared_payload, shared_records
+
+log = logging.getLogger(__name__)
 
 
 class _SharedEntry(JobEntry):
@@ -246,6 +251,8 @@ class SharedMetrics(HubMetrics):
         )
 
     def report(self, targets, probes, **kwargs):
+        profile_started = time.perf_counter()
+        profile = os.environ.get("PRIVY_SQL_PROFILE") == "1"
         snapshot = HubMetrics(clock=self._clock)
         snapshot.started_at = self.started_at
         selection = kwargs.get("selection") or ReportSelection(kwargs.get("range_name", DEFAULT_RANGE))
@@ -270,9 +277,13 @@ class SharedMetrics(HubMetrics):
         snapshot.purposes = self.purposes._snapshot(rows=purpose_rows)
         earliest = [entry.created_at for entry in snapshot._entries]
         shared_probes = dict(probes)
-        for row in sorted(
-            shared_records(self.backend, "probe", after=after, before=before), key=lambda r: r["at"]
-        ):
+        probe_rows = list(
+            self.backend.probe_history(after=after, before=before)
+            if hasattr(self.backend, "probe_history")
+            else shared_records(self.backend, "probe", after=after, before=before)
+        )
+        probe_assembly_started = time.perf_counter()
+        for row in sorted(probe_rows, key=lambda r: r["at"]):
             target_id = row["target"]
             result = self._probe_result(row)
             # HubMetrics.probe needs only the target's id.
@@ -282,6 +293,7 @@ class SharedMetrics(HubMetrics):
             if previous is None or result.checked_at > previous.checked_at:
                 shared_probes[target_id] = result
             earliest.append(row["at"])
+        probe_processing_ms = (time.perf_counter() - probe_assembly_started) * 1000
         calls = list(shared_records(self.backend, "call", after=after, before=before))
         snapshot._calls.extend(CallSample(r["at"], r["surface"], r["status"], r["seconds"]) for r in calls)
         earliest.extend(r["at"] for r in calls)
@@ -294,6 +306,18 @@ class SharedMetrics(HubMetrics):
             kwargs.setdefault("jobs_retained", counts["retained"])
         result = snapshot.report(targets, shared_probes, **kwargs)
         result["hub_started_at"] = utc_iso(self.started_at)
+        if profile:
+            log.info(
+                "sql_profile report_assembly thread=%s duration_ms=%.1f probe_assembly_ms=%.1f "
+                "jobs=%d purposes=%d probes=%d calls=%d",
+                threading.get_ident(),
+                (time.perf_counter() - profile_started) * 1000,
+                probe_processing_ms,
+                len(snapshot._entries),
+                max(0, len(purpose_rows) - len(snapshot._entries)),
+                len(probe_rows),
+                len(calls),
+            )
         return result
 
 

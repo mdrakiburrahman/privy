@@ -1593,11 +1593,23 @@ def render(service: Any, page: str, query: Mapping[str, list[str]], base_url: st
         selection = ReportSelection.parse(query) if page == "overview" else ReportSelection(range_name=rng)
     except ValueError as exc:
         return error_response(400, "invalid_argument", str(exc))
-    if page in ("leases", "jobs"):
-        report = build_shell_report(service, selection)
-    else:
-        report = build_report(service, selection=selection)
-        enrich_lease_report(service, report)
+    profile = os.environ.get("PRIVY_SQL_PROFILE") == "1"
+    request_started = time.perf_counter()
+    try:
+        if page in ("leases", "jobs"):
+            report = build_shell_report(service, selection)
+        else:
+            report = build_report(service, selection=selection)
+            enrich_lease_report(service, report)
+    except Exception:
+        if profile:
+            log.exception(
+                "dashboard_profile failed page=%s phase=report_build thread=%s",
+                page,
+                threading.get_ident(),
+            )
+        raise
+    report_finished = time.perf_counter()
     now = time.time()
     nonce = secrets.token_urlsafe(18)
     params: dict[str, str | None] = {}
@@ -1629,7 +1641,18 @@ def render(service: Any, page: str, query: Mapping[str, list[str]], base_url: st
     document = shell(
         service, page, title=title, main=main, report=report, nonce=nonce, base_url=base_url, params=params
     )
-    return html_response(document, nonce)
+    response = html_response(document, nonce)
+    if profile:
+        finished = time.perf_counter()
+        log.info(
+            "dashboard_profile page=%s thread=%s report_build_ms=%.1f html_render_ms=%.1f total_ms=%.1f",
+            page,
+            threading.get_ident(),
+            (report_finished - request_started) * 1000,
+            (finished - report_finished) * 1000,
+            (finished - request_started) * 1000,
+        )
+    return response
 
 
 def raw_log(service: Any, job_id: str) -> HttpResponse:

@@ -107,6 +107,8 @@ seconds. This is not a production-tier or two-physical-machine measurement. Dash
 cached listener statuses while stale probes continue in the background, waiting at most 0.5 seconds
 for a refresh. SQL-backed reports reuse the job counts already read for that page.
 
+Probe history reads use a covering SQL index over computed status and latency fields, while fetching full payloads only for each target's latest probe; the additive schema bootstrap is serialized and remains compatible with version-1 peers. For short-lived diagnostics, set `PRIVY_SQL_PROFILE=1` before starting the hub. The `sql_profile` log entries separate connection acquisition, SQL execution/fetch, per-kind record decoding and counts, report assembly, and HTML rendering. Failed statements include the exception and SQL text but never bind parameters or record payloads; unset the variable to disable profiling.
+
 ## Quick start
 
 1. Hydrate keys into the hub's hosting folder with `Sync-PrivyHubRelays.ps1` from

@@ -8,7 +8,7 @@ import yaml
 
 from privy.hub.leases import DEFAULT_CONFIG, effective_lease_config
 from privy.hub.settings import SettingsError, load_settings
-from privy.hub.sql_store import SqlBackend, StorageError, _home_identity, _HomeLock
+from privy.hub.sql_store import _SCHEMA, SqlBackend, StorageError, _home_identity, _HomeLock, _ProfileCursor
 
 
 def test_absent_settings_preserve_file_mode(tmp_path, monkeypatch):
@@ -121,9 +121,12 @@ def test_sql_job_pages_apply_state_filters_and_aggregate_counts():
     ) == [{"id": "job-1"}]
     assert backend.count_jobs_by_target(lease_id="lease-a") == {"target-a": 3, "target-b": 2}
     assert backend.count_jobs_by_lease() == {"lease-a": 4}
-    assert backend.count_job_records(
-        lease_id="lease-a", states=frozenset({"failed", "error"}), after=10, before=20
-    ) == 3
+    assert (
+        backend.count_job_records(
+            lease_id="lease-a", states=frozenset({"failed", "error"}), after=10, before=20
+        )
+        == 3
+    )
 
     page_query, page_args = cursor.statements[0]
     assert "JSON_VALUE(payload,'$.state') IN (?,?)" in page_query
@@ -163,6 +166,78 @@ def test_sql_history_scan_uses_larger_bounded_keyset_pages():
     assert "SELECT TOP (5000)" in query
     assert "ORDER BY at DESC,id DESC" in query
     assert args == ("probe", 0)
+
+
+def test_sql_probe_history_projects_samples_and_loads_only_latest_payloads():
+    class Cursor:
+        def __init__(self):
+            self.statements = []
+            self.result = []
+
+        def execute(self, query, *args):
+            self.statements.append((query, args))
+            if "probe_status,probe_latency_ms" in query:
+                self.result = [
+                    ("target-a", 1.0, "probe-a", "online", 10),
+                    ("target-a", 2.0, "probe-b", "offline", None),
+                    ("target-b", 3.0, "probe-c", "online", 50),
+                ]
+            else:
+                self.result = [
+                    ("probe-b", json.dumps({"info": {"hostname": "a"}, "error": "offline"})),
+                    ("probe-c", json.dumps({"info": {"hostname": "b"}, "legacy": False})),
+                ]
+
+        def fetchall(self):
+            return self.result
+
+    cursor = Cursor()
+
+    @contextmanager
+    def transaction():
+        yield cursor
+
+    backend = object.__new__(SqlBackend)
+    backend.transaction = transaction
+
+    rows = backend.probe_history(after=0, before=4)
+
+    assert [row["status"] for row in rows] == ["online", "offline", "online"]
+    assert rows[0]["latency_ms"] == 10
+    assert rows[1]["error"] == "offline"
+    assert rows[2]["info"] == {"hostname": "b"}
+    sample_query, sample_args = cursor.statements[0]
+    assert "probe_status,probe_latency_ms" in sample_query
+    assert "JSON_VALUE" not in sample_query
+    assert "ORDER BY" not in sample_query
+    assert "at>=?" in sample_query and "at<?" in sample_query
+    assert sample_args == (0, 4)
+    payload_query, payload_args = cursor.statements[1]
+    assert "OPENJSON(?)" in payload_query
+    assert payload_args == (json.dumps(["probe-b", "probe-c"]),)
+
+
+def test_schema_bootstrap_adds_compatible_covering_probe_projection():
+    assert "probe_status AS (CONVERT(nvarchar(32), JSON_VALUE(payload,'$.status')))" in _SCHEMA
+    assert "probe_latency_ms AS (TRY_CONVERT(int, JSON_VALUE(payload,'$.latency_ms')))" in _SCHEMA
+    assert "IF COL_LENGTH('dbo.privy_records','probe_status') IS NULL" in _SCHEMA
+    assert "IX_privy_probe_history" in _SCHEMA
+    assert "CREATE INDEX IX_privy_probe_history ON dbo.privy_records(at DESC)" in _SCHEMA
+    assert "INCLUDE(target,probe_status,probe_latency_ms) WHERE kind='probe'" in _SCHEMA
+
+
+def test_sql_profile_records_failed_statement_without_bound_parameters(caplog):
+    class Cursor:
+        def execute(self, query, *params):
+            raise RuntimeError("database failure")
+
+    with caplog.at_level("ERROR", logger="privy.hub"):
+        with pytest.raises(RuntimeError, match="database failure"):
+            _ProfileCursor(Cursor()).execute("SELECT payload WHERE id=?", "private-value")
+
+    assert "SELECT payload WHERE id=?" in caplog.text
+    assert "database failure" in caplog.text
+    assert "private-value" not in caplog.text
 
 
 def test_active_incarnation_from_a_different_home_scope_blocks_startup():
