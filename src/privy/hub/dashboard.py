@@ -776,8 +776,8 @@ def overview_controls(report: dict[str, Any]) -> str:
         '<button type="submit" class="lease-button primary filter-apply">Apply</button>'
         '<span id="metrics-error" class="metrics-error" role="alert" aria-live="polite"></span></form>'
         f'<p id="metrics-effective" class="metrics-effective">'
-        f'<span>{"Adjusted to " if report["resolution_adjusted"] else "Showing "}</span>'
-        f'<strong>{esc(fmt_interval(report["bucket_s"]))}</strong> per column'
+        f"<span>{'Adjusted to ' if report['resolution_adjusted'] else 'Showing '}</span>"
+        f"<strong>{esc(fmt_interval(report['bucket_s']))}</strong> per column"
         f"{' to keep the chart within 1,000 columns' if report['resolution_adjusted'] else ''}. "
         f'<span class="effective-range">from {effective_time("start")} '
         f'<span aria-hidden="true">to</span> {effective_time("end")} '

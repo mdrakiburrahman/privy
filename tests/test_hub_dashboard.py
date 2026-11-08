@@ -96,11 +96,11 @@ def test_overview_filter_controls_keep_selection_and_expose_exact_utc_range():
     assert 'id="metrics-start"' in text and 'id="metrics-end"' in text
     assert 'class="lease-button primary filter-apply"' in text
     assert 'role="alert" aria-live="polite"' in text
-    assert '<strong>15 minutes</strong> per column' in text
+    assert "<strong>15 minutes</strong> per column" in text
     assert 'datetime="2026-11-07T16:30:00.000Z"' in text
     assert 'datetime="2026-11-08T16:30:00.000Z"' in text
-    assert 'Nov 7, 2026 · 4:30 PM' in text and 'Nov 8, 2026 · 4:30 PM' in text
-    assert 'Exact UTC instant: 2026-11-07T16:30:00.000Z' in text
+    assert "Nov 7, 2026 · 4:30 PM" in text and "Nov 8, 2026 · 4:30 PM" in text
+    assert "Exact UTC instant: 2026-11-07T16:30:00.000Z" in text
 
     custom_text = dashboard.overview_controls({**report, "range": "custom"})
     assert 'class="report-dates" hidden' not in custom_text
