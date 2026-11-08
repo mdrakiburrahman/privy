@@ -38,6 +38,9 @@ function az {
             $parameterIndex = [Array]::IndexOf($args, "--parameters")
             $parameters = Get-Content -LiteralPath $args[$parameterIndex + 1].Substring(1) -Raw | ConvertFrom-Json
             if ($parameters.PSObject.Properties.Name -contains "clientIPv4Addresses") { throw "Deployment accepts client IPs." }
+            if (@($parameters.PSObject.Properties.Name | Where-Object { $_ -like "*test*" }).Count) {
+                throw "Deployment includes removed test parameters."
+            }
             @{
                 id="/test/deployment"
                 properties=@{
@@ -46,9 +49,7 @@ function az {
                         serverFqdn=@{value="test.database.windows.net"}
                         serverResourceId=@{value="/test/server"}
                         databaseResourceId=@{value="/test/privy"}
-                        testDatabaseResourceId=@{value="/test/privy_test"}
                         databaseSku=@{value="S0"}
-                        testDatabaseSku=@{value="Basic"}
                     }
                 }
             } | ConvertTo-Json -Depth 6
@@ -70,12 +71,13 @@ function Assert-Fails {
 
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("privy-infra-test-" + [guid]::NewGuid())
 $production = Join-Path $testRoot "production\appsettings.yaml"
-$test = Join-Path $testRoot "test\appsettings.yaml"
 try {
     Assert-Fails { & $deployScript -ClientIPv4Addresses "1.2.3.4" -ValidateOnly } "parameter"
     Assert-Fails { & $deployScript -SettingsPath ".\appsettings.yaml" } "absolute"
     Assert-Fails { & $deployScript -SettingsPath "C:\.temp\privy-hub\appsettings.yaml" } "protected"
-    Assert-Fails { & $deployScript -DatabaseName privy -TestDatabaseName privy } "different names"
+    Assert-Fails { & $deployScript -TestDatabaseName removed } "parameter"
+    Assert-Fails { & $deployScript -TestDatabaseSku Basic } "parameter"
+    Assert-Fails { & $deployScript -TestSettingsPath "C:\isolated\removed.yaml" } "parameter"
     if ($global:PrivyInfraCalls.Count -ne 0) { throw "Invalid input reached Azure." }
 
     $global:PrivyInfraFailAzure = $true
@@ -91,8 +93,11 @@ try {
     Assert-Fails { & $deployScript } "firewall bypass"
     $global:PrivyInfraWideFirewall = $false
     $global:PrivyInfraCalls = @()
-    $result = & $deployScript -SettingsPath $production -TestSettingsPath $test | ConvertFrom-Json
+    $result = & $deployScript -SettingsPath $production | ConvertFrom-Json
     if ($result.provisioningState -ne "Succeeded") { throw "Incorrect deployment state." }
+    if (@($result.PSObject.Properties.Name | Where-Object { $_ -like "*test*" }).Count) {
+        throw "Deployment includes removed test outputs."
+    }
     if ($result.firewallRule -ne "privy-allow-all" -or $result.startIpAddress -ne "0.0.0.0" -or $result.endIpAddress -ne "255.255.255.255") {
         throw "Incorrect allow-all firewall output."
     }
@@ -104,12 +109,11 @@ version: 1
 storage:
   mode: azure_sql
   server: 'test.database.windows.net'
-  database: 'privy_test'
+  database: 'privy'
   driver: 'ODBC Driver 18 for SQL Server'
   retention_days: 7
 "@
-    if ((Get-Content -LiteralPath $test -Raw).Trim() -ne $expected.Trim()) { throw "Incorrect settings schema." }
-    if ((Get-Content -LiteralPath $production -Raw) -notmatch "database: 'privy'") { throw "Production settings use test database." }
+    if ((Get-Content -LiteralPath $production -Raw).Trim() -ne $expected.Trim()) { throw "Incorrect settings schema." }
     foreach ($call in $global:PrivyInfraCalls) {
         $subscriptionIndex = [Array]::IndexOf($call, "--subscription")
         if ($subscriptionIndex -lt 0 -or $call[$subscriptionIndex + 1] -ne "ce859648-30e1-4135-9d0f-8358aebfe789") {
@@ -120,14 +124,14 @@ storage:
             if ($call[$nameIndex + 1] -notmatch '^privy-sql-\d{14}$') { throw "Malformed deployment name." }
         }
     }
-    Assert-Fails { & $deployScript -TestSettingsPath $test } "overwrite"
+    Assert-Fails { & $deployScript -SettingsPath $production } "overwrite"
     Write-Host "Infrastructure script tests passed (guards, native failures, validation, existing-server safety, settings schema, explicit subscription)."
 }
 finally {
-    foreach ($file in @($production, $test)) {
+    foreach ($file in @($production)) {
         if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force }
     }
-    foreach ($directory in @((Split-Path $production), (Split-Path $test), $testRoot)) {
+    foreach ($directory in @((Split-Path $production), $testRoot)) {
         if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory }
     }
     Remove-Variable -Name PrivyInfraCalls, PrivyInfraFailAzure, PrivyInfraExistingServer, PrivyInfraWideFirewall, PrivyInfraAllowAll -Scope Global
