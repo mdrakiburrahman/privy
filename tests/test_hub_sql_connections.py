@@ -93,6 +93,102 @@ def test_failed_lease_entry_and_rollback_does_not_strand_process_lock():
         assert pool.submit(another_thread).result(timeout=2)
 
 
+
+def test_transaction_closes_cursor_before_returning_connection():
+    events = []
+
+    class Cursor:
+        def execute(self, *_args):
+            events.append("execute")
+
+        def close(self):
+            events.append("cursor.close")
+
+    class Connection:
+        def cursor(self):
+            return cursor
+
+        def commit(self):
+            events.append("commit")
+
+        def rollback(self):
+            events.append("rollback")
+
+        def close(self):
+            events.append("connection.close")
+
+    cursor = Cursor()
+    connection = Connection()
+    backend = object.__new__(SqlBackend)
+    backend._connect = lambda: connection
+
+    with backend.transaction():
+        pass
+    assert events == ["execute", "commit", "cursor.close", "connection.close"]
+
+    events.clear()
+    with pytest.raises(ValueError, match="test failure"):
+        with backend.transaction():
+            raise ValueError("test failure")
+    assert events == ["execute", "rollback", "cursor.close", "connection.close"]
+
+
+def test_pooled_transactions_close_cursors_under_concurrent_reads_and_flushes():
+    import threading
+
+    pool_slot = threading.BoundedSemaphore(1)
+    state_lock = threading.Lock()
+    cursor_open = False
+
+    class Cursor:
+        def execute(self, *_args):
+            return self
+
+        def fetchone(self):
+            return (0,)
+
+        def close(self):
+            nonlocal cursor_open
+            with state_lock:
+                assert cursor_open
+                cursor_open = False
+
+    class Connection:
+        def cursor(self):
+            nonlocal cursor_open
+            with state_lock:
+                if cursor_open:
+                    raise RuntimeError("HY000: connection is busy with results")
+                cursor_open = True
+            return Cursor()
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pool_slot.release()
+
+    def connect():
+        assert pool_slot.acquire(timeout=2)
+        return Connection()
+
+    backend = object.__new__(SqlBackend)
+    backend._connect = connect
+
+    def run_transaction(index):
+        with backend.transaction("privy.concurrent-test") as cursor:
+            statement = "SELECT payload FROM dbo.privy_records" if index % 2 else "MERGE dbo.privy_records"
+            cursor.execute(statement)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(run_transaction, range(64)))
+
+    assert not cursor_open
+
+
 def test_report_history_reads_all_kinds_in_one_transaction():
     import json
 

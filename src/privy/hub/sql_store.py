@@ -505,6 +505,7 @@ class SqlBackend:
                 threading.get_ident(),
                 (time.perf_counter() - connection_started) * 1000,
             )
+        cursor = None
         try:
             raw_cursor = connection.cursor()
             cursor = _ProfileCursor(raw_cursor) if profile else raw_cursor
@@ -531,7 +532,15 @@ class SqlBackend:
                 raise StorageError("Authoritative Azure SQL transaction failed; no file fallback") from exc
             raise
         finally:
-            connection.close()
+            try:
+                if cursor is not None:
+                    cursor.close()
+            except Exception:
+                if hasattr(connection, "invalidate"):
+                    connection.invalidate()
+                log.exception("Azure SQL cursor close failed; connection discarded")
+            finally:
+                connection.close()
 
     def bootstrap(self) -> None:
         with self.transaction("privy.schema.v1") as cursor:
