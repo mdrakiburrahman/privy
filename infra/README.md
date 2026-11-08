@@ -1,12 +1,11 @@
 # Privy Azure SQL infrastructure
 
 Deploys an Entra-only logical SQL server and `privy` (Hyperscale `HS_Gen5_8`: Gen5, 8 vCores) in
-Canada Central. TLS
-1.2 is required; transparent data encryption is enabled. The single `privy-allow-all` firewall rule
-allows `0.0.0.0–255.255.255.255`, as explicitly chosen for multi-machine access. The server is
-internet-reachable, but connections still require Entra authentication and TLS. There are no
-passwords or Azure-services bypass rules. The application bootstraps its schema using
-`AzureCliCredential`.
+Canada Central. TLS 1.2 is required; transparent data encryption is enabled. The single
+`privy-allow-all` firewall rule allows `0.0.0.0–255.255.255.255`, as explicitly chosen for
+multi-machine access. The server is internet-reachable, but connections still require Entra
+authentication and TLS. There are no passwords or Azure-services bypass rules. The application
+bootstraps its schema using `AzureCliCredential`.
 
 Prerequisites: PowerShell, an authenticated Azure CLI user with permission to deploy resources in
 subscription `ce859648-30e1-4135-9d0f-8358aebfe789`, Bicep CLI, and (for application connectivity)
@@ -28,9 +27,8 @@ Second machines need no IP allowlisting. The script no longer accepts client IPs
 the same allow-all rule. Deployments are incremental: omitted rules and unrelated resources are
 preserved. Remove legacy per-IP rules explicitly after the first allow-all deployment; reruns do not
 recreate them. The script rejects automatic changes to existing target server identity,
-authentication, location, TLS/network settings or database
-SKU/HA/read-scale/zone/backup/collation. Use a reviewed Azure operation for intentional changes,
-then rerun.
+authentication, location, TLS/network settings or database SKU/HA/read-scale/zone/backup/collation.
+Use a reviewed Azure operation for intentional changes, then rerun.
 
 Existing databases must report a requested service objective matching the selected SKU; the script
 refuses to override pending SKU changes or missing requested-objective metadata. Hyperscale zone
@@ -40,9 +38,9 @@ The default server name is `privy-sql`; override `-ServerName` if needed for glo
 database name and supported SKUs are parameters. `HS_Gen5_8` is the default; `S0`, `S1`, `S2`, and
 `S3` remain available for intentional Standard-tier deployments. The Hyperscale configuration uses
 one high-availability replica, enables read scale-out, disables zone redundancy, and retains Local
-backup storage redundancy. All Azure operations pass the explicit
-subscription; the script does not run `az account set`. Deployment outputs are nonsecret resource
-IDs, FQDN, tiers, the firewall range, and explicit settings locations.
+backup storage redundancy. All Azure operations pass the explicit subscription; the script does not
+run `az account set`. Deployment outputs are nonsecret resource IDs, FQDN, tiers, the firewall
+range, and explicit settings locations.
 
 Using an indicative rate of **USD 0.22 per vCore-hour**, `HS_Gen5_8` with one HA replica is
 approximately **USD 84.48/day** for compute (`$0.22 × 8 vCores × 2 replicas × 24 hours`); storage,
