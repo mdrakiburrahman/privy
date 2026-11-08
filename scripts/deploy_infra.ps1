@@ -7,14 +7,9 @@ param(
     [string] $ServerName = "privy-sql",
     [ValidatePattern('^[A-Za-z][A-Za-z0-9_]{0,127}$')]
     [string] $DatabaseName = "privy",
-    [ValidatePattern('^[A-Za-z][A-Za-z0-9_]{0,127}$')]
-    [string] $TestDatabaseName = "privy_test",
     [ValidateSet("S0", "S1", "S2", "S3")]
     [string] $DatabaseSku = "S0",
-    [ValidateSet("Basic", "S0")]
-    [string] $TestDatabaseSku = "Basic",
     [string] $SettingsPath,
-    [string] $TestSettingsPath,
     [switch] $ValidateOnly
 )
 
@@ -78,12 +73,7 @@ storage:
     finally { $stream.Dispose() }
 }
 
-if ($DatabaseName -eq $TestDatabaseName) { throw "Production and test databases must have different names." }
 Assert-IsolatedSettingsPath $SettingsPath
-Assert-IsolatedSettingsPath $TestSettingsPath
-if ($SettingsPath -and $TestSettingsPath -and [IO.Path]::GetFullPath($SettingsPath) -eq [IO.Path]::GetFullPath($TestSettingsPath)) {
-    throw "Production and test settings must have different paths."
-}
 
 $account = Invoke-Azure @("account", "show")
 if ($account.user.type -ne "user") { throw "Deployment requires the signed-in user identity as Entra admin." }
@@ -124,7 +114,7 @@ if ($group.Count) {
             }
         }
         $databases = @(Invoke-Azure @("sql", "db", "list", "--resource-group", $ResourceGroupName, "--server", $ServerName))
-        foreach ($target in @(@{Name=$DatabaseName; Sku=$DatabaseSku}, @{Name=$TestDatabaseName; Sku=$TestDatabaseSku})) {
+        foreach ($target in @(@{Name=$DatabaseName; Sku=$DatabaseSku})) {
             $existingDb = @($databases | Where-Object name -EQ $target.Name)
             if ($existingDb.Count -and ($existingDb[0].currentServiceObjectiveName -ne $target.Sku -or
                 $existingDb[0].currentBackupStorageRedundancy -ne "Local" -or
@@ -141,9 +131,7 @@ $parameters = @{
     location = @{value=$Location}
     serverName = @{value=$ServerName}
     databaseName = @{value=$DatabaseName}
-    testDatabaseName = @{value=$TestDatabaseName}
     databaseSku = @{value=$DatabaseSku}
-    testDatabaseSku = @{value=$TestDatabaseSku}
     administratorObjectId = @{value=$objectId}
     administratorLogin = @{value=$account.user.name}
     tenantId = @{value=$tenantId}
@@ -166,18 +154,14 @@ try {
     }
     $outputs = $deployment.properties.outputs
     Write-HubSettings $SettingsPath $outputs.serverFqdn.value $DatabaseName
-    Write-HubSettings $TestSettingsPath $outputs.serverFqdn.value $TestDatabaseName
     [pscustomobject]@{
         deploymentId = $deployment.id
         provisioningState = $deployment.properties.provisioningState
         serverFqdn = $outputs.serverFqdn.value
         serverResourceId = $outputs.serverResourceId.value
         databaseResourceId = $outputs.databaseResourceId.value
-        testDatabaseResourceId = $outputs.testDatabaseResourceId.value
         databaseSku = $outputs.databaseSku.value
-        testDatabaseSku = $outputs.testDatabaseSku.value
         settingsPath = $SettingsPath
-        testSettingsPath = $TestSettingsPath
         firewallRule = "privy-allow-all"
         startIpAddress = "0.0.0.0"
         endIpAddress = "255.255.255.255"
