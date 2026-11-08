@@ -93,7 +93,6 @@ def test_failed_lease_entry_and_rollback_does_not_strand_process_lock():
         assert pool.submit(another_thread).result(timeout=2)
 
 
-
 def test_transaction_closes_cursor_before_returning_connection():
     events = []
 
