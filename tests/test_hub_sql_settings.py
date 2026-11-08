@@ -1,9 +1,12 @@
 import json
 from contextlib import contextmanager
 from pathlib import Path
+from threading import Lock, Thread
 
 import pytest
+import yaml
 
+from privy.hub.leases import DEFAULT_CONFIG, effective_lease_config
 from privy.hub.settings import SettingsError, load_settings
 from privy.hub.sql_store import SqlBackend, StorageError, _home_identity, _HomeLock
 
@@ -125,3 +128,74 @@ def test_sql_home_identity_is_stable_and_single_process_exclusive(tmp_path):
             _HomeLock(tmp_path / "sql-home.lock")
     finally:
         lock.close()
+
+
+class ConfigCursor:
+    def __init__(self, payload):
+        self.row = (json.dumps(payload),)
+        self.statements = []
+        self.lock = Lock()
+        self.protected_rows = {
+            "clients": {"client-1": {"id": "client-1"}},
+            "leases": {"lease-1": {"client_id": "client-1", "running_jobs": ["job-1"]}},
+            "pins": {"job-1": {"owner": "hub-b"}},
+        }
+
+    def execute(self, query, *args):
+        self.statements.append((query, args))
+
+    def fetchone(self):
+        return self.row
+
+
+def make_config_backend(cursor):
+    @contextmanager
+    def transaction(lock_name=None):
+        assert lock_name == "privy.leases"
+        with cursor.lock:
+            yield cursor
+
+    backend = object.__new__(SqlBackend)
+    backend.transaction = transaction
+    return backend
+
+
+def test_concurrent_sql_starts_accept_equivalent_legacy_config_without_mutating_shared_state():
+    legacy = yaml.safe_load(DEFAULT_CONFIG)
+    current = yaml.safe_load(DEFAULT_CONFIG.replace("  manual_max_ttl: 365d\n", ""))
+    expected = effective_lease_config(current)
+    cursor = ConfigCursor(legacy)
+    protected_before = json.loads(json.dumps(cursor.protected_rows))
+    backend = make_config_backend(cursor)
+    errors = []
+
+    def start_hub():
+        try:
+            backend.check_config("leases", expected)
+        except Exception as exc:
+            errors.append(exc)
+
+    starters = [Thread(target=start_hub) for _ in range(2)]
+    for starter in starters:
+        starter.start()
+    for starter in starters:
+        starter.join()
+
+    assert errors == []
+    assert len(cursor.statements) == 2
+    assert all(statement[0].startswith("SELECT") for statement in cursor.statements)
+    assert cursor.protected_rows == protected_before
+
+
+def test_sql_lease_config_rejects_genuine_semantic_mismatch():
+    current = yaml.safe_load(DEFAULT_CONFIG)
+    expected = effective_lease_config(current)
+    changed = yaml.safe_load(DEFAULT_CONFIG)
+    changed["defaults"]["ttl"] = "45m"
+    cursor = ConfigCursor(changed)
+    backend = make_config_backend(cursor)
+
+    with pytest.raises(StorageError, match="configuration differs"):
+        backend.check_config("leases", expected)
+    assert len(cursor.statements) == 1
+    assert cursor.statements[0][0].startswith("SELECT")
