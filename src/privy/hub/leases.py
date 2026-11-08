@@ -557,14 +557,44 @@ class LeaseStore:
     def _latest(self, group: str) -> dict[str, Any] | None:
         return next((item for item in reversed(self._leases.values()) if item["group"] == group), None)
 
-    def _group_view(self, group: dict[str, Any], *, probe: bool = False) -> dict[str, Any]:
+    def _group_view(
+        self,
+        group: dict[str, Any],
+        *,
+        probe: bool = False,
+        snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         key = group["group"]
-        lease = self._active(key)
-        use = self._uses.get(key, {})
-        allocation = self._latest(key)
-        latest = allocation.get("expired_ts", 0) if allocation and allocation["state"] == "expired" else 0
+        leases = snapshot["leases"] if snapshot is not None else self._leases
+        uses = snapshot["uses"] if snapshot is not None else self._uses
+        now = snapshot["now"] if snapshot is not None else self._clock()
+        lease = next(
+            (
+                item
+                for item in leases.values()
+                if item["group"] == key
+                and item["state"] == "active"
+                and (item["running_jobs"] or item["expires_ts"] > now)
+            ),
+            None,
+        )
+        use = uses.get(key, {})
+        allocation = next(
+            (item for item in reversed(leases.values()) if item["group"] == key),
+            None,
+        )
+        expired_at = 0
+        if allocation:
+            if allocation["state"] == "expired":
+                expired_at = allocation.get("expired_ts", 0)
+            elif (
+                allocation["state"] == "active"
+                and not allocation["running_jobs"]
+                and allocation["expires_ts"] <= now
+            ):
+                expired_at = allocation["expires_ts"]
         released = allocation.get("released_ts", 0) if allocation and allocation["state"] == "released" else 0
-        last = max(use.get("at", 0), latest)
+        last = max(use.get("at", 0), expired_at)
         leasable = last + self.cooldown if last > released else 0
         online = True
         for layer in group["require_online"]:
@@ -583,7 +613,7 @@ class LeaseStore:
             else "unavailable"
             if not online
             else "cooling"
-            if leasable > self._clock()
+            if leasable > now
             else "free"
         )
         if self.sql_backend is not None and use.get("running_jobs") and not lease:
@@ -597,10 +627,15 @@ class LeaseStore:
             else None,
             "last_used_at": utc_iso(use.get("at")),
             "last_used_by": use.get("by"),
-            "retry_after_s": max(0, int((lease["expires_ts"] if lease else leasable) - self._clock()) + 1),
+            "retry_after_s": max(0, int((lease["expires_ts"] if lease else leasable) - now) + 1),
         }
 
     def groups(self, *, probe: bool = False) -> list[dict[str, Any]]:
+        read_snapshot = getattr(self._lock, "read_snapshot", None)
+        if callable(read_snapshot):
+            with read_snapshot() as snapshot:
+                groups, _ = self._membership()
+                return [self._group_view(g, probe=probe, snapshot=snapshot) for g in groups.values()]
         with self._lock:
             self._sweep()
             groups, _ = self._membership()

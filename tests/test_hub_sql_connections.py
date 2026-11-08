@@ -164,6 +164,61 @@ def test_lease_lock_loads_snapshot_with_one_batched_read():
     assert store._uses == {"dev/box": use}
 
 
+
+def test_lease_read_snapshot_is_serializable_without_application_lock():
+    target = SimpleNamespace(id="dev/box_windows", namespace="dev", path="/tmp/box")
+    target_config = {"targets": [{"id": target.id, "namespace": target.namespace, "path": target.path}]}
+
+    class Cursor:
+        def __init__(self):
+            self.result_sets = [[(1,)], [(1_800_000_000.25,)], [(json.dumps(target_config),)], []]
+            self.result_set_index = 0
+            self.queries = []
+
+        def execute(self, query, *params):
+            self.queries.append((query, params))
+
+        def fetchone(self):
+            rows = self.result_sets[self.result_set_index]
+            return rows[0] if rows else None
+
+        def fetchall(self):
+            return self.result_sets[self.result_set_index]
+
+        def nextset(self):
+            self.result_set_index += 1
+            return self.result_set_index < len(self.result_sets)
+
+    cursor = Cursor()
+    transactions = []
+
+    @contextmanager
+    def transaction(lock=None, *, isolation_level=None):
+        transactions.append((lock, isolation_level))
+        yield cursor
+
+    backend = SimpleNamespace(
+        transaction=transaction,
+        assert_owner_active=lambda _cursor: None,
+        _assert_owner_current=lambda: None,
+        owner="hub-1",
+    )
+    store = SimpleNamespace(
+        registry=SimpleNamespace(snapshot=lambda: SimpleNamespace(targets=[target])),
+        _clients={},
+        _leases={},
+        _uses={},
+    )
+    lock = SqlLeaseLock(store, backend)
+
+    with lock.read_snapshot() as snapshot:
+        assert snapshot["now"] == 1_800_000_000.25
+
+    assert transactions == [(None, "SERIALIZABLE")]
+    assert len(cursor.queries) == 1
+    assert "sp_getapplock" not in cursor.queries[0][0]
+    assert store._clients == {} and store._leases == {} and store._uses == {}
+
 def test_lease_lock_rejects_snapshot_for_fenced_owner():
     class Cursor:
         def __init__(self):
@@ -203,10 +258,12 @@ def test_lease_lock_rejects_snapshot_for_fenced_owner():
 
 def test_transaction_closes_cursor_before_returning_connection():
     events = []
+    queries = []
 
     class Cursor:
-        def execute(self, *_args):
+        def execute(self, query, *_args):
             events.append("execute")
+            queries.append(query)
 
         def close(self):
             events.append("cursor.close")
@@ -232,6 +289,14 @@ def test_transaction_closes_cursor_before_returning_connection():
     with backend.transaction():
         pass
     assert events == ["execute", "cursor.close", "commit", "connection.close"]
+    assert queries[-1] == "SET NOCOUNT ON; SET XACT_ABORT ON; SET LOCK_TIMEOUT 15000;"
+
+    events.clear()
+    queries.clear()
+    with backend.transaction(isolation_level="SERIALIZABLE"):
+        pass
+    assert events == ["execute", "cursor.close", "commit", "connection.close"]
+    assert queries[0].startswith("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;")
 
     events.clear()
     with pytest.raises(ValueError, match="test failure"):

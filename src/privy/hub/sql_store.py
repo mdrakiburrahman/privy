@@ -494,7 +494,9 @@ class SqlBackend:
             self._thread.start()
 
     @contextmanager
-    def transaction(self, lock: str | None = None):
+    def transaction(self, lock: str | None = None, *, isolation_level: str | None = None):
+        if isolation_level not in (None, "SERIALIZABLE"):
+            raise ValueError(f"unsupported SQL transaction isolation level: {isolation_level}")
         profile = _profile_sql_enabled()
         connection_started = time.perf_counter()
         try:
@@ -527,7 +529,10 @@ class SqlBackend:
         try:
             raw_cursor = connection.cursor()
             cursor = _ProfileCursor(raw_cursor) if profile else raw_cursor
-            cursor.execute("SET NOCOUNT ON; SET XACT_ABORT ON; SET LOCK_TIMEOUT 15000;")
+            setup = "SET NOCOUNT ON; SET XACT_ABORT ON; SET LOCK_TIMEOUT 15000;"
+            if isolation_level == "SERIALIZABLE":
+                setup = f"SET TRANSACTION ISOLATION LEVEL {isolation_level}; {setup}"
+            cursor.execute(setup)
             if lock:
                 cursor.execute(
                     "DECLARE @r int; EXEC @r=sys.sp_getapplock @Resource=?, @LockMode='Exclusive', "
@@ -1504,6 +1509,88 @@ class SqlLeaseLock:
         self._lock = threading.RLock()
         self._local = threading.local()
 
+    def _read_snapshot(self, cursor: Any) -> dict[str, Any]:
+        assert_active = getattr(self.backend, "assert_owner_active", None)
+        assert_current = getattr(self.backend, "_assert_owner_current", None)
+        owner = getattr(self.backend, "owner", None)
+        if assert_current is not None:
+            assert_current()
+        elif assert_active is not None:
+            assert_active(cursor)
+        cursor.execute(
+            (
+                "SELECT CASE WHEN EXISTS(SELECT 1 FROM dbo.privy_coordination "
+                "WHERE kind='hub' AND id=? AND JSON_VALUE(payload,'$.active')='true') "
+                "THEN 1 ELSE 0 END;"
+                if owner is not None
+                else ""
+            )
+            + "SELECT DATEDIFF_BIG(millisecond,'1970-01-01',SYSUTCDATETIME())/1000.0;"
+            "SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id='targets';"
+            "SELECT kind,id,payload FROM dbo.privy_coordination "
+            "WHERE kind IN('client','lease','use') ORDER BY ordinal",
+            *((owner,) if owner is not None else ()),
+        )
+        now_row = cursor.fetchone()
+        if owner is not None:
+            if now_row is None:
+                raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
+            if not now_row[0]:
+                if assert_active is not None:
+                    assert_active(cursor)
+                raise StorageError("this Azure SQL hub incarnation was fenced; restart the hub")
+            if not cursor.nextset():
+                raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
+            now_row = cursor.fetchone()
+        if now_row is None or not cursor.nextset():
+            raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
+        now = float(now_row[0])
+        row = cursor.fetchone()
+        targets = {
+            "targets": [
+                {"id": target.id, "namespace": target.namespace, "path": target.path}
+                for target in self.store.registry.snapshot().targets
+            ]
+        }
+        if row is None or json.loads(row[0]) != targets:
+            raise StorageError(
+                "Local target configuration changed or differs from shared SQL configuration"
+            )
+        if not cursor.nextset():
+            raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
+        records = {"client": {}, "lease": {}, "use": {}}
+        for kind, key, raw in cursor.fetchall():
+            records[kind][key] = json.loads(raw)
+        if cursor.nextset():
+            raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
+        return {
+            "now": now,
+            "clients": records["client"],
+            "leases": records["lease"],
+            "uses": records["use"],
+        }
+
+    def _load_snapshot(self, cursor: Any) -> None:
+        snapshot = self._read_snapshot(cursor)
+        self._local.now = snapshot["now"]
+        self.store._clients = snapshot["clients"]
+        self.store._leases = snapshot["leases"]
+        self.store._uses = snapshot["uses"]
+        self._local.before = copy.deepcopy(
+            {
+                "client": snapshot["clients"],
+                "lease": snapshot["leases"],
+                "use": snapshot["uses"],
+            }
+        )
+
+    @contextmanager
+    def read_snapshot(self):
+        """Return a fresh detached SQL-time view without taking either lease lock."""
+        with self.backend.transaction(isolation_level="SERIALIZABLE") as cursor:
+            snapshot = self._read_snapshot(cursor)
+        yield snapshot
+
     def __enter__(self):
         self._lock.acquire()
         depth = getattr(self._local, "depth", 0)
@@ -1516,65 +1603,7 @@ class SqlLeaseLock:
             cursor = transaction.__enter__()
             self._local.transaction = transaction
             self._local.cursor = cursor
-            assert_active = getattr(self.backend, "assert_owner_active", None)
-            assert_current = getattr(self.backend, "_assert_owner_current", None)
-            owner = getattr(self.backend, "owner", None)
-            if assert_current is not None:
-                assert_current()
-            elif assert_active is not None:
-                assert_active(cursor)
-            cursor.execute(
-                (
-                    "SELECT CASE WHEN EXISTS(SELECT 1 FROM dbo.privy_coordination "
-                    "WHERE kind='hub' AND id=? AND JSON_VALUE(payload,'$.active')='true') "
-                    "THEN 1 ELSE 0 END;"
-                    if owner is not None
-                    else ""
-                )
-                + "SELECT DATEDIFF_BIG(millisecond,'1970-01-01',SYSUTCDATETIME())/1000.0;"
-                "SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id='targets';"
-                "SELECT kind,id,payload FROM dbo.privy_coordination "
-                "WHERE kind IN('client','lease','use') ORDER BY ordinal",
-                *((owner,) if owner is not None else ()),
-            )
-            now_row = cursor.fetchone()
-            if owner is not None:
-                if now_row is None:
-                    raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
-                if not now_row[0]:
-                    if assert_active is not None:
-                        assert_active(cursor)
-                    raise StorageError("this Azure SQL hub incarnation was fenced; restart the hub")
-                if not cursor.nextset():
-                    raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
-                now_row = cursor.fetchone()
-            if now_row is None or not cursor.nextset():
-                raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
-            self._local.now = float(now_row[0])
-            row = cursor.fetchone()
-            targets = {
-                "targets": [
-                    {"id": t.id, "namespace": t.namespace, "path": t.path}
-                    for t in self.store.registry.snapshot().targets
-                ]
-            }
-            if row is None or json.loads(row[0]) != targets:
-                raise StorageError(
-                    "Local target configuration changed or differs from shared SQL configuration"
-                )
-            if not cursor.nextset():
-                raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
-            state = {"client": {}, "lease": {}, "use": {}}
-            for kind, key, raw in cursor.fetchall():
-                state[kind][key] = json.loads(raw)
-            if cursor.nextset():
-                raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
-            self.store._clients, self.store._leases, self.store._uses = (
-                state["client"],
-                state["lease"],
-                state["use"],
-            )
-            self._local.before = copy.deepcopy(state)
+            self._load_snapshot(cursor)
             return self
         except BaseException as exc:
             try:

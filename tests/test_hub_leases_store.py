@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -169,6 +170,28 @@ def test_first_leasing_start_restores_cooldown_from_existing_hub_audit(tmp_path)
     assert error.value.code == "cooling_down"
     assert error.value.details["last_used_by"] == {"origin": "ui"}
 
+
+def test_sql_group_snapshot_displays_expiry_without_persisting_sweep(leasing, monkeypatch):
+    _, store, now = leasing
+    owner = client(store)
+    lease = acquire(store, owner, ttl="1m")
+    now[0] += 61
+    before = json.loads(json.dumps(store._leases[lease["lease_id"]]))
+
+    class SnapshotLock:
+        @contextmanager
+        def read_snapshot(self):
+            yield {"now": now[0], "leases": store._leases, "uses": store._uses}
+
+    store._lock = SnapshotLock()
+    store.sql_backend = object()
+    monkeypatch.setattr(store, "_save", lambda: pytest.fail("dashboard snapshot persisted sweep"))
+
+    groups = {item["group"]: item for item in store.groups()}
+    group = groups["dev/raki-windows-big"]
+    assert group["state"] == "cooling"
+    assert group["lease"] is None
+    assert store._leases[lease["lease_id"]] == before
 
 def test_group_regex_boundaries_unmatched_and_only_required_layer_online(leasing):
     hub, store, _ = leasing
