@@ -287,9 +287,15 @@ def test_report_history_aggregates_probe_and_call_data_in_one_transaction():
     assert "OPENJSON(?)" in cursor.executed[4][0]
     assert cursor.executed[4][1] == ('["probe-1"]',)
     assert "LAG(probe_status)" in cursor.executed[5][0]
-    assert "ROW_NUMBER() OVER(PARTITION BY target ORDER BY probe_latency_ms,at,id)" in cursor.executed[6][0]
+    target_p50_query = cursor.executed[6][0]
+    assert (
+        "ROW_NUMBER() OVER(PARTITION BY p.target ORDER BY p.probe_latency_ms,p.at,p.id)" in target_p50_query
+    )
+    assert "GROUP BY target" in target_p50_query
+    assert "COUNT_BIG(*) OVER" not in target_p50_query
+    assert "THEN 1 ELSE 0 END + 1" in target_p50_query
     assert "ORDER BY probe_latency_ms,target,at,id" in cursor.executed[7][0]
-    assert cursor.executed[6][1] == (2, 4)
+    assert cursor.executed[6][1] == (2, 4, 2, 4)
     assert cursor.executed[7][1] == (2, 4, 2, 4, 2, 4)
     assert "GROUP BY JSON_VALUE(payload,'$.surface')" in cursor.executed[8][0]
     assert history["jobs"] == [job]

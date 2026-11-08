@@ -1016,19 +1016,26 @@ class SqlBackend:
             where += " AND probe_status='online' AND probe_latency_ms IS NOT NULL"
             cursor.execute(
                 f"""
-                WITH ranked AS (
-                    SELECT target,probe_latency_ms,
-                        ROW_NUMBER() OVER(PARTITION BY target ORDER BY probe_latency_ms,at,id) AS sample_rank,
-                        COUNT_BIG(*) OVER(PARTITION BY target) AS sample_count
+                WITH counts AS (
+                    SELECT target,COUNT_BIG(*) AS sample_count
                     FROM dbo.privy_records WHERE {where}
+                    GROUP BY target
+                ), ranked AS (
+                    SELECT p.target,p.probe_latency_ms,
+                        ROW_NUMBER() OVER(PARTITION BY p.target ORDER BY p.probe_latency_ms,p.at,p.id) AS sample_rank,
+                        counts.sample_count
+                    FROM dbo.privy_records p
+                    JOIN counts ON counts.target=p.target
+                    WHERE {where}
                 )
                 SELECT target,MAX(probe_latency_ms)
                 FROM ranked
                 WHERE sample_rank=(sample_count-1)/2 +
                     CASE WHEN (sample_count-1)%2=1
-                        AND ((sample_count-1)/2)%2=1 THEN 1 ELSE 0 END
+                        AND ((sample_count-1)/2)%2=1 THEN 1 ELSE 0 END + 1
                 GROUP BY target
                 """,
+                *params,
                 *params,
             )
             latency_by_target = {
