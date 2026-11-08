@@ -1033,17 +1033,8 @@ class LeaseStore:
         with self._lock.read_snapshot() as snapshot:
             _, membership = self._membership()
             key, _ = membership[target]
-            lease = snapshot["leases"].get(lease_id) if lease_id else None
-            if lease_id:
-                if lease is None:
-                    raise LeaseError(f"unknown lease {lease_id!r}", status=404, code="unknown_lease")
-                if lease["state"] == "released":
-                    raise LeaseError("lease was released", status=409, code="lease_released")
-                latest = next(
-                    (item for item in reversed(snapshot["leases"].values()) if item["group"] == key), None
-                )
-                if latest is not None and latest["lease_id"] != lease_id:
-                    raise LeaseError("this lease was superseded", status=409, code="lease_lost")
+            lease = self._read_lease(snapshot, lease_id) if lease_id else None
+            if lease is not None:
                 if lease["group"] != key or target not in lease["members"].values():
                     raise LeaseError(
                         "target is outside this lease's group", status=409, code="target_not_in_lease"
@@ -1064,6 +1055,33 @@ class LeaseStore:
                 result["lease_warning"] = {k: view[k] for k in ("lease_id", "group", "holder", "expires_at")}
         model.defer_use(self, target, lease_id, origin)
         return result
+
+    def read_touch(self, lease_id: str) -> None:
+        model = getattr(self.sql_backend, "read_model", None)
+        if model is None:
+            self.touch(lease_id)
+            return
+        with self._lock.read_snapshot() as snapshot:
+            self._read_lease(snapshot, lease_id)
+        model.defer_touch(self, lease_id)
+
+    def _read_lease(self, snapshot: dict[str, Any], lease_id: str) -> dict[str, Any]:
+        lease = snapshot["leases"].get(lease_id)
+        if lease is None:
+            raise LeaseError(f"unknown lease {lease_id!r}", status=404, code="unknown_lease")
+        if lease["state"] == "released":
+            raise LeaseError("lease was released", status=409, code="lease_released")
+        latest = next(
+            (item for item in reversed(snapshot["leases"].values()) if item["group"] == lease["group"]), None
+        )
+        if latest is not None and latest["lease_id"] != lease_id:
+            raise LeaseError(
+                "this lease was superseded by a newer group allocation",
+                status=409,
+                code="lease_lost",
+                details={"lease_id": lease_id, "holder": self._view(latest, snapshot=snapshot)["holder"]},
+            )
+        return lease
 
     def job_started(self, job: Any) -> None:
         with self._lock:

@@ -861,6 +861,10 @@ class SqlBackend:
     def read_output_snapshot(self, job_id: str):
         with self.transaction() as cursor:
             cursor.execute(
+                "SELECT COALESCE(TRY_CONVERT(bigint,JSON_VALUE(payload,'$.stdout_bytes')),0),"
+                "COALESCE(TRY_CONVERT(bigint,JSON_VALUE(payload,'$.stderr_bytes')),0),"
+                "COALESCE(TRY_CONVERT(bigint,JSON_VALUE(payload,'$.chunk_count')),0) "
+                "FROM dbo.privy_records WHERE kind='job' AND id=?; "
                 "WITH tail AS (SELECT TOP (4096) chunk_index,payload FROM dbo.privy_output "
                 "WHERE job_id=? ORDER BY chunk_index DESC), bounded AS ("
                 "SELECT chunk_index,payload,SUM(CONVERT(bigint,DATALENGTH(payload))) OVER("
@@ -868,9 +872,18 @@ class SqlBackend:
                 "ROW_NUMBER() OVER(ORDER BY chunk_index DESC) AS n FROM tail) "
                 "SELECT payload FROM bounded WHERE bytes<=8388608 OR n=1 ORDER BY chunk_index",
                 job_id,
+                job_id,
             )
+            metadata = cursor.fetchone()
+            if metadata is None or not cursor.nextset():
+                raise StorageError("SQL output snapshot metadata is unavailable")
             rows = [json.loads(row[0]) for row in cursor.fetchall()]
-        return sorted(rows, key=lambda row: row["index"])
+            if cursor.nextset():
+                raise StorageError("SQL output snapshot returned an unexpected result-set count")
+        return {
+            "rows": sorted(rows, key=lambda row: row["index"]),
+            "sizes": {"stdout": int(metadata[0]), "stderr": int(metadata[1]), "chunks": int(metadata[2])},
+        }
 
     def get(self, kind: str, key: str) -> dict | None:
         with self.transaction() as cursor:

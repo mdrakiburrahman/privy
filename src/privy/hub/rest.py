@@ -408,7 +408,9 @@ class RestApi:
                         f"unknown argument(s) for stream_job: {', '.join(sorted(set(args) - {'job_id', 'lease_id'}))}"
                     )
                 return _stream_response(
-                    *self.service.job_usage(args["job_id"], lease_id=args.get("lease_id"), origin=origin)
+                    *self.service.job_usage(
+                        args["job_id"], lease_id=args.get("lease_id"), origin=origin, read_only=True
+                    )
                 )
             if route.operation == FORCE_RELEASE_OPERATION.name:
                 FORCE_RELEASE_OPERATION.parse(args)
@@ -429,13 +431,15 @@ class RestApi:
                 header_lease = headers.get("X-Privy-Lease")
                 if header_lease:
                     with _translated_errors():
-                        self.service.leases.touch(header_lease)
+                        self.service.leases.read_touch(header_lease)
             if stream and route.operation == "run":
                 return _stream_response(self.service.start_run(args, origin=origin))
             if stream:
                 OPERATIONS_BY_NAME[route.operation].parse(args)
                 return _stream_response(
-                    *self.service.job_usage(args["job_id"], lease_id=args.get("lease_id"), origin=origin)
+                    *self.service.job_usage(
+                        args["job_id"], lease_id=args.get("lease_id"), origin=origin, read_only=True
+                    )
                 )
             if route.operation == SYNC_OPERATION.name:
                 result = self.service.start_sync(args, origin=origin)
