@@ -112,6 +112,67 @@ def test_cursor_reads_are_batched_read_only_but_consumption_stays_atomic():
     assert any(query.startswith("UPDATE") for query, _ in cursor.queries)
 
 
+def test_collect_skips_lease_lock_when_no_retention_candidates():
+    class Cursor:
+        rowcount = 0
+
+        def __init__(self):
+            self.queries = []
+
+        def execute(self, query, *params):
+            self.queries.append((query, params))
+
+        def fetchone(self):
+            return (0,)
+
+    cursor = Cursor()
+    transactions = []
+
+    @contextmanager
+    def transaction(resource):
+        transactions.append(resource)
+        yield cursor
+
+    backend = SimpleNamespace(transaction=transaction)
+    assert SqlBackend.collect(backend) == {"output": 0, "jobs": 0, "history": 0, "leases": 0}
+    assert transactions == ["privy.gc"]
+    assert len(cursor.queries) == 1
+    query = cursor.queries[0][0]
+    assert "kind='job' AND at<@cutoff" in query
+    assert "kind<>'job' AND at<@cutoff" in query
+    assert "kind IN ('lease','hub')" in query and "DATEADD(day,-7,@now)" in query
+
+
+def test_collect_keeps_lease_lock_and_running_job_pin_guard_when_candidates_exist():
+    class Cursor:
+        rowcount = 0
+
+        def __init__(self):
+            self.queries = []
+            self.results = [(1,), (0,)]
+
+        def execute(self, query, *params):
+            self.queries.append((query, params))
+
+        def fetchone(self):
+            return self.results.pop(0)
+
+    cursor = Cursor()
+    transactions = []
+
+    @contextmanager
+    def transaction(resource):
+        transactions.append(resource)
+        yield cursor
+
+    backend = SimpleNamespace(transaction=transaction)
+    assert SqlBackend.collect(backend) == {"output": 0, "jobs": 0, "history": 0, "leases": 0}
+    assert transactions == ["privy.gc"]
+    queries = [query for query, _ in cursor.queries]
+    assert any("@Resource='privy.leases'" in query for query in queries)
+    assert any("OPENJSON(c.payload,'$.running_jobs')" in query for query in queries)
+
+
 def test_failed_lease_entry_and_rollback_does_not_strand_process_lock():
     @contextmanager
     def failed_transaction(resource):

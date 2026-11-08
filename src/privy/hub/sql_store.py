@@ -100,6 +100,51 @@ class _ProfileCursor:
         )
         return row
 
+    def nextset(self):
+        started = time.perf_counter()
+        result = None
+        try:
+            result = self._cursor.nextset()
+            return result
+        except Exception as exc:
+            log.exception(
+                "sql_profile nextset failed thread=%s error_type=%s error=%s query=%r",
+                threading.get_ident(),
+                type(exc).__name__,
+                exc,
+                self._query,
+            )
+            raise
+        finally:
+            log.info(
+                "sql_profile nextset thread=%s duration_ms=%.1f result=%r query=%r",
+                threading.get_ident(),
+                (time.perf_counter() - started) * 1000,
+                result,
+                self._query,
+            )
+
+    def close(self):
+        started = time.perf_counter()
+        try:
+            return self._cursor.close()
+        except Exception as exc:
+            log.exception(
+                "sql_profile cursor_close failed thread=%s error_type=%s error=%s query=%r",
+                threading.get_ident(),
+                type(exc).__name__,
+                exc,
+                self._query,
+            )
+            raise
+        finally:
+            log.info(
+                "sql_profile cursor_close thread=%s duration_ms=%.1f query=%r",
+                threading.get_ident(),
+                (time.perf_counter() - started) * 1000,
+                self._query,
+            )
+
     def __getattr__(self, name):
         return getattr(self._cursor, name)
 
@@ -549,7 +594,25 @@ class SqlBackend:
             except Exception as close_error:
                 cursor_close_error = close_error
                 raise
-            connection.commit()
+            commit_started = time.perf_counter()
+            try:
+                connection.commit()
+            except Exception as exc:
+                if profile:
+                    log.exception(
+                        "sql_profile commit failed thread=%s error_type=%s error=%s",
+                        threading.get_ident(),
+                        type(exc).__name__,
+                        exc,
+                    )
+                raise
+            finally:
+                if profile:
+                    log.info(
+                        "sql_profile commit thread=%s duration_ms=%.1f",
+                        threading.get_ident(),
+                        (time.perf_counter() - commit_started) * 1000,
+                    )
         except BaseException as exc:
             if type(exc).__module__ == "pyodbc" and hasattr(connection, "invalidate"):
                 connection.invalidate()
@@ -574,7 +637,20 @@ class SqlBackend:
                 raise StorageError("Authoritative Azure SQL transaction failed; no file fallback") from exc
             raise
         finally:
-            connection.close()
+            close_started = time.perf_counter()
+            try:
+                connection.close()
+            except Exception:
+                if profile:
+                    log.exception("sql_profile connection_return failed thread=%s", threading.get_ident())
+                raise
+            finally:
+                if profile:
+                    log.info(
+                        "sql_profile connection_return thread=%s duration_ms=%.1f",
+                        threading.get_ident(),
+                        (time.perf_counter() - close_started) * 1000,
+                    )
 
     def bootstrap(self) -> None:
         with self.transaction("privy.schema.v1") as cursor:
@@ -1419,8 +1495,18 @@ class SqlBackend:
     def collect(self, batch: int = 500) -> dict:
         if not 1 <= batch <= 1000:
             raise StorageError("GC batch must be between 1 and 1000")
-        counts = {}
+        counts = {"output": 0, "jobs": 0, "history": 0, "leases": 0}
         with self.transaction("privy.gc") as cursor:
+            cursor.execute(
+                "DECLARE @now datetime2=SYSUTCDATETIME(); "
+                "DECLARE @cutoff float=DATEDIFF_BIG(second,'1970-01-01',@now)-604800; "
+                "SELECT CASE WHEN EXISTS(SELECT 1 FROM dbo.privy_records WHERE kind='job' AND at<@cutoff) "
+                "OR EXISTS(SELECT 1 FROM dbo.privy_records WHERE kind<>'job' AND at<@cutoff) "
+                "OR EXISTS(SELECT 1 FROM dbo.privy_coordination WHERE kind IN ('lease','hub') "
+                "AND updated<DATEADD(day,-7,@now)) THEN 1 ELSE 0 END"
+            )
+            if not cursor.fetchone()[0]:
+                return counts
             cursor.execute(
                 "DECLARE @r int; EXEC @r=sys.sp_getapplock @Resource='privy.leases', @LockMode='Exclusive', "
                 "@LockOwner='Transaction', @LockTimeout=15000; SELECT @r;"
