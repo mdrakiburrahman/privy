@@ -46,7 +46,12 @@ def test_custom_dates_use_browser_timezone_and_preserve_interval(lease_browser):
         browser_api.expect(page.locator("#metrics-start")).to_have_value("2026-01-01T14:00")
         browser_api.expect(page.locator("#metrics-end")).to_have_value("2026-01-02T14:00")
         page.get_by_role("button", name="Apply", exact=True).click()
-        browser_api.expect(page.locator("#metrics-effective")).to_contain_text("2026-01-02T00:00:00.000Z")
+        browser_api.expect(page.locator("#metrics-effective")).to_contain_text("Jan 2, 2026 · 12:00 AM")
+        browser_api.expect(page.locator("#metrics-effective")).to_contain_text("Jan 3, 2026 · 12:00 AM")
+        browser_api.expect(page.locator("#metrics-effective")).to_contain_text("UTC")
+        times = page.locator("#metrics-effective time.range-time")
+        assert times.nth(0).get_attribute("datetime") == "2026-01-02T00:00:00.000Z"
+        assert times.nth(1).get_attribute("datetime") == "2026-01-03T00:00:00.000Z"
         browser_api.expect(page.locator("#metrics-start")).to_have_value("2026-01-01T14:00")
     finally:
         context.close()

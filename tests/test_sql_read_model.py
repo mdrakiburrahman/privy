@@ -172,6 +172,47 @@ def test_authoritative_feed_survives_ignored_pending_write_after_watermark_advan
         model.close()
 
 
+def test_overlay_added_after_outbox_snapshot_is_not_misclassified_as_acknowledged():
+    sampled_keys = threading.Event()
+    release_keys = threading.Event()
+    backend = Backend()
+    calls = 0
+
+    def pending_keys():
+        nonlocal calls
+        calls += 1
+        keys = set(backend.pending)
+        if calls == 2:
+            sampled_keys.set()
+            assert release_keys.wait(2)
+        return keys
+
+    backend.outbox = SimpleNamespace(pending_keys=pending_keys)
+    model = SqlReadModel(backend, start=False)
+    model.reads.interval = 3600
+    try:
+        model.refresh_once()
+        errors = []
+        refresher = threading.Thread(target=lambda: _capture_error(model.refresh_once, errors))
+        refresher.start()
+        assert sampled_keys.wait(1)
+
+        identity = ("job", "j")
+        backend.pending.add(identity)
+        model.apply("job", "j", job("queued"))
+        release_keys.set()
+        refresher.join(2)
+
+        assert not refresher.is_alive()
+        assert not errors
+        assert model.get("job", "j")["state"] == "queued"
+        assert identity in model._pending
+        assert identity not in model._records
+    finally:
+        release_keys.set()
+        model.close()
+
+
 def test_acknowledged_overlay_stays_visible_until_authoritative_reread_and_preserves_newer_overlay():
     entered_feed = threading.Event()
     release_feed = threading.Event()

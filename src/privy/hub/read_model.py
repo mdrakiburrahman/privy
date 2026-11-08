@@ -232,13 +232,12 @@ class SqlReadModel:
         self.reads.invalidate(lambda key: key[0] in ("report", "history"))
 
     def refresh_once(self):
-        pending_keys = self.backend.outbox.pending_keys()
         with self._lock:
-            acknowledged = [
-                (identity, self._pending_revision.get(identity, 0))
-                for identity in self._pending
-                if identity not in pending_keys
-            ][:500]
+            candidates = [(identity, self._pending_revision.get(identity, 0)) for identity in self._pending]
+        pending_keys = self.backend.outbox.pending_keys()
+        acknowledged = [
+            (identity, revision) for identity, revision in candidates if identity not in pending_keys
+        ][:500]
         while True:
             if self._stop.is_set():
                 return

@@ -738,7 +738,7 @@ def facet_toolbar() -> str:
 # ---- overview -----------------------------------------------------------------------
 
 
-def overview_controls(report: dict[str, Any]) -> str:
+def overview_controls(report: dict[str, Any], *, sql_backed: bool = False) -> str:
     ranges = "".join(
         f'<option value="{name}"{" selected" if name == report["range"] else ""}>'
         f"{esc({'all': 'All retained history', 'custom': 'Custom dates'}.get(name, name))}</option>"
@@ -750,6 +750,14 @@ def overview_controls(report: dict[str, Any]) -> str:
         for name in RESOLUTIONS
     )
     custom = report["range"] == "custom"
+    history_notice = (
+        "Request, probe, and job history is shared through Azure SQL; expired records are collected after 7 days, "
+        "while active leases and running jobs are protected. Online status is live."
+        if sql_backed
+        else "Telemetry is kept in RAM without age-based expiry; memory usage grows until restart. "
+        f"Request and probe history resets on restart; collecting since {esc(report['telemetry_started_at'])}. "
+        "Existing audit-restored job summaries are separate. Online status and running jobs are live."
+    )
 
     def effective_time(name: str) -> str:
         exact = report[name]
@@ -782,9 +790,7 @@ def overview_controls(report: dict[str, Any]) -> str:
         f'<span class="effective-range">from {effective_time("start")} '
         f'<span aria-hidden="true">to</span> {effective_time("end")} '
         '<abbr title="Coordinated Universal Time">UTC</abbr></span></p>'
-        '<p class="fine">Telemetry is kept in RAM without age-based expiry; memory usage grows until restart. '
-        f"Request and probe history resets on restart; collecting since {esc(report['telemetry_started_at'])}. "
-        "Existing audit-restored job summaries are separate. Online status and running jobs are live.</p></section>"
+        f'<p class="fine">{history_notice}</p></section>'
     )
 
 
@@ -928,7 +934,10 @@ def overview_page(service: Any, report: dict[str, Any], now: float) -> str:
     )
     return (
         hero("PRIVY HUB · CONTROL PLANE", "What's running through the relays", chips)
-        + overview_controls(report)
+        + overview_controls(
+            report,
+            sql_backed=callable(getattr(getattr(service.jobs, "backend", None), "report_history", None)),
+        )
         + stats
         + warn
         + activity

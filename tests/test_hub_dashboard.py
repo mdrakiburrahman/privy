@@ -101,6 +101,13 @@ def test_overview_filter_controls_keep_selection_and_expose_exact_utc_range():
     assert 'datetime="2026-11-08T16:30:00.000Z"' in text
     assert "Nov 7, 2026 · 4:30 PM" in text and "Nov 8, 2026 · 4:30 PM" in text
     assert "Exact UTC instant: 2026-11-07T16:30:00.000Z" in text
+    assert "Telemetry is kept in RAM without age-based expiry" in text
+
+    sql_text = dashboard.overview_controls(report, sql_backed=True)
+    assert "shared through Azure SQL" in sql_text
+    assert "collected after 7 days" in sql_text
+    assert "Telemetry is kept in RAM" not in sql_text
+    assert "resets on restart" not in sql_text
 
     custom_text = dashboard.overview_controls({**report, "range": "custom"})
     assert 'class="report-dates" hidden' not in custom_text
