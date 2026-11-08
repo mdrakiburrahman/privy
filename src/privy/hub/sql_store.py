@@ -951,21 +951,26 @@ class SqlBackend:
             where, params = query("probe")
             cursor.execute(
                 f"""
-                WITH ranked AS (
-                    SELECT target,at,id,probe_status,probe_latency_ms,
-                        ROW_NUMBER() OVER(PARTITION BY target ORDER BY at DESC,id DESC) AS latest_rank,
-                        COUNT_BIG(*) OVER(PARTITION BY target) AS sample_count,
-                        SUM(CONVERT(bigint,CASE WHEN probe_status='online' THEN 1 ELSE 0 END))
-                            OVER(PARTITION BY target) AS online_count,
-                        MAX(CASE WHEN probe_status='online' THEN at END)
-                            OVER(PARTITION BY target) AS last_online,
-                        MIN(at) OVER(PARTITION BY target) AS earliest_at
+                WITH summary AS (
+                    SELECT target,COUNT_BIG(*) AS sample_count,
+                        SUM(CONVERT(bigint,CASE WHEN probe_status='online' THEN 1 ELSE 0 END)) AS online_count,
+                        MAX(CASE WHEN probe_status='online' THEN at END) AS last_online,
+                        MIN(at) AS earliest_at
                     FROM dbo.privy_records WHERE {where}
+                    GROUP BY target
                 )
-                SELECT target,sample_count,online_count,last_online,earliest_at,
-                    at,id,probe_status,probe_latency_ms
-                FROM ranked WHERE latest_rank=1
+                SELECT summary.target,summary.sample_count,summary.online_count,
+                    summary.last_online,summary.earliest_at,latest.at,latest.id,
+                    latest.probe_status,latest.probe_latency_ms
+                FROM summary
+                CROSS APPLY (
+                    SELECT TOP(1) p.at,p.id,p.probe_status,p.probe_latency_ms
+                    FROM dbo.privy_records p
+                    WHERE {where} AND p.target=summary.target
+                    ORDER BY p.at DESC,p.id DESC
+                ) latest
                 """,
+                *params,
                 *params,
             )
             probe_rows = cursor.fetchall()

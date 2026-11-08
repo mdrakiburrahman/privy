@@ -280,10 +280,11 @@ def test_report_history_aggregates_probe_and_call_data_in_one_transaction():
 
     assert transactions == [True]
     assert len(cursor.executed) == 10
-    assert "ROW_NUMBER() OVER(PARTITION BY target" in cursor.executed[3][0]
-    assert "JOIN dbo.privy_records payloads" not in cursor.executed[3][0]
+    assert "GROUP BY target" in cursor.executed[3][0]
+    assert "CROSS APPLY" in cursor.executed[3][0]
+    assert "COUNT_BIG(*) OVER" not in cursor.executed[3][0]
     assert "kind='probe'" in cursor.executed[3][0]
-    assert cursor.executed[3][1] == (2, 4)
+    assert cursor.executed[3][1] == (2, 4, 2, 4)
     assert "OPENJSON(?)" in cursor.executed[4][0]
     assert cursor.executed[4][1] == ('["probe-1"]',)
     assert "LAG(probe_status)" in cursor.executed[5][0]
