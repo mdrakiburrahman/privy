@@ -209,6 +209,7 @@ def test_sql_group_snapshot_uses_detached_holder_data_with_sql_time(leasing, loc
     expired["expires_ts"] = now[0] - 1
     expired["running_jobs"] = []
     snapshot_leases = {expired["lease_id"]: expired, lease["lease_id"]: active}
+    snapshot_reads = 0
 
     if local_cache == "empty":
         store._clients = {}
@@ -224,6 +225,8 @@ def test_sql_group_snapshot_uses_detached_holder_data_with_sql_time(leasing, loc
     class SnapshotLock:
         @contextmanager
         def read_snapshot(self):
+            nonlocal snapshot_reads
+            snapshot_reads += 1
             yield {
                 "now": now[0],
                 "clients": {owner: fresh_client},
@@ -233,13 +236,35 @@ def test_sql_group_snapshot_uses_detached_holder_data_with_sql_time(leasing, loc
 
     store._lock = SnapshotLock()
     store.sql_backend = object()
+    local_clients = json.loads(json.dumps(store._clients))
+    local_leases = json.loads(json.dumps(store._leases))
+    assert store.target_summaries([]) == {}
+    assert snapshot_reads == 0
     groups = {item["group"]: item for item in store.groups()}
     group = groups["dev/raki-windows-big"]
+    assert snapshot_reads == 1
 
     assert group["lease"]["lease_id"] == lease["lease_id"]
     assert group["lease"]["holder"]["name"] == "peer-created-client"
     assert group["lease"]["holder"]["host"] == "peer-host"
     assert group["lease"]["holder"]["leases"] == [lease["lease_id"]]
+
+    target_ids = [
+        "dev/raki-windows-big_windows",
+        "dev/raki-windows-big_wsl",
+        "dev/raki-windows-big_devcontainer",
+    ]
+    summaries = store.target_summaries(target_ids)
+    assert snapshot_reads == 2
+    for target_id in target_ids:
+        summary = summaries[target_id]
+        assert summary["group"] == "dev/raki-windows-big"
+        assert summary["lease"]["lease_id"] == lease["lease_id"]
+        assert summary["lease"]["holder"]["name"] == "peer-created-client"
+        assert summary["lease"]["holder"]["host"] == "peer-host"
+        assert summary["lease"]["holder"]["leases"] == [lease["lease_id"]]
+    assert store._clients == local_clients
+    assert store._leases == local_leases
 
 
 def test_group_regex_boundaries_unmatched_and_only_required_layer_online(leasing):
