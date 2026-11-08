@@ -62,7 +62,8 @@ class BackgroundReads:
                 return read.value
             read.value, read.ready, read.updated, read.error = value, True, self.clock(), None
             if read.key[0] in ("output", "output-range"):
-                read.size = sum(len(row.get("data", "")) + 1024 for row in value)
+                rows = value["rows"] if isinstance(value, dict) else value
+                read.size = sum(len(row.get("data", "")) + 1024 for row in rows)
             while sum(item.size for item in self._reads.values()) > 64 * 1024 * 1024:
                 self._reads.popitem(last=False)
         return value
@@ -78,7 +79,7 @@ class BackgroundReads:
             read.revision += 1
             read.value, read.ready, read.updated, read.error = copy.deepcopy(value), True, self.clock(), None
 
-    def get(self, key, load, *, wait=True, detached=True):
+    def get(self, key, load, *, wait=True, detached=True, refresh=False):
         with self._lock:
             read = self._reads.get(key)
             if read is None:
@@ -89,7 +90,7 @@ class BackgroundReads:
             else:
                 read.load = load
                 self._reads.move_to_end(key)
-            fresh = read.ready and self.clock() - read.updated < self.max_age
+            fresh = not refresh and read.ready and self.clock() - read.updated < self.max_age
             if fresh:
                 return copy.deepcopy(read.value) if detached else read.value
             future = self._submit(read)
@@ -192,7 +193,13 @@ class SqlReadModel:
             self._updated = time.monotonic()
             self._error = None
             self._ready.set()
-        self.reads.discard(lambda key: key[0] in ("record", "records", "list", "scan", "counts"))
+            live_jobs = {key for kind, key in self._records if kind == "job"}
+        self.reads.discard(
+            lambda key: (
+                key[0] in ("record", "records", "list", "scan", "counts")
+                or (key[0] in ("output", "output-range") and key[1] not in live_jobs)
+            )
+        )
 
     def _refresh(self):
         while not self._stop.is_set():
@@ -295,9 +302,23 @@ class SqlReadModel:
                 tuple(sorted(states)) if states is not None else None,
             )
             return self.reads.get(key, lambda: self.backend.list(kind, **filters))
+        rows = self._select(
+            kind,
+            before=before,
+            after=after,
+            target=target,
+            lease_id=lease_id,
+            client_id=client_id,
+            states=states,
+        )
+        return copy.deepcopy(rows[:limit])
+
+    def _select(
+        self, kind, *, before=None, after=None, target=None, lease_id=None, client_id=None, states=None
+    ):
         rows = [
-            row
-            for (row_kind, _), row in self._snapshot()
+            (key, row)
+            for (row_kind, key), row in self._snapshot()
             if row_kind == kind
             and all(
                 value is None or str(row.get(name, "")).casefold() == str(value).casefold()
@@ -307,11 +328,8 @@ class SqlReadModel:
             and (after is None or row.get("created_at", row.get("at", 0)) >= after)
             and (states is None or row.get("state") in states)
         ]
-        rows.sort(
-            key=lambda row: (row.get("created_at", row.get("at", 0)), row.get("job_id", row.get("id", ""))),
-            reverse=True,
-        )
-        return copy.deepcopy(rows[:limit])
+        rows.sort(key=lambda item: (item[1].get("created_at", item[1].get("at", 0)), item[0]), reverse=True)
+        return [row for _, row in rows]
 
     def scan(self, kind, **filters):
         if not self._ready.is_set():
@@ -322,25 +340,7 @@ class SqlReadModel:
             yield from rows
             return
         # No paging cap: purpose history and reports may span all retained jobs.
-        self._snapshot()
-        with self._lock:
-            size = len(self._records)
-        if size <= 100_000:
-            yield from self.list(kind, limit=100_000, **filters)
-            return
-        rows = [row for (row_kind, _), row in self._snapshot() if row_kind == kind]
-        for name in ("target", "lease_id", "client_id"):
-            if filters.get(name) is not None:
-                rows = [row for row in rows if str(row.get(name, "")).casefold() == filters[name].casefold()]
-        if filters.get("before") is not None:
-            rows = [row for row in rows if row.get("created_at", row.get("at", 0)) < filters["before"]]
-        if filters.get("after") is not None:
-            rows = [row for row in rows if row.get("created_at", row.get("at", 0)) >= filters["after"]]
-        rows.sort(
-            key=lambda row: (row.get("created_at", row.get("at", 0)), row.get("job_id", row.get("id", ""))),
-            reverse=True,
-        )
-        yield from copy.deepcopy(rows)
+        yield from copy.deepcopy(self._select(kind, **filters))
 
     def count_jobs(self):
         if not self._ready.is_set():
@@ -389,20 +389,44 @@ class SqlReadModel:
                 ),
             )
             return self.reads.get(key, lambda: self.backend.count_job_records(**filters))
-        states = filters.pop("states", None)
-        return sum(states is None or row.get("state") in states for row in self.scan("job", **filters))
+        return len(self._select("job", **filters))
 
     def report_history(self, *, after=None, before=None):
         # Called only by the background report builder. Keep the SQL aggregates:
         # do not hydrate hundreds of thousands of raw probe JSON documents.
         return self.backend.report_history(after=after, before=before)
 
+    def _output_snapshot(self, job_id, required=None):
+        key = ("output", job_id)
+
+        def load():
+            deadline = time.monotonic() + 3
+            while True:
+                snapshot = self.backend.read_output_snapshot(job_id)
+                if required is None or all(
+                    snapshot["sizes"][stream] >= end for stream, end in required.items()
+                ):
+                    return snapshot
+                if time.monotonic() >= deadline:
+                    raise StorageError("SQL output is still catching up to job metadata")
+                time.sleep(0.05)
+
+        deadline = time.monotonic() + 4
+        snapshot = self.reads.get(key, load, detached=False)
+        # Metadata and output refresh independently. Never report an older
+        # output snapshot as a genuine missing chunk when metadata advanced.
+        while required is not None and any(
+            snapshot["sizes"][stream] < end for stream, end in required.items()
+        ):
+            if time.monotonic() >= deadline:
+                raise StorageError("SQL output is still catching up to job metadata")
+            snapshot = self.reads.get(key, load, detached=False, refresh=True)
+        return snapshot
+
     def output(self, job_id, stream, offset, limit):
         if limit <= 0:
             return []
-        rows = self.reads.get(
-            ("output", job_id), lambda: self.backend.read_output_snapshot(job_id), detached=False
-        )
+        rows = self._output_snapshot(job_id, {stream: offset + limit})["rows"]
         # Large jobs keep only a bounded tail. Fetch earlier explicit ranges on
         # demand rather than falsely treating a truncated snapshot as complete.
         stream_rows = [row for row in rows if row["stream"] == stream]
@@ -420,12 +444,21 @@ class SqlReadModel:
         )
 
     def pieces(self, job_id, index, limit=200):
-        rows = self.reads.get(("output", job_id), lambda: self.backend.read_output_snapshot(job_id))
+        with self._lock:
+            count = self._records.get(("job", job_id), {}).get("chunk_count", 0)
+        return self.read_pieces(job_id, index, limit=limit, chunk_count=count)
+
+    def read_pieces(self, job_id, index, *, limit=200, chunk_count=0):
+        if limit <= 0:
+            return []
+        rows = self._output_snapshot(job_id, {"chunks": chunk_count})["rows"]
         if rows and index < rows[0]["index"]:
             return self.reads.get(
                 ("output-range", job_id, index, limit), lambda: self.backend.pieces(job_id, index, limit)
             )
-        return sorted((row for row in rows if row["index"] >= index), key=lambda row: row["index"])[:limit]
+        return copy.deepcopy(
+            sorted((row for row in rows if row["index"] >= index), key=lambda row: row["index"])[:limit]
+        )
 
     def read_view_output(self, job_id, ranges):
         cursor_streams = [stream for stream, (offset, _, _) in ranges.items() if offset is None]
@@ -443,12 +476,17 @@ class SqlReadModel:
         return getattr(self.backend, name)
 
     def defer_use(self, store, target, lease_id, origin):
-        key = target, lease_id, origin
+        self._defer(("use", target, lease_id, origin), lambda: store.use(target, lease_id, origin=origin))
+
+    def defer_touch(self, store, lease_id):
+        self._defer(("touch", lease_id), lambda: store.touch(lease_id))
+
+    def _defer(self, key, action):
         with self._lock:
             error = self._use_errors.pop(key, None)
             if error is not None:
                 raise StorageError("Deferred read-path lease accounting failed") from error
-            self._uses[key] = lambda: store.use(target, lease_id, origin=origin)
+            self._uses[key] = action
 
     def _account(self):
         while not self._stop.wait(0.25):

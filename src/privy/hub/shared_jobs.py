@@ -496,7 +496,12 @@ class SharedJob(HubJob):
         deadline = time.monotonic() + max(0, timeout)
         while True:
             self.refresh()
-            rows = self.backend.pieces(self.id, index, limit=200)
+            read = getattr(self.backend, "read_pieces", None)
+            rows = (
+                read(self.id, index, limit=200, chunk_count=self._record.get("chunk_count", 0))
+                if read is not None
+                else self.backend.pieces(self.id, index, limit=200)
+            )
             pieces = []
             for row in rows:
                 if row["index"] != index:

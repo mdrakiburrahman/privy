@@ -8,8 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from privy.hub.jobs import SUCCEEDED
 from privy.hub.leases import LeaseError, LeaseStore
 from privy.hub.read_model import BackgroundReads, SqlReadModel
+from privy.hub.shared_jobs import SharedJob
 from privy.hub.sql_store import DurableOutbox, SqlBackend, StorageError
 
 
@@ -43,7 +45,16 @@ class Backend:
 
     def read_output_snapshot(self, job_id):
         self.sql_reads += 1
-        return copy.deepcopy(self.chunks)
+        return {
+            "rows": copy.deepcopy(self.chunks),
+            "sizes": {
+                **{
+                    stream: max((row["end"] for row in self.chunks if row["stream"] == stream), default=0)
+                    for stream in ("stdout", "stderr")
+                },
+                "chunks": max((row["index"] + 1 for row in self.chunks), default=0),
+            },
+        }
 
     def output(self, job_id, stream, offset, limit):
         self.sql_reads += 1
@@ -99,9 +110,9 @@ def test_startup_listener_batch_does_not_fan_out_per_target(model):
 def test_refresh_observes_remote_changes_and_old_writer_deletions(model):
     model.backend.records = {("job", "j"): job()}
     model.refresh_once()
-    model.backend.records["job", "j"] = job("completed")
+    model.backend.records["job", "j"] = job(SUCCEEDED)
     model.refresh_once()
-    assert model.get("job", "j")["state"] == "completed"
+    assert model.get("job", "j")["state"] == SUCCEEDED
     del model.backend.records["job", "j"]
     model.refresh_once()
     assert model.get("job", "j") is None
@@ -117,9 +128,9 @@ def test_pending_local_write_survives_old_snapshot_but_not_later_remote_writer(m
     assert model.get("job", "j")["state"] == "running"
     model.backend.pending.clear()
     # The own-write version can be superseded before hydration ever sees it.
-    model.backend.records["job", "j"] = job("completed")
+    model.backend.records["job", "j"] = job(SUCCEEDED)
     model.refresh_once()
-    assert model.get("job", "j")["state"] == "completed"
+    assert model.get("job", "j")["state"] == SUCCEEDED
     assert not model._pending
 
 
@@ -127,6 +138,16 @@ def test_raw_probe_history_is_not_retained(model):
     model.apply("probe", "probe", {"data": "large"})
     model.apply("call", "call", {"data": "large"})
     assert not model._records
+
+
+def test_purpose_timestamp_ties_use_sql_identity_order_even_without_payload_id(model):
+    model.backend.records = {
+        ("purpose", "a"): {"created_at": 1, "purpose": "first"},
+        ("purpose", "z"): {"created_at": 1, "purpose": "last"},
+    }
+    model.refresh_once()
+    assert [row["purpose"] for row in model.list("purpose")] == ["last", "first"]
+    assert [row["purpose"] for row in model.scan("purpose")] == ["last", "first"]
 
 
 def test_stale_metadata_fails_explicitly(model):
@@ -164,11 +185,11 @@ def test_periodic_refresh_converges_within_five_seconds():
     model = SqlReadModel(backend)
     try:
         assert model._ready.wait(2)
-        backend.records["job", "j"] = job("completed")
+        backend.records["job", "j"] = job(SUCCEEDED)
         deadline = time.monotonic() + 5
-        while model.get("job", "j")["state"] != "completed" and time.monotonic() < deadline:
+        while model.get("job", "j")["state"] != SUCCEEDED and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert model.get("job", "j")["state"] == "completed"
+        assert model.get("job", "j")["state"] == SUCCEEDED
         assert time.monotonic() < deadline
     finally:
         model.close()
@@ -196,6 +217,34 @@ def test_truncated_output_tail_fetches_earlier_range_instead_of_inventing_gap(mo
     reads = model.backend.sql_reads
     assert model.output("j", "stdout", 100, 4)[0]["end"] == 104
     assert model.backend.sql_reads == reads
+
+
+def test_advanced_metadata_refreshes_older_output_snapshot_instead_of_returning_incomplete_data(model):
+    assert model._output_snapshot("j")["sizes"]["stdout"] == 0
+    model.backend.chunks = [{"index": 0, "stream": "stdout", "start": 0, "end": 4, "data": "YWJjZA=="}]
+    assert model.output("j", "stdout", 0, 4)[0]["end"] == 4
+    assert model.backend.sql_reads == 2
+
+
+def test_genuine_missing_chunk_is_not_mistaken_for_cache_lag(model):
+    model.backend.read_output_snapshot = lambda job_id: {
+        "rows": [],
+        "sizes": {"stdout": 4, "stderr": 0, "chunks": 1},
+    }
+    assert model.output("j", "stdout", 0, 4) == []
+
+
+def test_streaming_projection_carries_chunk_count_during_progressive_startup(model):
+    assert model._output_snapshot("j")["sizes"]["chunks"] == 0
+    model.backend.chunks = [{"index": 0, "stream": "stdout", "start": 0, "end": 4, "data": "YWJjZA=="}]
+    projection = SharedJob(
+        model,
+        job(SUCCEEDED, type="exec", spec={}, origin="rest", stdout_bytes=4, stderr_bytes=0, chunk_count=1),
+        snapshot=True,
+    )
+    pieces, index, complete = projection.next_pieces(0, 0)
+    assert len(pieces) == 1 and pieces[0].stream == "stdout"
+    assert index == 1 and complete
 
 
 def test_cold_reads_coalesce_parallel_requests():
@@ -259,18 +308,29 @@ def test_failed_refresh_does_not_return_expired_success(caplog):
         cache.close()
 
 
-def test_deferred_accounting_runs_once_not_forever(model):
+@pytest.mark.parametrize("operation", ["use", "touch"])
+def test_deferred_accounting_runs_once_off_thread_not_forever(model, operation):
     delivered = threading.Event()
     calls = []
+    foreground_thread = threading.get_ident()
 
     def use(target, lease_id, *, origin):
+        assert threading.get_ident() != foreground_thread
         calls.append((target, lease_id, origin))
         delivered.set()
 
-    model.defer_use(SimpleNamespace(use=use), "box", "lease", "rest")
+    def touch(lease_id):
+        assert threading.get_ident() != foreground_thread
+        calls.append((None, lease_id, None))
+        delivered.set()
+
+    if operation == "use":
+        model.defer_use(SimpleNamespace(use=use), "box", "lease", "rest")
+    else:
+        model.defer_touch(SimpleNamespace(touch=touch), "lease")
     assert delivered.wait(2)
     time.sleep(0.35)
-    assert calls == [("box", "lease", "rest")]
+    assert calls == [("box", "lease", "rest") if operation == "use" else (None, "lease", None)]
 
 
 def test_outbox_pending_keys_are_not_limited_to_one_flush_batch(tmp_path):
@@ -305,6 +365,30 @@ def test_change_watermark_stops_before_uncommitted_transaction():
     assert executes[1][-1] == (12).to_bytes(8, "big")
 
 
+def test_output_snapshot_reads_metadata_before_bounded_chunks_in_one_execute():
+    executes = []
+    sets = iter([True, False])
+    chunk = {"index": 0, "stream": "stdout", "start": 0, "end": 4, "data": "YWJjZA=="}
+    cursor = SimpleNamespace(
+        execute=lambda *args: executes.append(args),
+        fetchone=lambda: (4, 0, 1),
+        fetchall=lambda: [(json.dumps(chunk),)],
+        nextset=lambda: next(sets),
+    )
+    backend = object.__new__(SqlBackend)
+
+    @contextlib.contextmanager
+    def transaction():
+        yield cursor
+
+    backend.transaction = transaction
+    snapshot = backend.read_output_snapshot("j")
+    assert snapshot == {"rows": [chunk], "sizes": {"stdout": 4, "stderr": 0, "chunks": 1}}
+    assert len(executes) == 1 and executes[0][1:] == ("j", "j")
+    assert executes[0][0].startswith("SELECT COALESCE")
+    assert "bytes<=8388608" in executes[0][0]
+
+
 def advisory_store():
     calls = []
     lease = {
@@ -329,7 +413,9 @@ def advisory_store():
 
     store = object.__new__(LeaseStore)
     store.sql_backend = SimpleNamespace(
-        read_model=SimpleNamespace(defer_use=lambda *args: calls.append(args))
+        read_model=SimpleNamespace(
+            defer_use=lambda *args: calls.append(args), defer_touch=lambda *args: calls.append(args)
+        )
     )
     store._lock = SimpleNamespace(read_snapshot=read_snapshot)
     store._membership = lambda: ({}, {"box": ("group", "windows")})
@@ -341,6 +427,12 @@ def test_read_accounting_returns_warning_without_entering_authoritative_lock():
     assert store.read_use("box", "lease") == {"purpose": "work"}
     assert len(calls) == 1
     assert store.read_use("box")["lease_warning"]["lease_id"] == "lease"
+
+
+def test_read_header_touch_does_not_enter_authoritative_lock():
+    store, _, calls = advisory_store()
+    store.read_touch("lease")
+    assert calls == [(store, "lease")]
 
 
 @pytest.mark.parametrize("state,code", [("released", "lease_released"), ("superseded", "lease_lost")])
