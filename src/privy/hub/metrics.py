@@ -432,6 +432,7 @@ class HubMetrics:
         selection: ReportSelection | None = None,
         jobs_running: int = 0,
         jobs_queued: int = 0,
+        jobs_retained: int | None = None,
         max_running: int = 0,
     ) -> dict[str, Any]:
         """Every number on the dashboard, as JSON-ready data."""
@@ -612,7 +613,7 @@ class HubMetrics:
             "telemetry_started_at": utc_iso(self.started_at),
             "restored_jobs": self.restored_jobs,
             "history_since": utc_iso(entries[0].created_at) if entries else None,
-            "kept_jobs": len(entries),
+            "kept_jobs": len(entries) if jobs_retained is None else jobs_retained,
             "targets_total": len(configured),
             "targets_online": statuses,
             "targets_used": sum(1 for row in rows if row["jobs"]),

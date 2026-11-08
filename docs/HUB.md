@@ -100,7 +100,7 @@ dashboard sidebar shows `storage Azure SQL` and pending/rejected delivery counts
 SQL and `/v1` includes detailed storage health. The isolated Basic-tier SQL benchmark (20 simulated
 devboxes, 3,360 jobs over seven days, 4 KiB output per job) measured a 200-job page at 0.63 seconds,
 seven-day statistics at 4.21 seconds, dashboard HTML at 5.35 seconds and an output page at 1.42
-seconds. This is not a production-tier or two-physical-machine measurement.
+seconds. This is not a production-tier or two-physical-machine measurement. Dashboard pages render cached listener statuses while stale probes continue in the background, waiting at most 0.5 seconds for a refresh. SQL-backed reports reuse the job counts already read for that page.
 
 ## Quick start
 

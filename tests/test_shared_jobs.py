@@ -915,6 +915,28 @@ def test_shared_report_query_count_is_page_bounded_not_per_job(tmp_path):
         jobs.close()
 
 
+def test_shared_report_reuses_supplied_job_counts(tmp_path):
+    hub = Hub(tmp_path)
+    backend = Backend()
+    jobs = manager(hub, backend)
+    target = hub.registry.resolve("dev/box1_windows")
+    count_calls = []
+    original_count_jobs = backend.count_jobs
+
+    def count_jobs():
+        count_calls.append(True)
+        return original_count_jobs()
+
+    backend.count_jobs = count_jobs
+    try:
+        metrics = SharedMetrics(backend, hub.registry)
+        report = metrics.report([target], {}, jobs_running=0, jobs_queued=0, jobs_retained=0, range_name="1h")
+        assert report["kept_jobs"] == 0
+        assert count_calls == []
+    finally:
+        jobs.close()
+
+
 def test_audit_import_pending_delivery_never_commits_marker(tmp_path):
     hub = Hub(tmp_path)
     backend = Backend()
