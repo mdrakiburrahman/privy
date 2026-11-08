@@ -1756,23 +1756,57 @@ class SqlBackend:
             self._wake.clear()
 
     def close(self) -> None:
+        if self._closed:
+            return
         self._stop.set()
         self._wake.set()
-        read_model = getattr(self, "read_model", None)
-        if read_model is not None:
-            read_model.close()
         if self._thread is not None:
             self._thread.join(timeout=35)
             if self._thread.is_alive():
-                raise StorageError("SQL delivery thread did not stop; journal remains open")
-        if not self.flush():
-            log.error("SQL journal has pending writes on shutdown; next start will replay them")
-        self.mark_stopped()
+                raise StorageError("SQL delivery thread did not stop; backend resources remain in use")
+
+        failures = []
+        read_model = getattr(self, "read_model", None)
+        if read_model is not None:
+            try:
+                read_model.close()
+            except Exception as exc:
+                failures.append(("read model", exc))
+                if not getattr(read_model, "closed", True):
+                    raise StorageError(
+                        "SQL read workers did not stop; backend resources remain in use"
+                    ) from exc
+
+        try:
+            if not self.flush():
+                log.error("SQL journal has pending writes on shutdown; next start will replay them")
+                failures.append(("journal flush", StorageError("pending writes will replay on next start")))
+        except Exception as exc:
+            failures.append(("journal flush", exc))
+            log.exception("SQL journal flush failed during shutdown; replay will be attempted on next start")
+        try:
+            self.mark_stopped()
+        except Exception as exc:
+            failures.append(("owner shutdown", exc))
+            log.exception("Could not mark SQL hub stopped during shutdown")
+
+        cleanup = (
+            ("outbox", self.outbox.close),
+            ("connection pool", self._connect.close if hasattr(self._connect, "close") else None),
+            ("home lock", self._home_lock.close),
+        )
+        for name, action in cleanup:
+            if action is None:
+                continue
+            try:
+                action()
+            except Exception as exc:
+                failures.append((name, exc))
+                log.exception("SQL backend %s cleanup failed", name)
         self._closed = True
-        self.outbox.close()
-        if hasattr(self._connect, "close"):
-            self._connect.close()
-        self._home_lock.close()
+        if failures:
+            summary = ", ".join(f"{name}: {type(exc).__name__}" for name, exc in failures)
+            raise StorageError(f"SQL backend shutdown completed with errors ({summary})") from failures[0][1]
 
 
 class SqlLeaseLock:

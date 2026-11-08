@@ -30,22 +30,80 @@ class _Read:
 
 
 class BackgroundReads:
-    """Coalesce misses, refresh off-thread, and fail explicitly on stale/error reads."""
+    """Coalesce bounded background reads and fail explicitly under backpressure."""
 
-    def __init__(self, *, workers=8, capacity=64, interval=1.0, max_age=5.0, clock=time.monotonic):
+    def __init__(
+        self,
+        *,
+        workers=8,
+        capacity=64,
+        queue_capacity=None,
+        interval=1.0,
+        max_age=5.0,
+        clock=time.monotonic,
+    ):
+        queue_capacity = capacity if queue_capacity is None else queue_capacity
+        if workers < 1:
+            raise ValueError("read worker count must be positive")
+        if capacity < 0 or queue_capacity < 0:
+            raise ValueError("read cache and queue capacities must be non-negative")
         self.clock = clock
         self.interval, self.max_age, self.capacity = interval, max_age, capacity
         self._lock = threading.RLock()
         self._reads: OrderedDict[Any, _Read] = OrderedDict()
+        self._inflight: dict[Any, _Read] = {}
+        self._admission = threading.BoundedSemaphore(workers + queue_capacity)
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="privy-read")
         self._stop = threading.Event()
+        self._closing = False
+        self._closed = False
+        self._close_lock = threading.Lock()
         self._thread = threading.Thread(target=self._refresh, name="privy-read-refresh", daemon=True)
         self._thread.start()
 
-    def _submit(self, read):
-        if read.future is None or read.future.done():
-            read.future = self._pool.submit(self._load, read)
-        return read.future
+    def _trim(self):
+        while len(self._reads) > self.capacity:
+            self._reads.popitem(last=False)
+
+    def _lookup(self, key, load):
+        read = self._reads.get(key)
+        if read is None:
+            read = self._inflight.get(key)
+            if read is None or (read.future is not None and read.future.cancelled()):
+                read = _Read(load, key)
+            self._reads[key] = read
+            self._trim()
+        else:
+            self._reads.move_to_end(key)
+        read.load = load
+        return read
+
+    def _finished(self, key, read, future):
+        self._admission.release()
+        with self._lock:
+            if self._inflight.get(key) is read and read.future is future:
+                del self._inflight[key]
+
+    def _submit(self, read, *, required=True):
+        if read.future is not None and not read.future.done():
+            return read.future
+        if self._closed or self._closing:
+            if required:
+                raise StorageError("SQL read model is closing; retry after restart")
+            return None
+        if not self._admission.acquire(blocking=False):
+            if required:
+                raise StorageError("SQL read model is saturated; retry shortly")
+            return None
+        try:
+            future = self._pool.submit(self._load, read)
+        except BaseException:
+            self._admission.release()
+            raise
+        read.future = future
+        self._inflight[read.key] = read
+        future.add_done_callback(lambda completed: self._finished(read.key, read, completed))
+        return future
 
     def _load(self, read):
         with self._lock:
@@ -70,26 +128,18 @@ class BackgroundReads:
 
     def publish(self, key, value, load):
         with self._lock:
-            read = self._reads.get(key)
+            read = self._reads.get(key) or self._inflight.get(key)
             if read is None:
                 read = _Read(load, key)
+            if key not in self._reads:
                 self._reads[key] = read
-                while len(self._reads) > self.capacity:
-                    self._reads.popitem(last=False)
+                self._trim()
             read.revision += 1
             read.value, read.ready, read.updated, read.error = copy.deepcopy(value), True, self.clock(), None
 
     def get(self, key, load, *, wait=True, detached=True, refresh=False):
         with self._lock:
-            read = self._reads.get(key)
-            if read is None:
-                read = _Read(load, key)
-                self._reads[key] = read
-                while len(self._reads) > self.capacity:
-                    self._reads.popitem(last=False)
-            else:
-                read.load = load
-                self._reads.move_to_end(key)
+            read = self._lookup(key, load)
             fresh = not refresh and read.ready and self.clock() - read.updated < self.max_age
             if fresh:
                 return copy.deepcopy(read.value) if detached else read.value
@@ -109,25 +159,37 @@ class BackgroundReads:
         with self._lock:
             for key, read in self._reads.items():
                 if predicate(key):
-                    self._submit(read)
+                    self._submit(read, required=False)
 
     def discard(self, predicate):
         with self._lock:
             for key in list(self._reads):
                 if predicate(key):
                     del self._reads[key]
+            for key, read in list(self._inflight.items()):
+                if predicate(key) and read.future is not None:
+                    read.future.cancel()
 
     def _refresh(self):
         while not self._stop.wait(self.interval):
             with self._lock:
                 for read in self._reads.values():
                     if self.clock() - read.updated >= self.interval:
-                        self._submit(read)
+                        self._submit(read, required=False)
 
     def close(self):
-        self._stop.set()
-        self._thread.join(timeout=2)
-        self._pool.shutdown(wait=True, cancel_futures=True)
+        with self._close_lock:
+            with self._lock:
+                if self._closed:
+                    return
+                self._closing = True
+                self._stop.set()
+            self._thread.join(timeout=2)
+            if self._thread.is_alive():
+                raise StorageError("SQL read refresh worker did not stop")
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            with self._lock:
+                self._closed = True
 
 
 class SqlReadModel:
@@ -146,6 +208,7 @@ class SqlReadModel:
         self._thread = None
         self._uses = {}
         self._use_errors = {}
+        self._closed = False
         self._accounting_thread = threading.Thread(
             target=self._account, name="privy-read-accounting", daemon=True
         )
@@ -162,7 +225,6 @@ class SqlReadModel:
                 self.reads.invalidate(lambda key: key == ("output", payload["job_id"]))
             return
         with self._lock:
-            self._records[kind, key] = copy.deepcopy(payload)
             self._pending[kind, key] = copy.deepcopy(payload)
         self.reads.invalidate(lambda key: key[0] in ("report", "history"))
 
@@ -176,11 +238,7 @@ class SqlReadModel:
             version, rows, complete = self.backend.read_changes(self._version)
             with self._lock:
                 for kind, key, payload in rows:
-                    identity = kind, key
-                    pending = self._pending.get(identity)
-                    if pending is None or pending == payload:
-                        self._records[identity] = payload
-                        self._pending.pop(identity, None)
+                    self._records[kind, key] = payload
                 self._version = version
             if complete:
                 break
@@ -193,7 +251,7 @@ class SqlReadModel:
             self._updated = time.monotonic()
             self._error = None
             self._ready.set()
-            live_jobs = {key for kind, key in self._records if kind == "job"}
+            live_jobs = {key for kind, key in self._records.keys() | self._pending.keys() if kind == "job"}
         self.reads.discard(
             lambda key: (
                 key[0] in ("record", "records", "list", "scan", "counts")
@@ -220,7 +278,8 @@ class SqlReadModel:
     def _snapshot(self):
         self._ensure_ready()
         with self._lock:
-            return list(self._records.items())
+            records = self._records | self._pending
+            return list(records.items())
 
     def get(self, kind, key):
         with self._lock:
@@ -250,7 +309,9 @@ class SqlReadModel:
         self._ensure_ready()
         with self._lock:
             return {
-                key: copy.deepcopy(self._records[kind, key]) for key in keys if (kind, key) in self._records
+                key: copy.deepcopy(self._pending.get((kind, key), self._records.get((kind, key))))
+                for key in keys
+                if (kind, key) in self._pending or (kind, key) in self._records
             }
 
     def list(
@@ -497,17 +558,41 @@ class SqlReadModel:
                         self._use_errors[key] = exc
                     log.exception("Deferred read-path lease accounting failed")
 
+    @property
+    def closed(self):
+        return self._closed
+
     def close(self):
+        if self._closed:
+            return
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=35)
             if self._thread.is_alive():
-                raise StorageError("SQL record hydration did not stop")
+                raise StorageError("SQL record hydration did not stop; backend resources remain in use")
         self._accounting_thread.join(timeout=35)
         if self._accounting_thread.is_alive():
-            raise StorageError("Deferred read accounting did not stop")
+            raise StorageError("Deferred read accounting did not stop; backend resources remain in use")
+
+        failures = []
         with self._lock:
             pending, self._uses = self._uses, {}
+            failures.extend(self._use_errors.values())
+            self._use_errors.clear()
         for use in pending.values():
-            use()
-        self.reads.close()
+            try:
+                use()
+            except Exception as exc:
+                failures.append(exc)
+                log.exception("Deferred read-path lease accounting failed during shutdown")
+        try:
+            self.reads.close()
+        except Exception as exc:
+            if not self.reads._closed:
+                raise StorageError("SQL read workers did not stop; backend resources remain in use") from exc
+            failures.append(exc)
+        self._closed = True
+        if failures:
+            raise StorageError(
+                f"Deferred read-path accounting or read shutdown failed ({len(failures)} error(s))"
+            ) from failures[0]

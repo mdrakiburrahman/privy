@@ -134,6 +134,44 @@ def test_pending_local_write_survives_old_snapshot_but_not_later_remote_writer(m
     assert not model._pending
 
 
+def test_authoritative_feed_survives_ignored_pending_write_after_watermark_advances():
+    class WatermarkedBackend(Backend):
+        def __init__(self):
+            super().__init__()
+            self.version = (1).to_bytes(8, "big")
+
+        def read_changes(self, version):
+            self.sql_reads += 1
+            if version < self.version:
+                return (
+                    self.version,
+                    [(kind, key, copy.deepcopy(row)) for (kind, key), row in self.records.items()],
+                    True,
+                )
+            return version, [], True
+
+    backend = WatermarkedBackend()
+    backend.records["job", "j"] = job("queued")
+    model = SqlReadModel(backend, start=False)
+    model.reads.interval = 3600
+    try:
+        model.refresh_once()
+        identity = ("job", "j")
+        backend.pending.add(identity)
+        model.apply("job", "j", job("running"))
+        backend.records[identity] = job(SUCCEEDED)
+        backend.version = (2).to_bytes(8, "big")
+        model.refresh_once()
+        assert model.get("job", "j")["state"] == "running"
+
+        backend.pending.clear()
+        model.refresh_once()
+        assert model.get("job", "j")["state"] == SUCCEEDED
+        assert model._version == backend.version
+    finally:
+        model.close()
+
+
 def test_raw_probe_history_is_not_retained(model):
     model.apply("probe", "probe", {"data": "large"})
     model.apply("call", "call", {"data": "large"})
@@ -306,6 +344,142 @@ def test_failed_refresh_does_not_return_expired_success(caplog):
         assert "Background SQL read refresh failed" in caplog.text
     finally:
         cache.close()
+
+
+def test_background_reads_bounds_running_and_queued_work():
+    cache = BackgroundReads(workers=1, capacity=3, queue_capacity=1, interval=3600)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked():
+        started.set()
+        assert release.wait(2)
+        return "first"
+
+    try:
+        cache.get(("first",), blocked, wait=False)
+        assert started.wait(1)
+        cache.get(("second",), lambda: "second", wait=False)
+        with pytest.raises(StorageError, match="saturated"):
+            cache.get(("third",), lambda: "third", wait=False)
+        release.set()
+        assert cache.get(("first",), blocked) == "first"
+        assert cache.get(("second",), lambda: "second") == "second"
+    finally:
+        release.set()
+        cache.close()
+
+
+def test_background_reads_deduplicate_inflight_load_after_cache_eviction():
+    cache = BackgroundReads(workers=1, capacity=1, queue_capacity=1, interval=3600)
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def first():
+        calls.append("first")
+        started.set()
+        assert release.wait(2)
+        return "first"
+
+    try:
+        cache.get(("first",), first, wait=False)
+        assert started.wait(1)
+        cache.get(("second",), lambda: "second", wait=False)
+        assert ("first",) not in cache._reads
+        cache.get(("first",), first, wait=False)
+        release.set()
+        assert cache.get(("first",), first) == "first"
+        assert calls == ["first"]
+    finally:
+        release.set()
+        cache.close()
+
+
+def test_background_reads_cancel_discarded_queued_load_and_reuse_capacity():
+    cache = BackgroundReads(workers=1, capacity=3, queue_capacity=1, interval=3600)
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def blocked():
+        started.set()
+        assert release.wait(2)
+        return "running"
+
+    def replacement():
+        calls.append("replacement")
+        return "replacement"
+
+    try:
+        cache.get(("running",), blocked, wait=False)
+        assert started.wait(1)
+        cache.get(("discarded",), lambda: calls.append("discarded"), wait=False)
+        queued = cache._inflight[("discarded",)].future
+        cache.discard(lambda key: key == ("discarded",))
+        assert queued.cancelled()
+        cache.get(("replacement",), replacement, wait=False)
+        release.set()
+        assert cache.get(("replacement",), replacement) == "replacement"
+        assert calls == ["replacement"]
+    finally:
+        release.set()
+        cache.close()
+
+
+def test_read_model_close_reports_accounting_failure_after_stopping_workers():
+    model = SqlReadModel(Backend(), start=False)
+
+    def fail():
+        raise RuntimeError("lease accounting failed")
+
+    model._uses[("test",)] = fail
+    with pytest.raises(StorageError, match="accounting or read shutdown failed"):
+        model.close()
+    assert model.closed
+    assert not model._accounting_thread.is_alive()
+    assert model.reads._closed
+
+
+def test_backend_close_cleans_all_resources_after_read_model_error():
+    calls = []
+    backend = object.__new__(SqlBackend)
+    backend._closed = False
+    backend._stop = threading.Event()
+    backend._wake = threading.Event()
+    backend._thread = None
+    backend.read_model = SimpleNamespace(
+        closed=True,
+        close=lambda: (_ for _ in ()).throw(RuntimeError("deferred use failed")),
+    )
+    backend.flush = lambda timeout=10: False
+    backend.mark_stopped = lambda: calls.append("stopped")
+    backend.outbox = SimpleNamespace(close=lambda: calls.append("outbox"))
+    backend._connect = SimpleNamespace(close=lambda: calls.append("pool"))
+    backend._home_lock = SimpleNamespace(close=lambda: calls.append("home lock"))
+
+    with pytest.raises(StorageError, match="read model: RuntimeError.*journal flush: StorageError"):
+        backend.close()
+    assert calls == ["stopped", "outbox", "pool", "home lock"]
+    assert backend._closed
+
+
+def test_backend_close_keeps_resources_open_while_delivery_worker_is_alive():
+    calls = []
+    backend = object.__new__(SqlBackend)
+    backend._closed = False
+    backend._stop = threading.Event()
+    backend._wake = threading.Event()
+    backend._thread = SimpleNamespace(join=lambda timeout: None, is_alive=lambda: True)
+    backend.read_model = SimpleNamespace(close=lambda: calls.append("read model"))
+    backend.outbox = SimpleNamespace(close=lambda: calls.append("outbox"))
+    backend._connect = SimpleNamespace(close=lambda: calls.append("pool"))
+    backend._home_lock = SimpleNamespace(close=lambda: calls.append("home lock"))
+
+    with pytest.raises(StorageError, match="resources remain in use"):
+        backend.close()
+    assert calls == []
+    assert not backend._closed
 
 
 def test_deferred_advisory_accounting_runs_once_off_thread_not_forever(model):
