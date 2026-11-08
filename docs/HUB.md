@@ -60,7 +60,7 @@ starts are safe. SQL is authoritative for clients, leases, use/cooldown records 
 operation reads current keyed records inside a database transaction, uses database time and commits
 only changed records. Admission, session registration, holder checks, renewal, client limits and
 release therefore coordinate across hubs. A differing target topology or lease/storage configuration
-is rejected; hydrate the complete intended topology before the first SQL start.
+is rejected; hydrate the complete intended topology before the first SQL start. Legacy lease rows are normalized with the current duration/default rules and migrated under the startup lock only when their effective values match exactly; a real policy difference still blocks startup.
 
 The deployed `privy-sql.database.windows.net` permits all client IPs through the single
 `privy-allow-all` rule. No per-machine firewall setup is needed. This makes the SQL endpoint

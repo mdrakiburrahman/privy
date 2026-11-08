@@ -69,6 +69,42 @@ def duration(value: Any) -> float:
     return seconds
 
 
+def effective_lease_config(config: Any) -> dict[str, Any]:
+    """Normalize lease policy representations to their effective values."""
+    if not isinstance(config, dict) or type(config.get("version")) is not int or config["version"] != 1:
+        raise ValueError("expected version: 1")
+    defaults = config.get("defaults")
+    if not isinstance(defaults, dict):
+        raise ValueError("defaults must be a mapping")
+    groups = config.get("groups")
+    if not isinstance(groups, list):
+        raise ValueError("groups must be a list")
+    ttl = duration(defaults["ttl"])
+    max_ttl = duration(defaults["max_ttl"])
+    manual_max_ttl = duration(defaults.get("manual_max_ttl", "365d"))
+    cooldown = duration(defaults["cooldown"])
+    client_idle_expiry = duration(defaults["client_idle_expiry"])
+    client_limit = defaults["max_leases_per_client"]
+    if type(client_limit) is not int or client_limit < 1:
+        raise ValueError("max_leases_per_client must be a positive integer")
+    if ttl > max_ttl or max_ttl > 4 * 3600:
+        raise ValueError("ttl must not exceed max_ttl and max_ttl must not exceed 4h")
+    if manual_max_ttl < ttl:
+        raise ValueError("manual_max_ttl must not be less than the default ttl")
+    return {
+        "version": 1,
+        "defaults": {
+            "ttl_s": ttl,
+            "max_ttl_s": max_ttl,
+            "manual_max_ttl_s": manual_max_ttl,
+            "cooldown_s": cooldown,
+            "max_leases_per_client": client_limit,
+            "client_idle_expiry_s": client_idle_expiry,
+        },
+        "groups": copy.deepcopy(groups),
+    }
+
+
 def _labels(value: Any) -> dict[str, str]:
     if value is None:
         return {}
@@ -262,35 +298,14 @@ class LeaseStore:
         config = self.config
         if not isinstance(config, dict) or type(config.get("version")) is not int or config["version"] != 1:
             raise ValueError("expected version: 1")
-        defaults = config.get("defaults")
-        if not isinstance(defaults, dict):
-            raise ValueError("defaults must be a mapping")
-        self.default_ttl = duration(defaults["ttl"])
-        self.max_ttl = duration(defaults["max_ttl"])
-        self.manual_max_ttl = duration(defaults.get("manual_max_ttl", "365d"))
-        self.cooldown = duration(defaults["cooldown"])
-        self.client_idle_expiry = duration(defaults["client_idle_expiry"])
+        self.effective_config = effective_lease_config(config)
+        defaults = self.effective_config["defaults"]
+        self.default_ttl = defaults["ttl_s"]
+        self.max_ttl = defaults["max_ttl_s"]
+        self.manual_max_ttl = defaults["manual_max_ttl_s"]
+        self.cooldown = defaults["cooldown_s"]
+        self.client_idle_expiry = defaults["client_idle_expiry_s"]
         self.client_limit = defaults["max_leases_per_client"]
-        if type(self.client_limit) is not int or self.client_limit < 1:
-            raise ValueError("max_leases_per_client must be a positive integer")
-        if self.default_ttl > self.max_ttl or self.max_ttl > 4 * 3600:
-            raise ValueError("ttl must not exceed max_ttl and max_ttl must not exceed 4h")
-        if self.manual_max_ttl < self.default_ttl:
-            raise ValueError("manual_max_ttl must not be less than the default ttl")
-        self.effective_config = {
-            "version": 1,
-            "defaults": {
-                "ttl_s": self.default_ttl,
-                "max_ttl_s": self.max_ttl,
-                "manual_max_ttl_s": self.manual_max_ttl,
-                "cooldown_s": self.cooldown,
-                "max_leases_per_client": self.client_limit,
-                "client_idle_expiry_s": self.client_idle_expiry,
-            },
-            "groups": copy.deepcopy(config["groups"]),
-        }
-        if not isinstance(config.get("groups"), list):
-            raise ValueError("groups must be a list")
         names: set[str] = set()
         for rule in config["groups"]:
             if not isinstance(rule, dict) or not isinstance(rule.get("name"), str) or not rule["name"]:

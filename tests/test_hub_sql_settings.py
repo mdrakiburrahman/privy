@@ -3,7 +3,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+import yaml
 
+from privy.hub.leases import DEFAULT_CONFIG, effective_lease_config
 from privy.hub.settings import SettingsError, load_settings
 from privy.hub.sql_store import SqlBackend, StorageError, _home_identity, _HomeLock
 
@@ -125,3 +127,46 @@ def test_sql_home_identity_is_stable_and_single_process_exclusive(tmp_path):
             _HomeLock(tmp_path / "sql-home.lock")
     finally:
         lock.close()
+
+
+class ConfigCursor:
+    def __init__(self, payload):
+        self.row = (json.dumps(payload),)
+        self.statements = []
+
+    def execute(self, query, *args):
+        self.statements.append((query, args))
+
+    def fetchone(self):
+        return self.row
+
+
+def test_sql_lease_config_migrates_equivalent_legacy_policy_and_rejects_changes():
+    legacy = yaml.safe_load(DEFAULT_CONFIG)
+    current = yaml.safe_load(DEFAULT_CONFIG.replace("  manual_max_ttl: 365d\n", ""))
+    expected = effective_lease_config(current)
+    cursor = ConfigCursor(legacy)
+
+    @contextmanager
+    def transaction(_lock=None):
+        yield cursor
+
+    backend = object.__new__(SqlBackend)
+    backend.transaction = transaction
+    backend.check_config("leases", expected)
+
+    update = next(statement for statement in cursor.statements if statement[0].startswith("UPDATE"))
+    assert json.loads(update[1][0]) == expected
+
+    changed = yaml.safe_load(DEFAULT_CONFIG)
+    changed["defaults"]["ttl"] = "45m"
+    cursor = ConfigCursor(changed)
+
+    @contextmanager
+    def changed_transaction(_lock=None):
+        yield cursor
+
+    backend.transaction = changed_transaction
+    with pytest.raises(StorageError, match="configuration differs"):
+        backend.check_config("leases", expected)
+    assert not any(statement[0].startswith("UPDATE") for statement in cursor.statements)
