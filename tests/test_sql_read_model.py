@@ -172,6 +172,67 @@ def test_authoritative_feed_survives_ignored_pending_write_after_watermark_advan
         model.close()
 
 
+def test_acknowledged_overlay_stays_visible_until_authoritative_reread_and_preserves_newer_overlay():
+    entered_feed = threading.Event()
+    release_feed = threading.Event()
+
+    class PausedBackend(Backend):
+        def __init__(self):
+            super().__init__()
+            self.feed_calls = 0
+
+        def read_changes(self, version):
+            self.feed_calls += 1
+            if self.feed_calls == 2:
+                entered_feed.set()
+                assert release_feed.wait(2)
+            self.sql_reads += 1
+            return version, [], True
+
+    backend = PausedBackend()
+    model = SqlReadModel(backend, start=False)
+    model.reads.interval = 3600
+    try:
+        model.refresh_once()
+        identity = ("job", "j")
+        model.apply("job", "j", job("queued"))
+        backend.records[identity] = job(SUCCEEDED)  # A newer cross-owner write won.
+        errors = []
+
+        refresher = threading.Thread(target=lambda: _capture_error(model.refresh_once, errors))
+        refresher.start()
+        assert entered_feed.wait(1)
+
+        # SQL has acknowledged the queued write, but the commit-safe change feed
+        # is deliberately paused and its watermark still does not cover the row.
+        assert model.get("job", "j")["state"] == "queued"
+        model.apply("job", "j", job("running"))
+        release_feed.set()
+        refresher.join(2)
+        assert not refresher.is_alive()
+        assert not errors
+
+        # The authoritative reread updates the base, but cannot retire a newer
+        # overlay admitted after the refresh captured the acknowledged revision.
+        assert model._records[identity]["state"] == SUCCEEDED
+        assert model.get("job", "j")["state"] == "running"
+        assert identity in model._pending
+
+        model.refresh_once()
+        assert model.get("job", "j")["state"] == SUCCEEDED
+        assert identity not in model._pending
+    finally:
+        release_feed.set()
+        model.close()
+
+
+def _capture_error(action, errors):
+    try:
+        action()
+    except Exception as exc:
+        errors.append(exc)
+
+
 def test_raw_probe_history_is_not_retained(model):
     model.apply("probe", "probe", {"data": "large"})
     model.apply("call", "call", {"data": "large"})

@@ -200,6 +200,7 @@ class SqlReadModel:
         self._lock = threading.RLock()
         self._records = {}
         self._pending = {}
+        self._pending_revision = {}
         self._version = bytes(8)
         self._ready = threading.Event()
         self._updated = 0.0
@@ -225,13 +226,19 @@ class SqlReadModel:
                 self.reads.invalidate(lambda key: key == ("output", payload["job_id"]))
             return
         with self._lock:
-            self._pending[kind, key] = copy.deepcopy(payload)
+            identity = kind, key
+            self._pending[identity] = copy.deepcopy(payload)
+            self._pending_revision[identity] = self._pending_revision.get(identity, 0) + 1
         self.reads.invalidate(lambda key: key[0] in ("report", "history"))
 
     def refresh_once(self):
+        pending_keys = self.backend.outbox.pending_keys()
         with self._lock:
-            pending = self.backend.outbox.pending_keys()
-            self._pending = {key: value for key, value in self._pending.items() if key in pending}
+            acknowledged = [
+                (identity, self._pending_revision.get(identity, 0))
+                for identity in self._pending
+                if identity not in pending_keys
+            ][:500]
         while True:
             if self._stop.is_set():
                 return
@@ -242,12 +249,28 @@ class SqlReadModel:
                 self._version = version
             if complete:
                 break
-        # Key reconciliation also observes old-version deletes, without tombstones.
+        # Key reconciliation observes old-version deletes, while bounded authoritative
+        # reads close the gap between outbox acknowledgement and the commit-safe feed.
         keys = self.backend.read_record_keys()
+        authoritative = {}
+        by_kind = {}
+        for (kind, key), _ in acknowledged:
+            by_kind.setdefault(kind, []).append(key)
+        for kind, selected in by_kind.items():
+            rows = self.backend.get_many(kind, selected)
+            authoritative.update({(kind, key): value for key, value in rows.items()})
         with self._lock:
             for identity in list(self._records):
                 if identity not in keys and identity not in self._pending:
                     del self._records[identity]
+            for identity, revision in acknowledged:
+                if identity in authoritative:
+                    self._records[identity] = authoritative[identity]
+                else:
+                    self._records.pop(identity, None)
+                if self._pending_revision.get(identity) == revision:
+                    self._pending.pop(identity, None)
+                    self._pending_revision.pop(identity, None)
             self._updated = time.monotonic()
             self._error = None
             self._ready.set()
