@@ -665,6 +665,37 @@ class LeaseStore:
                 "leasable_at": view["leasable_at"],
             }
 
+    def target_summaries(self, target_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        requested = list(dict.fromkeys(target_ids))
+        if not requested:
+            return {}
+
+        def summarize(snapshot: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+            groups, targets = self._membership()
+            group_views: dict[str, dict[str, Any]] = {}
+            summaries: dict[str, dict[str, Any]] = {}
+            for target_id in requested:
+                key, layer = targets[target_id]
+                if key not in group_views:
+                    group_views[key] = self._group_view(groups[key], snapshot=snapshot)
+                view = group_views[key]
+                summaries[target_id] = {
+                    "group": key,
+                    "layer": layer,
+                    "lease": copy.deepcopy(view["lease"]),
+                    "lease_state": view["state"],
+                    "leasable_at": view["leasable_at"],
+                }
+            return summaries
+
+        read_snapshot = getattr(self._lock, "read_snapshot", None)
+        if callable(read_snapshot):
+            with read_snapshot() as snapshot:
+                return summarize(snapshot)
+        with self._lock:
+            self._sweep()
+            return summarize()
+
     def _ttl(self, ttl: str | None, *, manual: bool = False) -> tuple[str, float]:
         ttl = self.config["defaults"]["ttl"] if ttl is None else ttl
         try:

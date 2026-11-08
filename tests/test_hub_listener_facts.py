@@ -177,6 +177,58 @@ def test_bulk_fact_readers_use_batched_fallback(tmp_path):
     hub.service.listener_infos.flush()
 
 
+def test_list_targets_uses_one_bulk_lease_summary_snapshot(tmp_path):
+    hub = Hub(
+        tmp_path,
+        {
+            BOX1: FakeListener(info=WINDOWS),
+            "dev/box2_windows": FakeListener(info_error=NO_LISTENER),
+            "contoso-lab/gpu1_linux": FakeListener(info=LINUX),
+        },
+        listener_infos=ListenerInfoStore(tmp_path),
+    )
+    store = hub.service.leases
+    target_ids = [target.id for target in hub.registry.snapshot().targets]
+    owner = store.register_client("summary-test")["client_id"]
+    lease = store.acquire(owner, target=target_ids[0])
+    expected = {target_id: store.target_summary(target_id) for target_id in target_ids}
+    assert expected[target_ids[0]]["lease"]["lease_id"] == lease["lease_id"]
+
+    class CountingLock:
+        def __init__(self, inner):
+            self.inner = inner
+            self.enter_count = 0
+
+        def __enter__(self):
+            self.enter_count += 1
+            return self.inner.__enter__()
+
+        def __exit__(self, *args):
+            return self.inner.__exit__(*args)
+
+    counting_lock = CountingLock(store._lock)
+    store._lock = counting_lock
+    assert store.target_summaries(target_ids) == expected
+    assert counting_lock.enter_count == 1
+
+    bulk = store.target_summaries
+    bulk_calls = []
+
+    def track_bulk(ids):
+        ids = list(ids)
+        bulk_calls.append(ids)
+        return bulk(ids)
+
+    def reject_single(_target_id):
+        raise AssertionError("list_targets must use the bulk lease summary")
+
+    store.target_summaries = track_bulk
+    store.target_summary = reject_single
+    payload = hub.service.invoke("list_targets", {"probe": False}, origin="test")
+    assert bulk_calls == [target_ids]
+    assert len(payload["targets"]) == len(target_ids)
+
+
 def test_list_targets_filters_by_facets_and_shows_last_known_details_offline(tmp_path):
     hub = Hub(
         tmp_path,

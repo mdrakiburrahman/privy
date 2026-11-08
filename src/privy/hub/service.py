@@ -995,6 +995,7 @@ class HubService:
         *,
         full: bool = False,
         facts: dict[str, Any] | None = None,
+        lease_summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         view: dict[str, Any] = {
             "id": target.id,
@@ -1002,7 +1003,7 @@ class HubService:
             "status": probe.status if probe else UNKNOWN,
         }
         view.update(_listener_summary(probe))
-        view.update(self.leases.target_summary(target.id))
+        view.update(lease_summary if lease_summary is not None else self.leases.target_summary(target.id))
         if probe is not None and probe.status == ONLINE:
             language = language_from(probe.info, target.path)
             if language:
@@ -1151,8 +1152,15 @@ class HubService:
         else:
             probes = {target.id: self.registry.cached(target) for target in targets}
         facts = self.listener_facts_many(targets, probes)
+        lease_summaries = self.leases.target_summaries([target.id for target in targets])
         views = [
-            self._target_view(target, probes.get(target.id), facts=facts[target.id]) for target in targets
+            self._target_view(
+                target,
+                probes.get(target.id),
+                facts=facts[target.id],
+                lease_summary=lease_summaries[target.id],
+            )
+            for target in targets
         ]
         counts = Counter(view["status"] for view in views)
         if online_only:
