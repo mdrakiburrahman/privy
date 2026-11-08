@@ -185,6 +185,7 @@ def test_concurrent_sql_starts_accept_equivalent_legacy_config_without_mutating_
     assert len(cursor.statements) == 2
     assert all(statement[0].startswith("SELECT") for statement in cursor.statements)
     assert cursor.protected_rows == protected_before
+    assert json.loads(cursor.row[0]) == legacy
 
 
 def test_sql_lease_config_rejects_genuine_semantic_mismatch():
