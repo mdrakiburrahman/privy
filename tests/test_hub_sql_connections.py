@@ -164,7 +164,6 @@ def test_lease_lock_loads_snapshot_with_one_batched_read():
     assert store._uses == {"dev/box": use}
 
 
-
 def test_lease_read_snapshot_is_serializable_without_application_lock():
     target = SimpleNamespace(id="dev/box_windows", namespace="dev", path="/tmp/box")
     target_config = {"targets": [{"id": target.id, "namespace": target.namespace, "path": target.path}]}
@@ -218,6 +217,7 @@ def test_lease_read_snapshot_is_serializable_without_application_lock():
     assert len(cursor.queries) == 1
     assert "sp_getapplock" not in cursor.queries[0][0]
     assert store._clients == {} and store._leases == {} and store._uses == {}
+
 
 def test_lease_lock_rejects_snapshot_for_fenced_owner():
     class Cursor:
@@ -289,7 +289,10 @@ def test_transaction_closes_cursor_before_returning_connection():
     with backend.transaction():
         pass
     assert events == ["execute", "cursor.close", "commit", "connection.close"]
-    assert queries[-1] == "SET NOCOUNT ON; SET XACT_ABORT ON; SET LOCK_TIMEOUT 15000;"
+    assert (
+        queries[-1]
+        == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; SET NOCOUNT ON; SET XACT_ABORT ON; SET LOCK_TIMEOUT 15000;"
+    )
 
     events.clear()
     queries.clear()
@@ -303,6 +306,51 @@ def test_transaction_closes_cursor_before_returning_connection():
         with backend.transaction():
             raise ValueError("test failure")
     assert events == ["execute", "cursor.close", "rollback", "connection.close"]
+
+
+def test_pooled_transaction_resets_isolation_after_commit_and_rollback(connections):
+    pool, _, created, _ = connections
+    pooled = pool()
+    connection = pooled._connection
+    state = {"isolation": "READ COMMITTED", "queries": [], "outcome": None}
+
+    class Cursor:
+        def execute(self, query, *_args):
+            state["queries"].append(query)
+            if query.startswith("SET TRANSACTION ISOLATION LEVEL "):
+                state["isolation"] = query.split("LEVEL ", 1)[1].split(";", 1)[0]
+
+        def close(self):
+            pass
+
+    connection.cursor = lambda: Cursor()
+    connection.commit = lambda: state.update(outcome="commit")
+    connection.rollback = lambda: state.update(outcome="rollback")
+    pooled.close()
+
+    backend = object.__new__(SqlBackend)
+    backend._connect = pool
+
+    with backend.transaction(isolation_level="SERIALIZABLE"):
+        assert state["isolation"] == "SERIALIZABLE"
+    assert state["isolation"] == "SERIALIZABLE"
+
+    with pytest.raises(RuntimeError, match="rollback test"):
+        with backend.transaction(isolation_level="SERIALIZABLE"):
+            assert state["isolation"] == "SERIALIZABLE"
+            raise RuntimeError("rollback test")
+    assert state["outcome"] == "rollback"
+    assert state["isolation"] == "SERIALIZABLE"
+
+    with backend.transaction():
+        assert state["isolation"] == "READ COMMITTED"
+
+    assert len(created) == 1
+    assert [query.split(";", 1)[0] for query in state["queries"]] == [
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+    ]
 
 
 def test_cursor_close_failure_rolls_back_and_discards_connection():

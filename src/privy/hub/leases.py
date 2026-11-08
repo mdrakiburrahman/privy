@@ -436,18 +436,33 @@ class LeaseStore:
             raise LeaseError(f"unknown lease {lease_id!r}", status=404, code="unknown_lease")
         return lease
 
-    def _client_view(self, client: dict[str, Any]) -> dict[str, Any]:
+    def _client_view(
+        self,
+        client: dict[str, Any],
+        *,
+        snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        leases = snapshot["leases"] if snapshot is not None else self._leases
+        now = snapshot["now"] if snapshot is not None else None
         return {k: copy.deepcopy(v) for k, v in client.items() if not k.endswith("_ts")} | {
             "registered_at": utc_iso(client["registered_ts"]),
             "last_seen_at": utc_iso(client["last_seen_ts"]),
             "leases": [
                 item["lease_id"]
-                for item in self._leases.values()
-                if item["client_id"] == client["client_id"] and item["state"] == "active"
+                for item in leases.values()
+                if item["client_id"] == client["client_id"]
+                and item["state"] == "active"
+                and (snapshot is None or item["running_jobs"] or item["expires_ts"] > now)
             ],
         }
 
-    def _view(self, lease: dict[str, Any], *, events: bool = True) -> dict[str, Any]:
+    def _view(
+        self,
+        lease: dict[str, Any],
+        *,
+        events: bool = True,
+        snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         view = {
             k: copy.deepcopy(v)
             for k, v in lease.items()
@@ -459,9 +474,10 @@ class LeaseStore:
             renewed_at=utc_iso(lease["renewed_ts"]),
             jobs_url=f"/v1/jobs?lease_id={lease['lease_id']}",
         )
-        client = self._clients.get(lease["client_id"])
+        clients = snapshot["clients"] if snapshot is not None else self._clients
+        client = clients.get(lease["client_id"])
         view["holder"] = (
-            self._client_view(client)
+            self._client_view(client, snapshot=snapshot)
             if client
             else {"client_id": lease["client_id"], "name": lease["holder_name"]}
         )
@@ -608,20 +624,14 @@ class LeaseStore:
                 online = False
                 break
         state = (
-            "leased"
-            if lease
-            else "unavailable"
-            if not online
-            else "cooling"
-            if leasable > now
-            else "free"
+            "leased" if lease else "unavailable" if not online else "cooling" if leasable > now else "free"
         )
         if self.sql_backend is not None and use.get("running_jobs") and not lease:
             state = "unavailable"
         return {
             **copy.deepcopy(group),
             "state": state,
-            "lease": self._view(lease, events=False) if lease else None,
+            "lease": self._view(lease, events=False, snapshot=snapshot) if lease else None,
             "leasable_at": utc_iso(lease["expires_ts"] if lease else leasable)
             if (lease or leasable)
             else None,

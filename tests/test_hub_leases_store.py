@@ -181,7 +181,7 @@ def test_sql_group_snapshot_displays_expiry_without_persisting_sweep(leasing, mo
     class SnapshotLock:
         @contextmanager
         def read_snapshot(self):
-            yield {"now": now[0], "leases": store._leases, "uses": store._uses}
+            yield {"now": now[0], "clients": store._clients, "leases": store._leases, "uses": store._uses}
 
     store._lock = SnapshotLock()
     store.sql_backend = object()
@@ -192,6 +192,55 @@ def test_sql_group_snapshot_displays_expiry_without_persisting_sweep(leasing, mo
     assert group["state"] == "cooling"
     assert group["lease"] is None
     assert store._leases[lease["lease_id"]] == before
+
+
+@pytest.mark.parametrize("local_cache", ["empty", "stale"])
+def test_sql_group_snapshot_uses_detached_holder_data_with_sql_time(leasing, local_cache):
+    _, store, now = leasing
+    owner = client(store)
+    lease = acquire(store, owner, ttl="1m")
+    now[0] += 10
+    fresh_client = json.loads(json.dumps(store._clients[owner]))
+    fresh_client["name"] = "peer-created-client"
+    fresh_client["host"] = "peer-host"
+    active = json.loads(json.dumps(store._leases[lease["lease_id"]]))
+    expired = json.loads(json.dumps(active))
+    expired["lease_id"] = "expired-peer-lease"
+    expired["expires_ts"] = now[0] - 1
+    expired["running_jobs"] = []
+    snapshot_leases = {expired["lease_id"]: expired, lease["lease_id"]: active}
+
+    if local_cache == "empty":
+        store._clients = {}
+        store._leases = {}
+    else:
+        stale_client = json.loads(json.dumps(fresh_client))
+        stale_client["name"] = "stale-client"
+        stale_lease = json.loads(json.dumps(active))
+        stale_lease["lease_id"] = "stale-lease"
+        store._clients = {owner: stale_client}
+        store._leases = {stale_lease["lease_id"]: stale_lease}
+
+    class SnapshotLock:
+        @contextmanager
+        def read_snapshot(self):
+            yield {
+                "now": now[0],
+                "clients": {owner: fresh_client},
+                "leases": snapshot_leases,
+                "uses": {},
+            }
+
+    store._lock = SnapshotLock()
+    store.sql_backend = object()
+    groups = {item["group"]: item for item in store.groups()}
+    group = groups["dev/raki-windows-big"]
+
+    assert group["lease"]["lease_id"] == lease["lease_id"]
+    assert group["lease"]["holder"]["name"] == "peer-created-client"
+    assert group["lease"]["holder"]["host"] == "peer-host"
+    assert group["lease"]["holder"]["leases"] == [lease["lease_id"]]
+
 
 def test_group_regex_boundaries_unmatched_and_only_required_layer_online(leasing):
     hub, store, _ = leasing

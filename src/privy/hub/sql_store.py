@@ -529,9 +529,11 @@ class SqlBackend:
         try:
             raw_cursor = connection.cursor()
             cursor = _ProfileCursor(raw_cursor) if profile else raw_cursor
-            setup = "SET NOCOUNT ON; SET XACT_ABORT ON; SET LOCK_TIMEOUT 15000;"
-            if isolation_level == "SERIALIZABLE":
-                setup = f"SET TRANSACTION ISOLATION LEVEL {isolation_level}; {setup}"
+            effective_isolation = isolation_level or "READ COMMITTED"
+            setup = (
+                f"SET TRANSACTION ISOLATION LEVEL {effective_isolation}; "
+                "SET NOCOUNT ON; SET XACT_ABORT ON; SET LOCK_TIMEOUT 15000;"
+            )
             cursor.execute(setup)
             if lock:
                 cursor.execute(
@@ -1553,9 +1555,7 @@ class SqlLeaseLock:
             ]
         }
         if row is None or json.loads(row[0]) != targets:
-            raise StorageError(
-                "Local target configuration changed or differs from shared SQL configuration"
-            )
+            raise StorageError("Local target configuration changed or differs from shared SQL configuration")
         if not cursor.nextset():
             raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
         records = {"client": {}, "lease": {}, "use": {}}
