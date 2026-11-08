@@ -11,6 +11,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
 from typing import Any
 
+from privy.hub.metrics import ReportSelection
 from privy.hub.sql_store import StorageError
 
 log = logging.getLogger("privy.hub")
@@ -27,6 +28,11 @@ class _Read:
     error: Exception | None = None
     size: int = 0
     revision: int = 0
+    accessed: float | None = None
+    started: float | None = None
+    duration: float = 0
+    invalidation: int = 0
+    dirty: bool = False
 
 
 class BackgroundReads:
@@ -40,6 +46,8 @@ class BackgroundReads:
         queue_capacity=None,
         interval=1.0,
         max_age=5.0,
+        idle_after=60.0,
+        cold_timeout=4.0,
         clock=time.monotonic,
     ):
         queue_capacity = capacity if queue_capacity is None else queue_capacity
@@ -49,6 +57,7 @@ class BackgroundReads:
             raise ValueError("read cache and queue capacities must be non-negative")
         self.clock = clock
         self.interval, self.max_age, self.capacity = interval, max_age, capacity
+        self.idle_after, self.cold_timeout = idle_after, cold_timeout
         self._lock = threading.RLock()
         self._reads: OrderedDict[Any, _Read] = OrderedDict()
         self._inflight: dict[Any, _Read] = {}
@@ -63,7 +72,18 @@ class BackgroundReads:
 
     def _trim(self):
         while len(self._reads) > self.capacity:
-            self._reads.popitem(last=False)
+            self._evict_one()
+
+    def _evict_one(self):
+        for key in self._reads:
+            if not self.capacity or not self._default_report(key):
+                del self._reads[key]
+                return
+        self._reads.popitem(last=False)
+
+    @staticmethod
+    def _default_report(key):
+        return key[0] == "report" and len(key) > 1 and key[1] == ReportSelection()
 
     def _lookup(self, key, load):
         read = self._reads.get(key)
@@ -107,23 +127,27 @@ class BackgroundReads:
 
     def _load(self, read):
         with self._lock:
-            revision, load = read.revision, read.load
+            revision, invalidation, load = read.revision, read.invalidation, read.load
+            read.started = self.clock()
         try:
             value = load()
         except Exception as exc:
             with self._lock:
                 read.error = exc
+                read.duration = max(0, self.clock() - read.started)
             log.exception("Background SQL read refresh failed")
             raise
         with self._lock:
+            read.duration = max(0, self.clock() - read.started)
             if revision != read.revision:
                 return read.value
             read.value, read.ready, read.updated, read.error = value, True, self.clock(), None
+            read.dirty = read.invalidation != invalidation
             if read.key[0] in ("output", "output-range"):
                 rows = value["rows"] if isinstance(value, dict) else value
                 read.size = sum(len(row.get("data", "")) + 1024 for row in rows)
             while sum(item.size for item in self._reads.values()) > 64 * 1024 * 1024:
-                self._reads.popitem(last=False)
+                self._evict_one()
         return value
 
     def publish(self, key, value, load):
@@ -136,18 +160,22 @@ class BackgroundReads:
                 self._trim()
             read.revision += 1
             read.value, read.ready, read.updated, read.error = copy.deepcopy(value), True, self.clock(), None
+            read.dirty = False
 
     def get(self, key, load, *, wait=True, detached=True, refresh=False):
         with self._lock:
             read = self._lookup(key, load)
-            fresh = not refresh and read.ready and self.clock() - read.updated < self.max_age
-            if fresh:
+            now = self.clock()
+            read.accessed = now
+            if not refresh and read.ready:
+                if read.dirty or now - read.updated >= max(self.max_age, 2 * read.duration):
+                    self._submit_if_due(read, now)
                 return copy.deepcopy(read.value) if detached else read.value
             future = self._submit(read)
         if not wait:
             return None
         try:
-            future.result(timeout=4.0)
+            future.result(timeout=self.cold_timeout)
         except TimeoutError as exc:
             raise StorageError("SQL read model is still hydrating; retry shortly") from exc
         except Exception as exc:
@@ -157,9 +185,25 @@ class BackgroundReads:
 
     def invalidate(self, predicate):
         with self._lock:
+            now = self.clock()
             for key, read in self._reads.items():
                 if predicate(key):
-                    self._submit(read, required=False)
+                    read.invalidation += 1
+                    read.dirty = True
+                    if self._active(read, now):
+                        self._submit_if_due(read, now)
+
+    def _active(self, read, now):
+        return (
+            read.key[0] == "history"
+            or self._default_report(read.key)
+            or (read.accessed is not None and now - read.accessed < self.idle_after)
+        )
+
+    def _submit_if_due(self, read, now):
+        delay = max(self.interval, 2 * read.duration)
+        if read.started is None or now - read.started >= delay:
+            self._submit(read, required=False)
 
     def discard(self, predicate):
         with self._lock:
@@ -174,8 +218,15 @@ class BackgroundReads:
         while not self._stop.wait(self.interval):
             with self._lock:
                 for read in self._reads.values():
-                    if self.clock() - read.updated >= self.interval:
-                        self._submit(read, required=False)
+                    now = self.clock()
+                    if not self._active(read, now):
+                        continue
+                    if (
+                        read.dirty
+                        or not read.ready
+                        or now - read.updated >= max(self.max_age, 2 * read.duration)
+                    ):
+                        self._submit_if_due(read, now)
 
     def close(self):
         with self._close_lock:
@@ -193,18 +244,22 @@ class BackgroundReads:
 
 
 class SqlReadModel:
-    def __init__(self, backend, *, start=True):
+    def __init__(self, backend, *, start=True, reconcile_interval=30.0):
         self.backend = backend
         self.owner = backend.owner
         self.reads = BackgroundReads()
         self._lock = threading.RLock()
         self._records = {}
         self._pending = {}
+        self._snapshots = {}
         self._pending_revision = {}
         self._version = bytes(8)
+        self._reconcile_interval = reconcile_interval
+        self._reconciled = None
         self._ready = threading.Event()
         self._updated = 0.0
         self._error = None
+        self._refresh_duration = None
         self._stop = threading.Event()
         self._thread = None
         self._uses = {}
@@ -229,28 +284,32 @@ class SqlReadModel:
             identity = kind, key
             self._pending[identity] = copy.deepcopy(payload)
             self._pending_revision[identity] = self._pending_revision.get(identity, 0) + 1
+            self._snapshots.pop(kind, None)
         self.reads.invalidate(lambda key: key[0] in ("report", "history"))
 
     def refresh_once(self):
+        started = time.monotonic()
         with self._lock:
             candidates = [(identity, self._pending_revision.get(identity, 0)) for identity in self._pending]
         pending_keys = self.backend.outbox.pending_keys()
         acknowledged = [
             (identity, revision) for identity, revision in candidates if identity not in pending_keys
         ][:500]
+        changes = []
+        version = self._version
         while True:
             if self._stop.is_set():
                 return
-            version, rows, complete = self.backend.read_changes(self._version)
-            with self._lock:
-                for kind, key, payload in rows:
-                    self._records[kind, key] = payload
-                self._version = version
+            version, rows, complete = self.backend.read_changes(version)
+            changes.extend(rows)
             if complete:
                 break
         # Key reconciliation observes old-version deletes, while bounded authoritative
         # reads close the gap between outbox acknowledgement and the commit-safe feed.
-        keys = self.backend.read_record_keys()
+        reconcile = (
+            self._reconciled is None or time.monotonic() - self._reconciled >= self._reconcile_interval
+        )
+        keys = self.backend.read_record_keys() if reconcile else None
         authoritative = {}
         by_kind = {}
         for (kind, key), _ in acknowledged:
@@ -259,49 +318,77 @@ class SqlReadModel:
             rows = self.backend.get_many(kind, selected)
             authoritative.update({(kind, key): value for key, value in rows.items()})
         with self._lock:
-            for identity in list(self._records):
-                if identity not in keys and identity not in self._pending:
-                    del self._records[identity]
+            changed_kinds = set()
+            for kind, key, payload in changes:
+                identity = kind, key
+                if self._records.get(identity) != payload:
+                    self._records[identity] = payload
+                    changed_kinds.add(kind)
+            self._version = version
+            if keys is not None:
+                for identity in list(self._records):
+                    if identity not in keys and identity not in self._pending:
+                        del self._records[identity]
+                        changed_kinds.add(identity[0])
+                self._reconciled = time.monotonic()
             for identity, revision in acknowledged:
                 if identity in authoritative:
-                    self._records[identity] = authoritative[identity]
+                    if self._records.get(identity) != authoritative[identity]:
+                        self._records[identity] = authoritative[identity]
+                        changed_kinds.add(identity[0])
                 else:
-                    self._records.pop(identity, None)
+                    if identity in self._records:
+                        del self._records[identity]
+                        changed_kinds.add(identity[0])
                 if self._pending_revision.get(identity) == revision:
                     self._pending.pop(identity, None)
                     self._pending_revision.pop(identity, None)
+                    changed_kinds.add(identity[0])
+            for kind in changed_kinds:
+                self._snapshots.pop(kind, None)
             self._updated = time.monotonic()
+            self._refresh_duration = self._updated - started
             self._error = None
             self._ready.set()
-            live_jobs = {key for kind, key in self._records.keys() | self._pending.keys() if kind == "job"}
-        self.reads.discard(
-            lambda key: (
-                key[0] in ("record", "records", "list", "scan", "counts")
-                or (key[0] in ("output", "output-range") and key[1] not in live_jobs)
-            )
-        )
 
     def _refresh(self):
         while not self._stop.is_set():
             try:
                 self.refresh_once()
             except Exception as exc:
-                self._error = exc
+                with self._lock:
+                    self._error = exc
                 log.exception("SQL record hydration failed")
             self._stop.wait(1)
 
     def _ensure_ready(self):
         if not self._ready.wait(4):
             raise StorageError("SQL records are still hydrating; retry shortly")
-        with self._lock:
-            if time.monotonic() - self._updated >= 5:
-                raise StorageError("SQL record read model is stale") from self._error
 
-    def _snapshot(self):
+    def health(self):
+        with self._lock:
+            return {
+                "ready": self._ready.is_set(),
+                "age_seconds": max(0, time.monotonic() - self._updated) if self._ready.is_set() else None,
+                "last_refresh_seconds": self._refresh_duration,
+                "last_error": str(self._error) if self._error is not None else None,
+            }
+
+    def _snapshot(self, kind):
         self._ensure_ready()
         with self._lock:
-            records = self._records | self._pending
-            return list(records.items())
+            cached = self._snapshots.get(kind)
+            if cached is None:
+                records = self._records | self._pending
+                cached = tuple(
+                    sorted(
+                        ((key, row) for (row_kind, key), row in records.items() if row_kind == kind),
+                        key=lambda item: (item[1].get("created_at", item[1].get("at", 0)), item[0]),
+                        reverse=True,
+                    )
+                )
+                self._snapshots[kind] = cached
+            return cached
 
     def get(self, kind, key):
         with self._lock:
@@ -393,26 +480,42 @@ class SqlReadModel:
             lease_id=lease_id,
             client_id=client_id,
             states=states,
+            limit=limit,
         )
-        return copy.deepcopy(rows[:limit])
+        return copy.deepcopy(rows)
 
     def _select(
-        self, kind, *, before=None, after=None, target=None, lease_id=None, client_id=None, states=None
+        self,
+        kind,
+        *,
+        before=None,
+        after=None,
+        target=None,
+        lease_id=None,
+        client_id=None,
+        states=None,
+        limit=None,
     ):
-        rows = [
-            (key, row)
-            for (row_kind, key), row in self._snapshot()
-            if row_kind == kind
-            and all(
-                value is None or str(row.get(name, "")).casefold() == str(value).casefold()
-                for name, value in (("target", target), ("lease_id", lease_id), ("client_id", client_id))
-            )
-            and (before is None or row.get("created_at", row.get("at", 0)) < before)
-            and (after is None or row.get("created_at", row.get("at", 0)) >= after)
-            and (states is None or row.get("state") in states)
-        ]
-        rows.sort(key=lambda item: (item[1].get("created_at", item[1].get("at", 0)), item[0]), reverse=True)
-        return [row for _, row in rows]
+        filters = tuple(
+            (name, str(value).casefold())
+            for name, value in (("target", target), ("lease_id", lease_id), ("client_id", client_id))
+            if value is not None
+        )
+        rows = []
+        for _, row in self._snapshot(kind):
+            if filters and any(str(row.get(name, "")).casefold() != value for name, value in filters):
+                continue
+            at = row.get("created_at", row.get("at", 0))
+            if before is not None and at >= before:
+                continue
+            if after is not None and at < after:
+                continue
+            if states is not None and row.get("state") not in states:
+                continue
+            rows.append(row)
+            if limit is not None and len(rows) >= limit:
+                break
+        return rows
 
     def scan(self, kind, **filters):
         if not self._ready.is_set():
@@ -428,7 +531,7 @@ class SqlReadModel:
     def count_jobs(self):
         if not self._ready.is_set():
             return self.reads.get(("counts",), self.backend.count_jobs)
-        rows = [row for (kind, _), row in self._snapshot() if kind == "job"]
+        rows = [row for _, row in self._snapshot("job")]
         return {
             "running": sum(r["state"] == "running" for r in rows),
             "queued": sum(r["state"] == "queued" for r in rows),
@@ -441,8 +544,8 @@ class SqlReadModel:
                 ("counts", "target", lease_id), lambda: self.backend.count_jobs_by_target(lease_id=lease_id)
             )
         counts = {}
-        for (kind, _), row in self._snapshot():
-            if kind != "job" or (lease_id is not None and row.get("lease_id") != lease_id):
+        for _, row in self._snapshot("job"):
+            if lease_id is not None and row.get("lease_id") != lease_id:
                 continue
             if row.get("target"):
                 counts[row["target"]] = counts.get(row["target"], 0) + 1
@@ -452,9 +555,7 @@ class SqlReadModel:
         if not self._ready.is_set():
             return self.reads.get(("counts", "lease"), self.backend.count_jobs_by_lease)
         counts = {}
-        for (kind, _), row in self._snapshot():
-            if kind != "job":
-                continue
+        for _, row in self._snapshot("job"):
             if row.get("lease_id"):
                 counts[row["lease_id"]] = counts.get(row["lease_id"], 0) + 1
         return counts

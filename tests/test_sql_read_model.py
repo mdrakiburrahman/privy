@@ -10,6 +10,7 @@ import pytest
 
 from privy.hub.jobs import SUCCEEDED
 from privy.hub.leases import LeaseError, LeaseStore
+from privy.hub.metrics import ReportSelection
 from privy.hub.read_model import BackgroundReads, SqlReadModel
 from privy.hub.shared_jobs import SharedJob
 from privy.hub.sql_store import DurableOutbox, SqlBackend, StorageError
@@ -114,6 +115,7 @@ def test_refresh_observes_remote_changes_and_old_writer_deletions(model):
     model.refresh_once()
     assert model.get("job", "j")["state"] == SUCCEEDED
     del model.backend.records["job", "j"]
+    model._reconciled = 0
     model.refresh_once()
     assert model.get("job", "j") is None
     assert model.count_jobs()["retained"] == 0
@@ -290,11 +292,17 @@ def test_purpose_timestamp_ties_use_sql_identity_order_even_without_payload_id(m
     assert [row["purpose"] for row in model.scan("purpose")] == ["last", "first"]
 
 
-def test_stale_metadata_fails_explicitly(model):
+def test_stale_metadata_remains_available_and_exposes_health(model):
+    model.backend.records["job", "j"] = job()
     model.refresh_once()
-    model._updated = time.monotonic() - 5
-    with pytest.raises(StorageError, match="stale"):
-        model.get("job", "missing")
+    model._updated = time.monotonic() - 60
+    model._error = RuntimeError("refresh failed")
+    assert model.get("job", "j")["state"] == "running"
+    status = model.health()
+    assert status["ready"]
+    assert status["age_seconds"] >= 60
+    assert status["last_refresh_seconds"] >= 0
+    assert status["last_error"] == "refresh failed"
 
 
 def test_progressive_startup_serves_exact_record_before_full_hydration():
@@ -410,6 +418,27 @@ def test_cold_reads_coalesce_parallel_requests():
         cache.close()
 
 
+def test_cold_read_times_out_without_cancelling_inflight_hydration():
+    entered, release = threading.Event(), threading.Event()
+    cache = BackgroundReads(interval=3600, cold_timeout=0.01)
+
+    def load():
+        entered.set()
+        assert release.wait(2)
+        return "ready"
+
+    try:
+        with pytest.raises(StorageError, match="still hydrating"):
+            cache.get(("cold",), load)
+        assert entered.is_set()
+        release.set()
+        cache._reads[("cold",)].future.result(timeout=2)
+        assert cache.get(("cold",), load) == "ready"
+    finally:
+        release.set()
+        cache.close()
+
+
 def test_local_commit_publication_cannot_be_overwritten_by_older_inflight_read():
     entered, release = threading.Event(), threading.Event()
     cache = BackgroundReads(interval=3600)
@@ -431,21 +460,149 @@ def test_local_commit_publication_cannot_be_overwritten_by_older_inflight_read()
         cache.close()
 
 
-def test_failed_refresh_does_not_return_expired_success(caplog):
+def test_slow_or_failed_refresh_serves_last_good_value(caplog):
     now = [0]
-    cache = BackgroundReads(interval=3600, clock=lambda: now[0])
+    cache = BackgroundReads(interval=1, clock=lambda: now[0])
+    entered, release = threading.Event(), threading.Event()
 
     def fail():
+        entered.set()
+        assert release.wait(2)
         raise RuntimeError("database unavailable")
 
     try:
         assert cache.get(("report",), lambda: {"ok": True}) == {"ok": True}
         now[0] = 5
-        with pytest.raises(StorageError, match="refresh failed"):
-            cache.get(("report",), fail)
+        assert cache.get(("report",), fail) == {"ok": True}
+        assert entered.wait(1)
+        assert cache.get(("report",), fail) == {"ok": True}
+        release.set()
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            cache._reads[("report",)].future.result(timeout=2)
+        assert cache.get(("report",), fail) == {"ok": True}
         assert "Background SQL read refresh failed" in caplog.text
     finally:
+        release.set()
         cache.close()
+
+
+def test_idle_reads_do_not_refresh_and_write_bursts_coalesce():
+    now = [0.0]
+    cache = BackgroundReads(interval=0.01, max_age=5, idle_after=60, clock=lambda: now[0])
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def load():
+        calls.append(now[0])
+        if len(calls) == 2:
+            entered.set()
+            assert release.wait(2)
+        return len(calls)
+
+    try:
+        assert cache.get(("report",), load) == 1
+        now[0] = 61
+        time.sleep(0.04)
+        cache.invalidate(lambda key: True)
+        time.sleep(0.04)
+        assert calls == [0]
+        assert cache.get(("report",), load) == 1
+        assert entered.wait(1)
+        for _ in range(20):
+            cache.invalidate(lambda key: True)
+        assert calls == [0, 61]
+        release.set()
+        cache._reads[("report",)].future.result(timeout=2)
+        assert cache.get(("report",), load) == 2
+        assert calls == [0, 61]
+    finally:
+        release.set()
+        cache.close()
+
+
+def test_default_report_stays_warm_after_idle():
+    now = [0.0]
+    cache = BackgroundReads(interval=0.01, max_age=5, idle_after=60, clock=lambda: now[0])
+    refreshed = threading.Event()
+    calls = []
+
+    def load():
+        calls.append(now[0])
+        if len(calls) > 1:
+            refreshed.set()
+        return len(calls)
+
+    try:
+        key = ("report", ReportSelection(), ())
+        assert cache.get(key, load) == 1
+        now[0] = 61
+        assert refreshed.wait(1)
+        assert cache.get(key, load) == 2
+    finally:
+        cache.close()
+
+
+def test_default_report_survives_cache_eviction():
+    cache = BackgroundReads(capacity=1, interval=3600)
+    key = ("report", ReportSelection(), ())
+    try:
+        assert cache.get(key, lambda: "default") == "default"
+        assert cache.get(("other",), lambda: "other") == "other"
+        assert key in cache._reads
+        assert cache.get(key, lambda: "unexpected") == "default"
+    finally:
+        cache.close()
+
+
+def test_unchanged_refresh_defers_expensive_key_reconciliation(model):
+    model.backend.records["job", "j"] = job()
+    model.refresh_once()
+    reads = model.backend.sql_reads
+    model.refresh_once()
+    assert model.backend.sql_reads == reads + 1
+    assert model.get("job", "j") == job()
+
+
+def test_refresh_preserves_last_good_snapshot_until_full_feed_commits(model):
+    model.backend.records["job", "j"] = job("queued")
+    model.refresh_once()
+    entered, release = threading.Event(), threading.Event()
+
+    def feed(version):
+        if version == bytes(8):
+            return (1).to_bytes(8, "big"), [("job", "j", job("running"))], False
+        entered.set()
+        assert release.wait(2)
+        raise StorageError("feed interrupted")
+
+    model.backend.read_changes = feed
+    errors = []
+    thread = threading.Thread(target=lambda: _capture_error(model.refresh_once, errors))
+    thread.start()
+    try:
+        assert entered.wait(1)
+        assert model.get("job", "j")["state"] == "queued"
+        release.set()
+        thread.join(2)
+        assert len(errors) == 1
+        assert model.get("job", "j")["state"] == "queued"
+        assert model._version == bytes(8)
+    finally:
+        release.set()
+        thread.join(2)
+
+
+def test_unchanged_refresh_keeps_job_snapshot_and_local_write_invalidates_it(model):
+    model.backend.records["job", "j"] = job("queued")
+    model.refresh_once()
+    assert model.list("job")[0]["state"] == "queued"
+    snapshot = model._snapshots["job"]
+    model.refresh_once()
+    assert model._snapshots["job"] is snapshot
+    model.backend.pending.add(("job", "j"))
+    model.apply("job", "j", job("running"))
+    assert model.list("job")[0]["state"] == "running"
+    assert model._snapshots["job"] is not snapshot
 
 
 def test_background_reads_bounds_running_and_queued_work():

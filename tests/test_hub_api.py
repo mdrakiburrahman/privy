@@ -4,6 +4,7 @@ import logging
 import queue
 import threading
 import time
+from types import SimpleNamespace
 from urllib.parse import quote
 
 import pytest
@@ -24,6 +25,7 @@ from privy.hub.app import Headers, HubApp, build_hub
 from privy.hub.home import LEGACY_TOKEN_FILENAME, read_state
 from privy.hub.rest import RELAYS_OPERATION, ROUTES, STREAM_JOB
 from privy.hub.service import OPERATIONS
+from privy.hub.sql_store import StorageError
 from privy.transfer import TransferResult
 
 NO_LISTENER = '{"error":{"code":"EndpointNotFound","message":"There are no listeners connected"}}'
@@ -79,6 +81,42 @@ def test_every_endpoint_is_open_without_credentials(hub):
     assert hub.call("GET", "/v1/targets", headers=stale).status == 403
     assert hub.call("GET", "/v1", headers={"Authorization": "Bearer obsolete"}).status == 200
     assert hub.call("GET", "/v1", headers={"Host": "devbox.example:7748"}).status == 403
+
+
+@pytest.mark.parametrize(
+    ("path", "method"), [("/ui", "report"), ("/ui/jobs", "entries"), ("/v1/stats", "report")]
+)
+def test_storage_hydration_errors_return_retryable_503(hub, monkeypatch, path, method):
+    def unavailable(*args, **kwargs):
+        raise StorageError("SQL read model is still hydrating")
+
+    monkeypatch.setattr(hub.service.metrics, method, unavailable)
+    response = hub.call("GET", path)
+    assert response.status == 503
+    assert response.headers["Retry-After"] == "1"
+    assert response.payload["error"]["code"] == "storage_unavailable"
+
+
+def test_health_includes_read_model_freshness(hub, monkeypatch):
+    status = {"ready": True, "age_seconds": 12, "last_refresh_seconds": 3, "last_error": "timeout"}
+    backend = SimpleNamespace(
+        health=lambda: {"mode": "azure_sql"}, read_model=SimpleNamespace(health=lambda: status)
+    )
+    monkeypatch.setattr(hub.jobs, "backend", backend, raising=False)
+    response = hub.call("GET", "/healthz")
+    assert response.status == 200
+    assert response.payload["storage"]["read_model"] == status
+
+
+def test_translated_api_storage_error_is_retryable(hub, monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise StorageError("SQL read model is still hydrating")
+
+    monkeypatch.setattr(hub.jobs, "list", unavailable)
+    response = hub.call("GET", "/v1/jobs")
+    assert response.status == 503
+    assert response.headers["Retry-After"] == "1"
+    assert response.payload["error"]["code"] == "storage_unavailable"
 
 
 def test_quickstart_lists_online_machines_with_runnable_examples(hub):

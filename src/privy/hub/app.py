@@ -31,6 +31,7 @@ from privy.hub.registry import DEFAULT_PROBE_TTL_S, TargetRegistry
 from privy.hub.responses import HTML_TYPE, HttpResponse, error_response
 from privy.hub.rest import RestApi
 from privy.hub.service import HubService
+from privy.hub.sql_store import StorageError
 
 __all__ = ["Headers", "HttpResponse", "HubApp", "HubHTTPServer", "HubRuntime", "build_hub"]
 
@@ -167,14 +168,15 @@ class HubApp:
             else:
                 backend = getattr(self.service.jobs, "backend", None)
                 if backend is not None:
-                    from privy.hub.sql_store import StorageError
-
                     try:
                         storage = backend.health()
                     except StorageError:
                         return error_response(
                             503, "storage_unavailable", "Authoritative SQL backing store is unavailable"
                         )
+                    model = getattr(backend, "read_model", None)
+                    if model is not None:
+                        storage["read_model"] = model.health()
                 else:
                     storage = {"mode": "file"}
                 response = HttpResponse(
@@ -193,7 +195,14 @@ class HubApp:
             response.surface = "mcp"
             return response
         query = parse_qs(parsed.query, keep_blank_values=True)
-        response = self.rest.handle(method, path, query, headers, body)
+        try:
+            response = self.rest.handle(method, path, query, headers, body)
+        except StorageError:
+            response = error_response(
+                503, "storage_unavailable", "shared storage is unavailable; retry later", {"Retry-After": "1"}
+            )
+        if response.status == 503 and response.note == "storage_unavailable":
+            response.headers["Retry-After"] = "1"
         ui = headers.get("X-Privy-UI") or path == "/ui" or path.startswith("/ui/")
         response.surface = "ui" if ui or response.media_type() == HTML_TYPE else "rest"
         return response
