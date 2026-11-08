@@ -28,7 +28,7 @@ from privy.hub.jobs import (
     utc_iso,
 )
 from privy.hub.leases import LeaseError, LeaseStore
-from privy.hub.listener_facts import FACETS, ListenerInfoStore, facts_for, matches
+from privy.hub.listener_facts import FACETS, ListenerInfoStore, facts_for, facts_for_many, matches
 from privy.hub.metrics import HubMetrics
 from privy.hub.purpose import MAX_PURPOSE_CHARS, WINDOWS, normalize_purpose
 from privy.hub.registry import (
@@ -881,6 +881,11 @@ class HubService:
         """OS and version facts, live or last known (see :mod:`privy.hub.listener_facts`)."""
         return facts_for(self.listener_infos, target_id, path, probe)
 
+    def listener_facts_many(
+        self, targets: Sequence[Target], probes: Mapping[str, ProbeResult | None]
+    ) -> dict[str, dict[str, Any]]:
+        return facts_for_many(self.listener_infos, targets, probes)
+
     def _job_added(self, job: HubJob) -> None:
         self.leases.job_started(job)
         self.metrics.job_added(job)
@@ -1145,10 +1150,7 @@ class HubService:
             probes = self.registry.probe_many(targets, refresh=refresh)
         else:
             probes = {target.id: self.registry.cached(target) for target in targets}
-        facts = {
-            target.id: self.listener_facts(target.id, target.path, probes.get(target.id))
-            for target in targets
-        }
+        facts = self.listener_facts_many(targets, probes)
         views = [
             self._target_view(target, probes.get(target.id), facts=facts[target.id]) for target in targets
         ]

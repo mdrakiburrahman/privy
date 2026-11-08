@@ -687,6 +687,19 @@ class SqlBackend:
             row = cursor.fetchone()
             return json.loads(row[0]) if row else None
 
+    def get_many(self, kind: str, keys: list[str]) -> dict[str, dict]:
+        unique_keys = list(dict.fromkeys(keys))
+        if not unique_keys:
+            return {}
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT id,payload FROM dbo.privy_records WHERE kind=? "
+                "AND id IN (SELECT value FROM OPENJSON(?))",
+                kind,
+                json.dumps(unique_keys, ensure_ascii=True),
+            )
+            return {str(key): json.loads(payload) for key, payload in cursor.fetchall()}
+
     def list(
         self,
         kind: str,

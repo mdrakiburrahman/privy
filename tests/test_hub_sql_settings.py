@@ -87,6 +87,38 @@ def test_same_home_successor_fences_previous_incarnation_without_releasing_pins(
     assert json.loads(insert[1])["home_scope"] == "host:/home"
 
 
+def test_sql_get_many_uses_one_parameterized_openjson_query():
+    rows = [("dev/a", json.dumps({"seen_at": 10, "info": {"platform": {"system": "Linux"}}}))]
+    cursor = FakeCursor(rows)
+
+    @contextmanager
+    def transaction(_lock=None):
+        yield cursor
+
+    backend = object.__new__(SqlBackend)
+    backend.transaction = transaction
+
+    assert backend.get_many("listener", ["dev/a", "dev/b", "dev/a"]) == {
+        "dev/a": {"seen_at": 10, "info": {"platform": {"system": "Linux"}}}
+    }
+    assert len(cursor.statements) == 1
+    query, args = cursor.statements[0]
+    assert "id IN (SELECT value FROM OPENJSON(?))" in query
+    assert args == ("listener", '["dev/a", "dev/b"]')
+
+
+def test_sql_get_many_skips_empty_key_sets():
+    backend = object.__new__(SqlBackend)
+
+    @contextmanager
+    def unexpected_transaction(_lock=None):
+        pytest.fail("empty get_many must not open a SQL transaction")
+        yield
+
+    backend.transaction = unexpected_transaction
+    assert backend.get_many("listener", []) == {}
+
+
 def test_sql_job_pages_apply_state_filters_and_aggregate_counts():
     class Cursor:
         def __init__(self):

@@ -6,7 +6,14 @@ from types import SimpleNamespace
 from hub_fakes import FakeListener, Hub
 
 from privy.client import RelayHTTPError
-from privy.hub.listener_facts import FORGET_S, REFRESH_S, STATE_FILENAME, ListenerInfoStore, describe, matches
+from privy.hub.listener_facts import (
+    FORGET_S,
+    REFRESH_S,
+    STATE_FILENAME,
+    ListenerInfoStore,
+    describe,
+    matches,
+)
 from privy.hub.registry import OFFLINE, ONLINE, ProbeResult
 
 BOX1 = "dev/box1_windows"
@@ -99,6 +106,75 @@ def test_store_keeps_last_description_without_rewriting_unchanged_ones(tmp_path)
 
     state.write_text("{not json", encoding="utf-8")
     assert ListenerInfoStore(tmp_path).last(BOX1) is None
+
+
+def test_last_many_batches_shared_reads_and_preserves_newest_and_expiry():
+    now = 2_000_000_000.0
+
+    class Backend:
+        owner = "hub-test"
+
+        def __init__(self):
+            self.calls = []
+            self.rows = {
+                "dev/a": {"seen_at": now - 2, "info": LINUX},
+                "dev/b": {"seen_at": now - 1, "info": LINUX},
+                "dev/c": {"seen_at": now - FORGET_S - 2, "info": LINUX},
+            }
+
+        def enqueue(self, *_args):
+            pass
+
+        def get_many(self, kind, target_ids):
+            self.calls.append((kind, target_ids))
+            return {target_id: self.rows[target_id] for target_id in target_ids if target_id in self.rows}
+
+    backend = Backend()
+    store = ListenerInfoStore(clock=lambda: now, backend=backend)
+    store.record(SimpleNamespace(id="dev/a"), ProbeResult(ONLINE, now - 1, info=WINDOWS))
+    store.record(SimpleNamespace(id="dev/c"), ProbeResult(ONLINE, now - FORGET_S - 1, info=WINDOWS))
+
+    result = store.last_many(["dev/a", "dev/a", "dev/b", "dev/c"])
+
+    assert backend.calls == [("listener", ["dev/a", "dev/b", "dev/c"])]
+    assert result["dev/a"] == (WINDOWS, now - 1)
+    assert result["dev/b"] == (LINUX, now - 1)
+    assert result["dev/c"] is None
+
+
+def test_bulk_fact_readers_use_batched_fallback(tmp_path):
+    from privy.hub.dashboard import build_report
+
+    class TrackingStore(ListenerInfoStore):
+        def __init__(self, home):
+            super().__init__(home, save_delay_s=3600)
+            self.calls = []
+
+        def last(self, _target_id):
+            raise AssertionError("bulk readers must not perform per-target lookups")
+
+        def last_many(self, target_ids):
+            keys = list(target_ids)
+            self.calls.append(keys)
+            return super().last_many(keys)
+
+    store = TrackingStore(tmp_path)
+    hub = Hub(
+        tmp_path,
+        {
+            "dev/box1_windows": FakeListener(info_error=NO_LISTENER),
+            "dev/box2_linux": FakeListener(info_error=NO_LISTENER),
+        },
+        listener_infos=store,
+    )
+
+    hub.service.invoke("list_targets", {"probe": False}, origin="test")
+    assert len(store.calls) == 1
+    store.calls.clear()
+
+    build_report(hub.service)
+    assert len(store.calls) == 1
+    hub.service.listener_infos.flush()
 
 
 def test_list_targets_filters_by_facets_and_shows_last_known_details_offline(tmp_path):

@@ -307,10 +307,11 @@ def build_report(
         jobs_retained=counts["retained"],
         max_running=service.jobs.max_running,
     )
+    facts = service.listener_facts_many(targets, probes)
     for row in report["targets"]:
         probe = probes.get(row["id"])
         row["terminal_shells"] = terminal_languages(probe.info if probe else None)
-        row.update(service.listener_facts(row["id"], row["hybrid_connection"], probe))
+        row.update(facts[row["id"]])
     return report
 
 
