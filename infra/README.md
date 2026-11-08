@@ -1,6 +1,7 @@
 # Privy Azure SQL infrastructure
 
-Deploys an Entra-only logical SQL server and `privy` (Standard S0, 10 DTUs) in Canada Central. TLS
+Deploys an Entra-only logical SQL server and `privy` (Hyperscale `HS_Gen5_8`: Gen5, 8 vCores) in
+Canada Central. TLS
 1.2 is required; transparent data encryption is enabled. The single `privy-allow-all` firewall rule
 allows `0.0.0.0–255.255.255.255`, as explicitly chosen for multi-machine access. The server is
 internet-reachable, but connections still require Entra authentication and TLS. There are no
@@ -27,20 +28,28 @@ Second machines need no IP allowlisting. The script no longer accepts client IPs
 the same allow-all rule. Deployments are incremental: omitted rules and unrelated resources are
 preserved. Remove legacy per-IP rules explicitly after the first allow-all deployment; reruns do not
 recreate them. The script rejects automatic changes to existing target server identity,
-authentication, location, TLS/network settings or database SKU/backup/collation. Use a reviewed
-Azure operation for intentional changes, then rerun.
+authentication, location, TLS/network settings or database
+SKU/HA/read-scale/zone/backup/collation. Use a reviewed Azure operation for intentional changes,
+then rerun.
+
+Existing databases must report a requested service objective matching the selected SKU; the script
+refuses to override pending SKU changes or missing requested-objective metadata. Hyperscale zone
+redundancy must be explicitly reported as boolean `false`, not missing, null, or a string.
 
 The default server name is `privy-sql`; override `-ServerName` if needed for global uniqueness. The
-database name and supported starting SKUs are parameters. All Azure operations pass the explicit
+database name and supported SKUs are parameters. `HS_Gen5_8` is the default; `S0`, `S1`, `S2`, and
+`S3` remain available for intentional Standard-tier deployments. The Hyperscale configuration uses
+one high-availability replica, enables read scale-out, disables zone redundancy, and retains Local
+backup storage redundancy. All Azure operations pass the explicit
 subscription; the script does not run `az account set`. Deployment outputs are nonsecret resource
 IDs, FQDN, tiers, the firewall range, and explicit settings locations.
 
-Canada Central S0 availability was checked against Azure capabilities on 2026-11-07. The Azure
-Retail Prices API listed S0 at **USD 0.532/day** (about **USD 15.96 per 30 days**) before tax, extra
-storage/backup, or agreement discounts. This is a retail estimate, not the subscription's invoice
-price. Consult
-[Azure SQL pricing](https://azure.microsoft.com/pricing/details/azure-sql-database/single/) for
-current pricing; no cost limit or autoscaling is implied.
+Using an indicative rate of **USD 0.22 per vCore-hour**, `HS_Gen5_8` with one HA replica is
+approximately **USD 84.48/day** for compute (`$0.22 × 8 vCores × 2 replicas × 24 hours`); storage,
+backup, tax, and agreement discounts are additional. This is an indicative retail estimate, not a
+quote or the subscription's invoice price. Actual rates vary by region and agreement. Consult
+[Azure SQL pricing](https://azure.microsoft.com/pricing/details/azure-sql-database/single/) before
+changing capacity; no cost limit or autoscaling is implied.
 
 Run `pwsh -File .\infra\test_deploy.ps1` for isolated script tests using a mocked Azure CLI (input
 guards, native exit-code failures, existing-server safety, validation-only behavior, YAML shape and

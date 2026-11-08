@@ -4,6 +4,7 @@ $deployScript = Join-Path $PSScriptRoot "..\scripts\deploy_infra.ps1"
 $global:PrivyInfraCalls = @()
 $global:PrivyInfraFailAzure = $false
 $global:PrivyInfraExistingServer = $false
+$global:PrivyInfraDatabaseState = "none"
 $global:PrivyInfraWideFirewall = $false
 $global:PrivyInfraAllowAll = $false
 $tenant = "11111111-1111-1111-1111-111111111111"
@@ -32,11 +33,44 @@ function az {
             elseif ($global:PrivyInfraAllowAll) { '[{"name":"privy-allow-all","startIpAddress":"0.0.0.0","endIpAddress":"255.255.255.255"}]' }
             else { '[]' }
         }
-        "sql db list" { '[]' }
+        "sql db list" {
+            if ($global:PrivyInfraDatabaseState -eq "none") { '[]' }
+            elseif ($global:PrivyInfraDatabaseState -eq "standard") {
+                @{
+                    name="privy"; currentServiceObjectiveName="S0"
+                    requestedServiceObjectiveName="S0"
+                    currentBackupStorageRedundancy="Local"; collation="SQL_Latin1_General_CP1_CI_AS"
+                    sku=@{name="S0"; tier="Standard"}
+                } | ConvertTo-Json -Depth 6
+            }
+            else {
+                $database = @{
+                    name="privy"; currentServiceObjectiveName="HS_Gen5_8"
+                    requestedServiceObjectiveName="HS_Gen5_8"
+                    currentBackupStorageRedundancy="Local"; collation="SQL_Latin1_General_CP1_CI_AS"
+                    sku=@{name="HS_Gen5"; tier="Hyperscale"; family="Gen5"; capacity=8}
+                    highAvailabilityReplicaCount=1; readScale="Enabled"; zoneRedundant=$false
+                }
+                if ($global:PrivyInfraDatabaseState -eq "wrongHyperscale") {
+                    $database.highAvailabilityReplicaCount = 0
+                    $database.readScale = "Disabled"
+                }
+                switch ($global:PrivyInfraDatabaseState) {
+                    "missingZone" { $database.Remove("zoneRedundant") }
+                    "nullZone" { $database.zoneRedundant = $null }
+                    "wrongZone" { $database.zoneRedundant = $true }
+                    "stringZone" { $database.zoneRedundant = "false" }
+                    "pendingSku" { $database.requestedServiceObjectiveName = "HS_Gen5_16" }
+                    "wrongCurrentSku" { $database.currentServiceObjectiveName = "HS_Gen5_16" }
+                }
+                @($database) | ConvertTo-Json -Depth 6
+            }
+        }
         "deployment sub validate" { '{}' }
         "deployment sub create" {
             $parameterIndex = [Array]::IndexOf($args, "--parameters")
             $parameters = Get-Content -LiteralPath $args[$parameterIndex + 1].Substring(1) -Raw | ConvertFrom-Json
+            if ($parameters.databaseSku.value -ne "HS_Gen5_8") { throw "Deployment did not select the Hyperscale default." }
             if ($parameters.PSObject.Properties.Name -contains "clientIPv4Addresses") { throw "Deployment accepts client IPs." }
             if (@($parameters.PSObject.Properties.Name | Where-Object { $_ -like "*test*" }).Count) {
                 throw "Deployment includes removed test parameters."
@@ -49,7 +83,7 @@ function az {
                         serverFqdn=@{value="test.database.windows.net"}
                         serverResourceId=@{value="/test/server"}
                         databaseResourceId=@{value="/test/privy"}
-                        databaseSku=@{value="S0"}
+                        databaseSku=@{value="HS_Gen5_8"}
                     }
                 }
             } | ConvertTo-Json -Depth 6
@@ -71,6 +105,14 @@ function Assert-Fails {
 
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("privy-infra-test-" + [guid]::NewGuid())
 $production = Join-Path $testRoot "production\appsettings.yaml"
+$mainTemplate = Get-Content -LiteralPath (Join-Path $PSScriptRoot "main.bicep") -Raw
+$sqlTemplate = Get-Content -LiteralPath (Join-Path $PSScriptRoot "sql.bicep") -Raw
+if ($mainTemplate -notmatch "@allowed\(\['S0', 'S1', 'S2', 'S3', 'HS_Gen5_8'\]\)\s*param databaseSku string = 'HS_Gen5_8'") {
+    throw "Bicep does not default to HS_Gen5_8 while preserving Standard SKUs."
+}
+if ($sqlTemplate -notmatch "highAvailabilityReplicaCount: 1" -or $sqlTemplate -notmatch "readScale: 'Enabled'" -or $sqlTemplate -notmatch "zoneRedundant: false") {
+    throw "Bicep is missing explicit Hyperscale HA/read-scale/zone settings."
+}
 try {
     Assert-Fails { & $deployScript -ClientIPv4Addresses "1.2.3.4" -ValidateOnly } "parameter"
     Assert-Fails { & $deployScript -SettingsPath ".\appsettings.yaml" } "absolute"
@@ -93,6 +135,25 @@ try {
     Assert-Fails { & $deployScript } "firewall bypass"
     $global:PrivyInfraWideFirewall = $false
     $global:PrivyInfraCalls = @()
+    $global:PrivyInfraDatabaseState = "wrongHyperscale"
+    Assert-Fails { & $deployScript -ValidateOnly } "SKU/HA/read-scale/zone"
+    foreach ($state in @("missingZone", "nullZone", "wrongZone", "stringZone", "wrongCurrentSku", "pendingSku")) {
+        $global:PrivyInfraDatabaseState = $state
+        $global:PrivyInfraCalls = @()
+        $expectedFailure = if ($state -eq "pendingSku") { "requested SKU differs" } else { "SKU/HA/read-scale/zone" }
+        Assert-Fails { & $deployScript -ValidateOnly } $expectedFailure
+        if (@($global:PrivyInfraCalls | Where-Object { $_[0] -eq "deployment" }).Count) {
+            throw "Unsafe database metadata reached deployment: $state"
+        }
+    }
+    $global:PrivyInfraDatabaseState = "standard"
+    & $deployScript -DatabaseSku S0 -ValidateOnly
+    $global:PrivyInfraDatabaseState = "hyperscale"
+    $global:PrivyInfraCalls = @()
+    & $deployScript -ValidateOnly
+    if (@($global:PrivyInfraCalls | Where-Object { $_[0] -eq "deployment" -and $_[2] -eq "validate" }).Count -ne 1) {
+        throw "Matching current/requested Hyperscale metadata did not reach validation."
+    }
     $result = & $deployScript -SettingsPath $production | ConvertFrom-Json
     if ($result.provisioningState -ne "Succeeded") { throw "Incorrect deployment state." }
     if (@($result.PSObject.Properties.Name | Where-Object { $_ -like "*test*" }).Count) {
@@ -134,5 +195,5 @@ finally {
     foreach ($directory in @((Split-Path $production), $testRoot)) {
         if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory }
     }
-    Remove-Variable -Name PrivyInfraCalls, PrivyInfraFailAzure, PrivyInfraExistingServer, PrivyInfraWideFirewall, PrivyInfraAllowAll -Scope Global
+    Remove-Variable -Name PrivyInfraCalls, PrivyInfraFailAzure, PrivyInfraExistingServer, PrivyInfraDatabaseState, PrivyInfraWideFirewall, PrivyInfraAllowAll -Scope Global
 }

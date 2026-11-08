@@ -9,8 +9,8 @@ param administratorObjectId string
 param administratorLogin string
 param tenantId string
 
-@allowed(['S0', 'S1', 'S2', 'S3'])
-param databaseSku string = 'S0'
+@allowed(['S0', 'S1', 'S2', 'S3', 'HS_Gen5_8'])
+param databaseSku string = 'HS_Gen5_8'
 
 resource group 'Microsoft.Resources/resourceGroups@2025-04-01' = {
   name: resourceGroupName

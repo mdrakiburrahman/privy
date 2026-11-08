@@ -7,8 +7,8 @@ param(
     [string] $ServerName = "privy-sql",
     [ValidatePattern('^[A-Za-z][A-Za-z0-9_]{0,127}$')]
     [string] $DatabaseName = "privy",
-    [ValidateSet("S0", "S1", "S2", "S3")]
-    [string] $DatabaseSku = "S0",
+    [ValidateSet("S0", "S1", "S2", "S3", "HS_Gen5_8")]
+    [string] $DatabaseSku = "HS_Gen5_8",
     [string] $SettingsPath,
     [switch] $ValidateOnly
 )
@@ -116,10 +116,32 @@ if ($group.Count) {
         $databases = @(Invoke-Azure @("sql", "db", "list", "--resource-group", $ResourceGroupName, "--server", $ServerName))
         foreach ($target in @(@{Name=$DatabaseName; Sku=$DatabaseSku})) {
             $existingDb = @($databases | Where-Object name -EQ $target.Name)
-            if ($existingDb.Count -and ($existingDb[0].currentServiceObjectiveName -ne $target.Sku -or
+            if (-not $existingDb.Count) { continue }
+            $database = $existingDb[0]
+            $requestedObjective = $database.PSObject.Properties["requestedServiceObjectiveName"]
+            if ($null -eq $requestedObjective -or $requestedObjective.Value -ne $target.Sku) {
+                throw "Existing database $($target.Name) requested SKU differs or is missing; refusing to override a pending change."
+            }
+            $isHyperscale = $target.Sku -eq "HS_Gen5_8"
+            $skuMismatch = if ($isHyperscale) {
+                $zoneRedundancy = $database.PSObject.Properties["zoneRedundant"]
+                $database.currentServiceObjectiveName -ne "HS_Gen5_8" -or
+                $database.sku.name -ne "HS_Gen5" -or
+                $database.sku.tier -ne "Hyperscale" -or
+                $database.sku.family -ne "Gen5" -or
+                [int]$database.sku.capacity -ne 8 -or
+                [int]$database.highAvailabilityReplicaCount -ne 1 -or
+                $database.readScale -ne "Enabled" -or
+                $null -eq $zoneRedundancy -or
+                $zoneRedundancy.Value -isnot [bool] -or
+                $zoneRedundancy.Value -ne $false
+            } else {
+                $database.currentServiceObjectiveName -ne $target.Sku
+            }
+            if ($skuMismatch -or
                 $existingDb[0].currentBackupStorageRedundancy -ne "Local" -or
-                $existingDb[0].collation -ne "SQL_Latin1_General_CP1_CI_AS")) {
-                throw "Existing database $($target.Name) SKU/backup/collation differs; refusing automatic changes."
+                $database.collation -ne "SQL_Latin1_General_CP1_CI_AS") {
+                throw "Existing database $($target.Name) SKU/HA/read-scale/zone/backup/collation differs; refusing automatic changes."
             }
         }
     }

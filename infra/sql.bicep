@@ -6,6 +6,8 @@ param administratorLogin string
 param tenantId string
 param databaseSku string
 
+var isHyperscale = databaseSku == 'HS_Gen5_8'
+
 resource server 'Microsoft.Sql/servers@2023-08-01' = {
   name: serverName
   location: location
@@ -29,11 +31,22 @@ resource database 'Microsoft.Sql/servers/databases@2023-08-01' = {
   parent: server
   name: databaseName
   location: location
-  sku: {
+  sku: isHyperscale ? {
+    name: 'HS_Gen5'
+    tier: 'Hyperscale'
+    family: 'Gen5'
+    capacity: 8
+  } : {
     name: databaseSku
     tier: 'Standard'
   }
-  properties: {
+  properties: isHyperscale ? {
+    collation: 'SQL_Latin1_General_CP1_CI_AS'
+    requestedBackupStorageRedundancy: 'Local'
+    highAvailabilityReplicaCount: 1
+    readScale: 'Enabled'
+    zoneRedundant: false
+  } : {
     collation: 'SQL_Latin1_General_CP1_CI_AS'
     requestedBackupStorageRedundancy: 'Local'
   }
