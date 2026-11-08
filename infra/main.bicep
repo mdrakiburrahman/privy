@@ -16,10 +16,6 @@ param databaseSku string = 'S0'
 @allowed(['Basic', 'S0'])
 param testDatabaseSku string = 'Basic'
 
-@minLength(1)
-@description('Individual public client IPv4 addresses. No ranges or Azure-services bypass.')
-param clientIPv4Addresses array
-
 resource group 'Microsoft.Resources/resourceGroups@2025-04-01' = {
   name: resourceGroupName
   location: resourceGroupLocation
@@ -38,7 +34,6 @@ module sql './sql.bicep' = {
     tenantId: tenantId
     databaseSku: databaseSku
     testDatabaseSku: testDatabaseSku
-    clientIPv4Addresses: clientIPv4Addresses
   }
 }
 

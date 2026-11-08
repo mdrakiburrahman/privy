@@ -62,6 +62,10 @@ only changed records. Admission, session registration, holder checks, renewal, c
 release therefore coordinate across hubs. A differing target topology or lease/storage configuration
 is rejected; hydrate the complete intended topology before the first SQL start.
 
+The deployed `privy-sql.database.windows.net` permits all client IPs through the single
+`privy-allow-all` rule. No per-machine firewall setup is needed. This makes the SQL endpoint
+internet-reachable; Entra-only authentication and TLS 1.2 remain required.
+
 Job workers stay on their originating hub. Shared job summaries, output pages, broadcasts, audit,
 listener facts, purposes and dashboard telemetry are journaled locally before asynchronous delivery
 to SQL. The bounded SQLite delivery journal uses full durability, ordered replay and SQL
