@@ -16,7 +16,8 @@ import secrets
 import threading
 import time
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -124,6 +125,27 @@ def fmt_span(seconds: float) -> str:
     if seconds < 86400:
         return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
     return f"{seconds // 86400}d {seconds % 86400 // 3600}h"
+
+
+def fmt_interval(seconds: float) -> str:
+    remaining = Decimal(str(seconds))
+    if not remaining.is_finite() or remaining < 0:
+        raise ValueError("interval must be a finite nonnegative number")
+    parts = []
+    for unit, singular in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        count = int(remaining // unit)
+        if count:
+            parts.append(f"{count} {singular}{'' if count == 1 else 's'}")
+            remaining -= count * unit
+    if remaining or not parts:
+        amount = format(remaining.normalize(), "f")
+        parts.append(f"{amount} second{'s' if remaining != 1 else ''}")
+    return " ".join(parts)
+
+
+def fmt_utc_summary(at: float) -> str:
+    moment = datetime.fromtimestamp(at, tz=timezone.utc)
+    return f"{moment.strftime('%b')} {moment.day}, {moment.year} · {moment.strftime('%I:%M %p').lstrip('0')}"
 
 
 def local_time(at: float | None, *, short: bool = False) -> str:
@@ -728,21 +750,38 @@ def overview_controls(report: dict[str, Any]) -> str:
         for name in RESOLUTIONS
     )
     custom = report["range"] == "custom"
+
+    def effective_time(name: str) -> str:
+        exact = report[name]
+        label = fmt_utc_summary(report[f"{name}_ts"])
+        aria_label = f"{label} UTC; exact instant {exact}"
+        return (
+            f'<time class="range-time" datetime="{esc(exact)}" '
+            f'title="Exact UTC instant: {esc(exact)}" aria-label="{esc(aria_label)}">'
+            f"{esc(label)}</time>"
+        )
+
     return (
-        '<section class="metrics-controls"><form id="metrics-controls" class="toolbar">'
-        f'<label>History range<select id="metrics-range">{ranges}</select></label>'
-        f'<label>Resolution<select id="metrics-resolution">{resolutions}</select></label>'
+        '<section class="metrics-controls" aria-label="History filters">'
+        '<form id="metrics-controls" class="metrics-filter-form">'
+        f'<label class="metrics-filter-field" for="metrics-range">History range'
+        f'<select id="metrics-range">{ranges}</select></label>'
+        f'<label class="metrics-filter-field" for="metrics-resolution">Resolution'
+        f'<select id="metrics-resolution">{resolutions}</select></label>'
         f'<div id="metrics-custom" class="report-dates"{"" if custom else " hidden"}>'
-        f'<label>Start (local time)<input type="datetime-local" id="metrics-start" '
-        f'data-timestamp="{report["start_ts"]}"></label>'
-        f'<label>End (local time)<input type="datetime-local" id="metrics-end" '
-        f'data-timestamp="{report["end_ts"]}"></label></div>'
-        '<button type="submit" class="lease-button">Apply</button>'
-        '<span id="metrics-error" class="lease-action-error" role="alert"></span></form>'
-        f'<p id="metrics-effective" class="fine">{"Adjusted to " if report["resolution_adjusted"] else "Showing "}'
-        f"{esc(fmt_span(report['bucket_s']))} per column"
+        f'<label for="metrics-start">Start (local time)<input type="datetime-local" id="metrics-start" '
+        f'data-timestamp="{report["start_ts"]}" aria-describedby="metrics-error"></label>'
+        f'<label for="metrics-end">End (local time)<input type="datetime-local" id="metrics-end" '
+        f'data-timestamp="{report["end_ts"]}" aria-describedby="metrics-error"></label></div>'
+        '<button type="submit" class="lease-button primary filter-apply">Apply</button>'
+        '<span id="metrics-error" class="metrics-error" role="alert" aria-live="polite"></span></form>'
+        f'<p id="metrics-effective" class="metrics-effective">'
+        f'<span>{"Adjusted to " if report["resolution_adjusted"] else "Showing "}</span>'
+        f'<strong>{esc(fmt_interval(report["bucket_s"]))}</strong> per column'
         f"{' to keep the chart within 1,000 columns' if report['resolution_adjusted'] else ''}. "
-        f"{esc(report['start'])} to {esc(report['end'])} (UTC).</p>"
+        f'<span class="effective-range">from {effective_time("start")} '
+        f'<span aria-hidden="true">to</span> {effective_time("end")} '
+        '<abbr title="Coordinated Universal Time">UTC</abbr></span></p>'
         '<p class="fine">Telemetry is kept in RAM without age-based expiry; memory usage grows until restart. '
         f"Request and probe history resets on restart; collecting since {esc(report['telemetry_started_at'])}. "
         "Existing audit-restored job summaries are separate. Online status and running jobs are live.</p></section>"
@@ -825,13 +864,13 @@ def overview_page(service: Any, report: dict[str, Any], now: float) -> str:
     legend = (
         '<div class="legend"><span><i class="exec"></i>exec</span><span><i class="transfer"></i>upload / download</span>'
         '<span><i class="sync"></i>sync</span><span><i class="fail"></i>failed</span>'
-        f"<span>{esc(fmt_span(report['bucket_s']))} per column · local time</span></div>"
+        f"<span>{esc(fmt_interval(report['bucket_s']))} per column · local time</span></div>"
     )
     activity = section(
         "activity",
         "01",
         "Activity",
-        f"jobs started per {fmt_span(report['bucket_s'])}",
+        f"jobs started per {fmt_interval(report['bucket_s'])}",
         f'<div class="chart">{activity_chart(report)}</div>{legend}',
     )
     busiest = [row for row in rows if row["jobs"]][:8]

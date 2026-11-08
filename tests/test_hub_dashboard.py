@@ -2,13 +2,14 @@ import json
 import re
 import threading
 import time
+from datetime import datetime, timezone
 
 import pytest
 from hub_fakes import FakeListener, Hub, blocking_run, exec_result
 
 from privy.client import RelayHTTPError
 from privy.hub import dashboard
-from privy.hub.dashboard import fmt_bytes, fmt_ms, sparkline
+from privy.hub.dashboard import fmt_bytes, fmt_interval, fmt_ms, sparkline
 from privy.hub.jobs import utc_iso
 from privy.hub.metrics import HubMetrics, public_report
 from privy.hub.registry import ProbeResult
@@ -52,6 +53,57 @@ def html_of(response):
     assert response.status == 200, response.payload
     assert response.media_type().startswith("text/html")
     return response.text
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [
+        (0, "0 seconds"),
+        (1.25, "1.25 seconds"),
+        (60, "1 minute"),
+        (90.5, "1 minute 30.5 seconds"),
+        (900, "15 minutes"),
+        (900.25, "15 minutes 0.25 seconds"),
+        (86400, "1 day"),
+    ],
+)
+def test_interval_format_is_natural_and_keeps_fractional_seconds(seconds, expected):
+    assert fmt_interval(seconds) == expected
+
+
+def test_overview_filter_controls_keep_selection_and_expose_exact_utc_range():
+    start = datetime(2026, 11, 7, 16, 30, tzinfo=timezone.utc)
+    end = datetime(2026, 11, 8, 16, 30, tzinfo=timezone.utc)
+    report = {
+        "range": "24h",
+        "requested_resolution": "15m",
+        "start_ts": start.timestamp(),
+        "end_ts": end.timestamp(),
+        "start": "2026-11-07T16:30:00.000Z",
+        "end": "2026-11-08T16:30:00.000Z",
+        "resolution_adjusted": False,
+        "bucket_s": 900,
+        "telemetry_started_at": "2026-11-08T16:30:00.000Z",
+    }
+
+    text = dashboard.overview_controls(report)
+
+    assert 'id="metrics-controls" class="metrics-filter-form"' in text
+    assert 'for="metrics-range"' in text and 'for="metrics-resolution"' in text
+    assert 'value="24h" selected>24h</option>' in text
+    assert 'value="15m" selected>15m</option>' in text
+    assert 'class="report-dates" hidden' in text
+    assert 'id="metrics-start"' in text and 'id="metrics-end"' in text
+    assert 'class="lease-button primary filter-apply"' in text
+    assert 'role="alert" aria-live="polite"' in text
+    assert '<strong>15 minutes</strong> per column' in text
+    assert 'datetime="2026-11-07T16:30:00.000Z"' in text
+    assert 'datetime="2026-11-08T16:30:00.000Z"' in text
+    assert 'Nov 7, 2026 · 4:30 PM' in text and 'Nov 8, 2026 · 4:30 PM' in text
+    assert 'Exact UTC instant: 2026-11-07T16:30:00.000Z' in text
+
+    custom_text = dashboard.overview_controls({**report, "range": "custom"})
+    assert 'class="report-dates" hidden' not in custom_text
 
 
 # ---- negotiation and pages ---------------------------------------------------------

@@ -212,10 +212,37 @@ border:1px solid var(--line);border-radius:7px}
 .lease-dialog .primary{background:var(--accent);color:var(--paper);border-color:var(--accent)}
 .lease-action-error{color:var(--red);padding:12px}
 .lease-button[hidden],.report-dates[hidden]{display:none}
-.metrics-controls{margin-bottom:20px}.metrics-controls label,.lease-form label{display:flex;flex-direction:column;gap:6px}
-.metrics-controls .toolbar,.report-dates{display:flex;gap:12px;flex-wrap:wrap;align-items:end}
-.metrics-controls input,.lease-form input,.lease-form select{padding:8px;border:1px solid var(--line);
-border-radius:5px;background:var(--paper);color:var(--ink);font:12px var(--sans);min-width:0}
+.metrics-controls{margin:20px 0;min-width:0;max-width:100%}
+.metrics-filter-form{display:flex;width:100%;min-width:0;max-width:100%;gap:12px;flex-wrap:wrap;align-items:end;padding:14px 16px;
+background:var(--paper);border:1px solid var(--line);border-radius:8px}
+.metrics-filter-field,.metrics-controls .report-dates label,.lease-form label{display:flex;flex-direction:column;gap:6px}
+.metrics-filter-field,.metrics-controls .report-dates label{font-size:11px;font-weight:600;color:var(--muted)}
+.metrics-filter-field{min-width:156px}
+.metrics-controls select,.metrics-controls input,.lease-form input,.lease-form select{padding:8px 10px;
+border:1px solid var(--line);border-radius:5px;background:var(--paper);color:var(--ink);
+font:12px var(--sans);min-width:0;min-height:38px}
+.metrics-controls select,.metrics-controls input{width:100%}
+.report-dates{display:flex;gap:12px;flex-wrap:wrap;align-items:end}
+.metrics-controls .report-dates label{min-width:200px}
+.metrics-filter-form .filter-apply{margin:0;min-height:38px;padding:8px 18px;font-size:12px;font-weight:650;border-radius:6px}
+.metrics-filter-form .filter-apply:focus-visible,.metrics-controls select:focus-visible,.metrics-controls input:focus-visible{
+outline:2px solid var(--accent);outline-offset:2px}
+.metrics-error{color:var(--red);font-size:11px;padding:0;flex-basis:100%}
+.metrics-error:empty{display:none}
+.metrics-effective{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;margin:10px 2px 0;
+color:var(--muted);font-size:11px}
+.metrics-effective strong{color:var(--ink);font-weight:650}
+.effective-range{display:inline-flex;flex-wrap:wrap;align-items:baseline;gap:5px 8px;font-variant-numeric:tabular-nums}
+.effective-range time{white-space:nowrap}.effective-range abbr{color:var(--muted);font-size:10px;text-decoration:none}
+@media(max-width:560px){
+.metrics-controls{width:100%;max-width:calc(100vw - 32px)}
+.metrics-filter-form{display:grid;grid-template-columns:minmax(0,1fr);gap:10px;padding:12px}
+.metrics-filter-field{min-width:0}
+.metrics-controls .report-dates{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,1fr);gap:10px}
+.metrics-controls .report-dates label{min-width:0}
+.metrics-filter-form .filter-apply,.metrics-filter-form .metrics-error{grid-column:1/-1}
+.metrics-filter-form .filter-apply{width:100%}.effective-range time{white-space:normal}
+}
 .lease-form{display:grid;gap:14px}.lease-form select{width:100%}
 .duration-picker{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .duration-picker input{width:80px;text-align:center}.duration-picker output{font:600 16px var(--mono)}
