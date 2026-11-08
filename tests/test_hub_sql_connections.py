@@ -112,10 +112,8 @@ def test_cursor_reads_are_batched_read_only_but_consumption_stays_atomic():
     assert any(query.startswith("UPDATE") for query, _ in cursor.queries)
 
 
-def test_collect_skips_lease_lock_when_no_retention_candidates():
+def test_collect_checks_candidates_before_nonblocking_locks():
     class Cursor:
-        rowcount = 0
-
         def __init__(self):
             self.queries = []
 
@@ -123,54 +121,86 @@ def test_collect_skips_lease_lock_when_no_retention_candidates():
             self.queries.append((query, params))
 
         def fetchone(self):
-            return (0,)
+            return (0, 0, 0, 0)
 
     cursor = Cursor()
     transactions = []
 
     @contextmanager
-    def transaction(resource):
-        transactions.append(resource)
+    def transaction(*args, **kwargs):
+        transactions.append((args, kwargs))
         yield cursor
 
     backend = SimpleNamespace(transaction=transaction)
     assert SqlBackend.collect(backend) == {"output": 0, "jobs": 0, "history": 0, "leases": 0}
-    assert transactions == ["privy.gc"]
+    assert transactions == [((), {})]
     assert len(cursor.queries) == 1
-    query = cursor.queries[0][0]
+    query, params = cursor.queries[0]
+    assert params == (100,)
+    assert query.index("IF EXISTS") < query.index("@Resource='privy.gc'")
+    assert "@Resource='privy.gc'" in query and "@Resource='privy.leases'" in query
+    assert query.count("@LockTimeout=0") == 2
     assert "kind='job' AND at<@cutoff" in query
     assert "kind<>'job' AND at<@cutoff" in query
     assert "kind IN ('lease','hub')" in query and "DATEADD(day,-7,@now)" in query
 
 
-def test_collect_keeps_lease_lock_and_running_job_pin_guard_when_candidates_exist():
+def test_collect_batches_deletions_under_nonblocking_lease_pin_guard():
     class Cursor:
-        rowcount = 0
-
         def __init__(self):
             self.queries = []
-            self.results = [(1,), (0,)]
 
         def execute(self, query, *params):
             self.queries.append((query, params))
 
         def fetchone(self):
-            return self.results.pop(0)
+            return (7, 5, 12, 2)
 
     cursor = Cursor()
     transactions = []
 
     @contextmanager
-    def transaction(resource):
-        transactions.append(resource)
+    def transaction(*args, **kwargs):
+        transactions.append((args, kwargs))
         yield cursor
 
     backend = SimpleNamespace(transaction=transaction)
-    assert SqlBackend.collect(backend) == {"output": 0, "jobs": 0, "history": 0, "leases": 0}
-    assert transactions == ["privy.gc"]
-    queries = [query for query, _ in cursor.queries]
-    assert any("@Resource='privy.leases'" in query for query in queries)
-    assert any("OPENJSON(c.payload,'$.running_jobs')" in query for query in queries)
+    assert SqlBackend.collect(backend, batch=25) == {
+        "output": 7,
+        "jobs": 5,
+        "history": 12,
+        "leases": 2,
+    }
+    assert transactions == [((), {})]
+    assert len(cursor.queries) == 1
+    query, params = cursor.queries[0]
+    assert params == (25,)
+    assert "TOP (@batch)" in query
+    assert (
+        "JSON_VALUE(r.payload,'$.state') IN ('succeeded','failed','timed_out','cancelled','error')" in query
+    )
+    assert "OPENJSON(c.payload,'$.running_jobs')" in query
+    assert "c.kind='lease' AND pin.value=r.id" in query
+    assert "c.kind='use' AND pin.[key] COLLATE DATABASE_DEFAULT=r.id" in query
+    assert "DELETE FROM dbo.privy_cursors" in query
+    assert "DELETE FROM dbo.privy_cancels" in query
+
+
+@pytest.mark.parametrize("result", [None, (0, 0, 0)])
+def test_collect_requires_a_deletion_count_result(result):
+    class Cursor:
+        def execute(self, query, *params):
+            pass
+
+        def fetchone(self):
+            return result
+
+    @contextmanager
+    def transaction(*args, **kwargs):
+        yield Cursor()
+
+    with pytest.raises(StorageError, match="SQL GC batch returned invalid deletion counts"):
+        SqlBackend.collect(SimpleNamespace(transaction=transaction))
 
 
 def test_failed_lease_entry_and_rollback_does_not_strand_process_lock():

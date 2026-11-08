@@ -93,7 +93,9 @@ that unresolved work has been checked. Local PID discovery files, Relay secrets,
 interactive terminal sessions and hub-local transfer paths do not migrate through SQL. Metadata is
 shared; files and interactive resources still belong to the machine hosting them.
 
-SQL cleanup runs in indexed, bounded batches with seven-day retention. It protects active leases,
+SQL cleanup checks for retention candidates first, then tries its GC and lease locks without
+waiting. If either is busy, that pass skips cleanup and retries after the 30-second maintenance
+interval. It runs in indexed, bounded batches with seven-day retention and protects active leases,
 unfinished jobs, their output and control records, and unresolved pins. Job summaries and output are
 read lazily; startup does not load seven days of output. Both hubs must use SQL mode against the
 same database: a database-backed lease does **not** coordinate with an existing file-mode hub.

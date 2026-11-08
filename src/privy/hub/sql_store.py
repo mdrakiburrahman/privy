@@ -1566,67 +1566,68 @@ class SqlBackend:
                 existing.update(row[0] for row in cursor.fetchall())
         return existing
 
-    def collect(self, batch: int = 500) -> dict:
+    def collect(self, batch: int = 100) -> dict:
         if not 1 <= batch <= 1000:
             raise StorageError("GC batch must be between 1 and 1000")
+        query = (
+            "DECLARE @batch int=?; "
+            "DECLARE @now datetime2=SYSUTCDATETIME(); "
+            "DECLARE @cutoff float=DATEDIFF_BIG(second,'1970-01-01',@now)-604800; "
+            "DECLARE @output int=0, @jobs int=0, @history int=0, @leases int=0; "
+            "IF EXISTS(SELECT 1 FROM dbo.privy_records WHERE kind='job' AND at<@cutoff) "
+            "OR EXISTS(SELECT 1 FROM dbo.privy_records WHERE kind<>'job' AND at<@cutoff) "
+            "OR EXISTS(SELECT 1 FROM dbo.privy_coordination WHERE kind IN ('lease','hub') "
+            "AND updated<DATEADD(day,-7,@now)) BEGIN "
+            "DECLARE @gc_lock int; "
+            "EXEC @gc_lock=sys.sp_getapplock @Resource='privy.gc', @LockMode='Exclusive', "
+            "@LockOwner='Transaction', @LockTimeout=0; "
+            "IF @gc_lock>=0 AND ( "
+            "EXISTS(SELECT 1 FROM dbo.privy_records WHERE kind='job' AND at<@cutoff) "
+            "OR EXISTS(SELECT 1 FROM dbo.privy_records WHERE kind<>'job' AND at<@cutoff) "
+            "OR EXISTS(SELECT 1 FROM dbo.privy_coordination WHERE kind IN ('lease','hub') "
+            "AND updated<DATEADD(day,-7,@now))) BEGIN "
+            "DECLARE @lease_lock int; "
+            "EXEC @lease_lock=sys.sp_getapplock @Resource='privy.leases', @LockMode='Exclusive', "
+            "@LockOwner='Transaction', @LockTimeout=0; "
+            "IF @lease_lock>=0 BEGIN "
+            "CREATE TABLE #expired(id nvarchar(400) NOT NULL PRIMARY KEY); "
+            "INSERT #expired SELECT TOP (@batch) r.id FROM dbo.privy_records r WHERE r.kind='job' "
+            "AND r.at<@cutoff "
+            "AND JSON_VALUE(r.payload,'$.state') IN ('succeeded','failed','timed_out','cancelled','error') "
+            "AND NOT EXISTS(SELECT 1 FROM dbo.privy_coordination c "
+            "CROSS APPLY OPENJSON(c.payload,'$.running_jobs') pin "
+            "WHERE (c.kind='lease' AND pin.value=r.id) "
+            "OR (c.kind='use' AND pin.[key] COLLATE DATABASE_DEFAULT=r.id)) ORDER BY r.at; "
+            "DELETE TOP (@batch) FROM dbo.privy_output WHERE job_id IN(SELECT id FROM #expired); "
+            "SET @output=@@ROWCOUNT; "
+            "DELETE e FROM #expired e WHERE EXISTS("
+            "SELECT 1 FROM dbo.privy_output o WHERE o.job_id=e.id); "
+            "DELETE FROM dbo.privy_cursors WHERE job_id IN(SELECT id FROM #expired); "
+            "DELETE FROM dbo.privy_cancels WHERE job_id IN(SELECT id FROM #expired); "
+            "DELETE FROM dbo.privy_records WHERE kind='job' AND id IN(SELECT id FROM #expired); "
+            "SET @jobs=@@ROWCOUNT; "
+            "DELETE TOP (@batch) r FROM dbo.privy_records r WHERE r.kind<>'job' AND r.at<@cutoff "
+            "AND NOT EXISTS(SELECT 1 FROM dbo.privy_records j WHERE j.kind='job' "
+            "AND j.id=JSON_VALUE(r.payload,'$.job_id')) "
+            "AND NOT EXISTS(SELECT 1 FROM OPENJSON(r.payload,'$.job_ids') child "
+            "JOIN dbo.privy_records j ON j.kind='job' AND j.id=child.value); "
+            "SET @history=@@ROWCOUNT; "
+            "DELETE TOP (@batch) FROM dbo.privy_coordination WHERE kind='lease' "
+            "AND updated<DATEADD(day,-7,@now) AND JSON_VALUE(payload,'$.state')<>'active' "
+            "AND JSON_QUERY(payload,'$.running_jobs')='[]'; "
+            "SET @leases=@@ROWCOUNT; "
+            "DELETE TOP (@batch) FROM dbo.privy_coordination WHERE kind='hub' "
+            "AND updated<DATEADD(day,-7,@now); "
+            "END END END; "
+            "SELECT @output,@jobs,@history,@leases;"
+        )
         counts = {"output": 0, "jobs": 0, "history": 0, "leases": 0}
-        with self.transaction("privy.gc") as cursor:
-            cursor.execute(
-                "DECLARE @now datetime2=SYSUTCDATETIME(); "
-                "DECLARE @cutoff float=DATEDIFF_BIG(second,'1970-01-01',@now)-604800; "
-                "SELECT CASE WHEN EXISTS(SELECT 1 FROM dbo.privy_records WHERE kind='job' AND at<@cutoff) "
-                "OR EXISTS(SELECT 1 FROM dbo.privy_records WHERE kind<>'job' AND at<@cutoff) "
-                "OR EXISTS(SELECT 1 FROM dbo.privy_coordination WHERE kind IN ('lease','hub') "
-                "AND updated<DATEADD(day,-7,@now)) THEN 1 ELSE 0 END"
-            )
-            if not cursor.fetchone()[0]:
-                return counts
-            cursor.execute(
-                "DECLARE @r int; EXEC @r=sys.sp_getapplock @Resource='privy.leases', @LockMode='Exclusive', "
-                "@LockOwner='Transaction', @LockTimeout=15000; SELECT @r;"
-            )
-            if cursor.fetchone()[0] < 0:
-                raise StorageError("SQL lease cleanup coordination lock timed out")
-            # Never collect a running/queued job, its output, or its control records.
-            cursor.execute("DROP TABLE IF EXISTS #expired; CREATE TABLE #expired(id nvarchar(400) NOT NULL)")
-            cursor.execute(
-                "INSERT #expired SELECT TOP (?) r.id FROM dbo.privy_records r WHERE r.kind='job' "
-                "AND r.at < DATEDIFF_BIG(second,'1970-01-01',SYSUTCDATETIME())-604800 "
-                "AND JSON_VALUE(r.payload,'$.state') IN ('succeeded','failed','timed_out','cancelled','error') "
-                "AND NOT EXISTS(SELECT 1 FROM dbo.privy_coordination c CROSS APPLY OPENJSON(c.payload,'$.running_jobs') pin "
-                "WHERE (c.kind='lease' AND pin.value=r.id) OR (c.kind='use' AND pin.[key] COLLATE DATABASE_DEFAULT=r.id)) ORDER BY r.at",
-                batch,
-            )
-            cursor.execute(
-                "DELETE TOP (?) FROM dbo.privy_output WHERE job_id IN(SELECT id FROM #expired)", batch
-            )
-            counts["output"] = cursor.rowcount
-            cursor.execute("DELETE FROM #expired WHERE id IN(SELECT job_id FROM dbo.privy_output)")
-            cursor.execute("DELETE FROM dbo.privy_cursors WHERE job_id IN(SELECT id FROM #expired)")
-            cursor.execute("DELETE FROM dbo.privy_cancels WHERE job_id IN(SELECT id FROM #expired)")
-            cursor.execute(
-                "DELETE FROM dbo.privy_records WHERE kind='job' AND id IN(SELECT id FROM #expired)"
-            )
-            counts["jobs"] = cursor.rowcount
-            cursor.execute(
-                "DELETE TOP (?) r FROM dbo.privy_records r WHERE r.kind<>'job' "
-                "AND r.at<DATEDIFF_BIG(second,'1970-01-01',SYSUTCDATETIME())-604800 "
-                "AND NOT EXISTS(SELECT 1 FROM dbo.privy_records j WHERE j.kind='job' AND j.id=JSON_VALUE(r.payload,'$.job_id')) "
-                "AND NOT EXISTS(SELECT 1 FROM OPENJSON(r.payload,'$.job_ids') child JOIN dbo.privy_records j ON j.kind='job' AND j.id=child.value)",
-                batch,
-            )
-            counts["history"] = cursor.rowcount
-            cursor.execute(
-                "DELETE TOP (?) FROM dbo.privy_coordination WHERE kind='lease' AND updated<DATEADD(day,-7,SYSUTCDATETIME()) "
-                "AND JSON_VALUE(payload,'$.state')<>'active' AND JSON_QUERY(payload,'$.running_jobs')='[]'",
-                batch,
-            )
-            counts["leases"] = cursor.rowcount
-            cursor.execute(
-                "DELETE TOP (?) FROM dbo.privy_coordination WHERE kind='hub' AND updated<DATEADD(day,-7,SYSUTCDATETIME())",
-                batch,
-            )
-            cursor.execute("DROP TABLE #expired")
+        with self.transaction() as cursor:
+            cursor.execute(query, batch)
+            row = cursor.fetchone()
+            if row is None or len(row) != 4:
+                raise StorageError("SQL GC batch returned invalid deletion counts")
+            counts = dict(zip(counts, (int(value) for value in row)))
         return counts
 
     def flush(self, timeout: float = 10) -> bool:
