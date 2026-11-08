@@ -943,33 +943,8 @@ class SqlBackend:
             latest_before_params = [after] if after is not None else []
             if after is None:
                 latest_before_sql = "SELECT payload FROM dbo.privy_records WHERE 1=0"
-            job_rows, purpose_rows, latest_before_rows = execute_batch(
-                [
-                    f"SELECT payload FROM dbo.privy_records WHERE {job_where}",
-                    f"SELECT payload FROM dbo.privy_records WHERE {purpose_where}",
-                    latest_before_sql,
-                ],
-                [*job_params, *purpose_params, *latest_before_params],
-            )
-            for name, kind, rows in (
-                ("jobs", "job", job_rows),
-                ("purposes", "purpose", purpose_rows),
-            ):
-                decode_started = time.perf_counter()
-                decoded[name] = [json.loads(row[0]) for row in rows]
-                if _profile_sql_enabled():
-                    log.info(
-                        "sql_profile record_decode thread=%s kind=%s rows=%d duration_ms=%.1f",
-                        threading.get_ident(),
-                        kind,
-                        len(rows),
-                        (time.perf_counter() - decode_started) * 1000,
-                    )
-            decoded["latest_before"] = [json.loads(row[0]) for row in latest_before_rows]
-
             where, params = query("probe")
-            cursor.execute(
-                f"""
+            probe_sql = f"""
                 WITH summary AS (
                     SELECT target,COUNT_BIG(*) AS sample_count,
                         SUM(CONVERT(bigint,CASE WHEN probe_status='online' THEN 1 ELSE 0 END)) AS online_count,
@@ -988,11 +963,7 @@ class SqlBackend:
                     WHERE {where} AND p.target=summary.target
                     ORDER BY p.at DESC,p.id DESC
                 ) latest
-                """,
-                *params,
-                *params,
-            )
-            probe_rows = cursor.fetchall()
+                """
             status_where, status_params = query("probe")
             status_sql = f"""
                 WITH ordered AS (
@@ -1077,14 +1048,33 @@ class SqlBackend:
                 "FROM dbo.privy_records WHERE kind='job' GROUP BY JSON_VALUE(payload,'$.state')"
             )
             (
+                job_rows,
+                purpose_rows,
+                latest_before_rows,
+                probe_rows,
                 status_result,
                 target_p50_result,
                 overall_result,
                 call_rows,
                 job_count_rows,
             ) = execute_batch(
-                [status_sql, target_p50_sql, overall_sql, calls_sql, job_counts_sql],
                 [
+                    f"SELECT payload FROM dbo.privy_records WHERE {job_where}",
+                    f"SELECT payload FROM dbo.privy_records WHERE {purpose_where}",
+                    latest_before_sql,
+                    probe_sql,
+                    status_sql,
+                    target_p50_sql,
+                    overall_sql,
+                    calls_sql,
+                    job_counts_sql,
+                ],
+                [
+                    *job_params,
+                    *purpose_params,
+                    *latest_before_params,
+                    *params,
+                    *params,
                     *status_params,
                     *target_params,
                     *target_params,
@@ -1094,6 +1084,21 @@ class SqlBackend:
                     *call_params,
                 ],
             )
+            for name, kind, rows in (
+                ("jobs", "job", job_rows),
+                ("purposes", "purpose", purpose_rows),
+            ):
+                decode_started = time.perf_counter()
+                decoded[name] = [json.loads(row[0]) for row in rows]
+                if _profile_sql_enabled():
+                    log.info(
+                        "sql_profile record_decode thread=%s kind=%s rows=%d duration_ms=%.1f",
+                        threading.get_ident(),
+                        kind,
+                        len(rows),
+                        (time.perf_counter() - decode_started) * 1000,
+                    )
+            decoded["latest_before"] = [json.loads(row[0]) for row in latest_before_rows]
             status_rows = {str(target): (float(since), bool(first)) for target, since, first in status_result}
             latency_by_target = {
                 str(target): float(p50) if p50 is not None else None for target, p50 in target_p50_result
