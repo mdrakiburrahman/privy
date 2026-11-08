@@ -125,7 +125,7 @@ class LeaseStore:
 
             import_path = self.state_path
             self.state_path = None
-            sql_backend.check_config("leases", self.config)
+            sql_backend.check_config("leases", self.effective_config)
             sql_backend.check_config(
                 "targets",
                 {
@@ -277,6 +277,18 @@ class LeaseStore:
             raise ValueError("ttl must not exceed max_ttl and max_ttl must not exceed 4h")
         if self.manual_max_ttl < self.default_ttl:
             raise ValueError("manual_max_ttl must not be less than the default ttl")
+        self.effective_config = {
+            "version": 1,
+            "defaults": {
+                "ttl_s": self.default_ttl,
+                "max_ttl_s": self.max_ttl,
+                "manual_max_ttl_s": self.manual_max_ttl,
+                "cooldown_s": self.cooldown,
+                "max_leases_per_client": self.client_limit,
+                "client_idle_expiry_s": self.client_idle_expiry,
+            },
+            "groups": copy.deepcopy(config["groups"]),
+        }
         if not isinstance(config.get("groups"), list):
             raise ValueError("groups must be a list")
         names: set[str] = set()
@@ -803,11 +815,36 @@ class LeaseStore:
                     "only the holder may release this lease", status=403, code="not_lease_holder"
                 )
             if self.sql_backend is not None and lease["running_jobs"]:
-                raise LeaseError(
-                    "running or unresolved pinned jobs must finish before SQL lease release",
-                    status=409,
-                    code="lease_pinned",
-                    details={"running_jobs": lease["running_jobs"]},
+                if not force:
+                    raise LeaseError(
+                        "running or unresolved pinned jobs must finish before SQL lease release",
+                        status=409,
+                        code="lease_pinned",
+                        details={"running_jobs": lease["running_jobs"]},
+                    )
+                owners = lease.get("job_owners", {})
+                live = [
+                    job
+                    for job in lease["running_jobs"]
+                    if not self.sql_backend.owner_is_stale(
+                        owners.get(job, "unresolved-file-import")
+                    )
+                ]
+                if live:
+                    raise LeaseError(
+                        "cannot reconcile pins owned by an active or unknown hub; confirm remote jobs have stopped",
+                        status=409,
+                        code="lease_pinned",
+                        details={"running_jobs": live},
+                    )
+                reconciled = list(lease["running_jobs"])
+                lease["running_jobs"] = []
+                lease["job_owners"] = {}
+                self._event(
+                    lease,
+                    "pins_reconciled",
+                    job_ids=reconciled,
+                    warning="Remote work may still be running; verify before force release",
                 )
             if lease["state"] != "released":
                 lease["state"], lease["released_ts"] = "released", self._clock()

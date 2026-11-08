@@ -117,6 +117,42 @@ def test_defaults_persistence_and_client_session_idempotency(leasing, tmp_path):
     assert '"event": "lease.acquired"' in hub.audit_path.read_text()
 
 
+def test_effective_sql_config_applies_omitted_manual_ttl_default(leasing, tmp_path):
+    hub, first, _ = leasing
+    second_home = tmp_path / "second"
+    second_home.mkdir()
+    (second_home / "leases.yaml").write_text(
+        DEFAULT_CONFIG.replace("  manual_max_ttl: 365d\n", ""), encoding="utf-8"
+    )
+    second = LeaseStore(hub.registry, home=second_home)
+    assert first.effective_config == second.effective_config
+
+
+def test_sql_force_release_reconciles_only_stopped_or_unresolved_pins(leasing):
+    _, store, _ = leasing
+    owner = client(store)
+    lease = acquire(store, owner)
+    record = store._leases[lease["lease_id"]]
+    record["running_jobs"] = ["stopped-job", "live-job"]
+    record["job_owners"] = {"stopped-job": "stopped-owner", "live-job": "live-owner"}
+    store.sql_backend = SimpleNamespace(
+        owner_is_stale=lambda value: value in {"stopped-owner", "unresolved-file-import"}
+    )
+    with pytest.raises(LeaseError) as error:
+        store.release(lease["lease_id"], force=True)
+    assert error.value.code == "lease_pinned"
+    assert record["running_jobs"] == ["stopped-job", "live-job"]
+
+    record["running_jobs"] = ["stopped-job", "file-job"]
+    record["job_owners"] = {"stopped-job": "stopped-owner", "file-job": "unresolved-file-import"}
+    store.release(lease["lease_id"], force=True)
+    assert record["running_jobs"] == []
+    assert record["job_owners"] == {}
+    assert record["state"] == "released"
+    assert record["events"][-2]["event"] == "pins_reconciled"
+    assert "may still be running" in record["events"][-2]["warning"]
+
+
 def test_first_leasing_start_restores_cooldown_from_existing_hub_audit(tmp_path):
     hub = Hub(tmp_path)
     result = hub.call(

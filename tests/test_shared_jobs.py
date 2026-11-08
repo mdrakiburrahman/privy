@@ -1104,6 +1104,9 @@ class ProcessBackend(Backend):
     def check_config(self, name, payload):
         self.coordination["config", name] = json.dumps(payload)
 
+    def set_migration_status(self, status):
+        self.migration_status = dict(status)
+
     @contextlib.contextmanager
     def transaction(self, lock=None):
         with self.lock:
@@ -1172,7 +1175,7 @@ def test_sql_process_harness_starts_and_serves_with_fake_backend(missing_depende
     home.mkdir()
     settings = home / "appsettings.yaml"
     settings.write_text(
-        "version: 1\nstorage: {mode: azure_sql, server: simulated.invalid, database: privy_test}\n",
+        "version: 1\nstorage: {mode: azure_sql, server: simulated.invalid, database: fake_harness_db}\n",
         encoding="utf-8",
     )
     unavailable = (

@@ -358,6 +358,8 @@ class HubRuntime:
         return f"http://{host}:{port}"
 
     def serve_forever(self) -> None:
+        if self.storage is not None:
+            self.service.jobs.start_audit_import(self.home / AUDIT_FILENAME)
         self.server.serve_forever(poll_interval=0.5)
 
     def shutdown(self) -> None:
@@ -367,6 +369,10 @@ class HubRuntime:
         self.service.listener_infos.flush()
         if self.storage is not None:
             self.service.jobs.close()
+            if self.service.jobs.audit_import_running:
+                from privy.hub.sql_store import StorageError
+
+                raise StorageError("audit import is still running; SQL storage remains open")
             self.storage.close()
 
 
@@ -408,7 +414,6 @@ def build_hub(
             )
             leases = LeaseStore(registry, home=home, audit=jobs.audit, sql_backend=storage)
             listener_infos = ListenerInfoStore(home, backend=storage)
-            jobs.import_audit(home / AUDIT_FILENAME)
         except BaseException:
             storage.close()
             raise

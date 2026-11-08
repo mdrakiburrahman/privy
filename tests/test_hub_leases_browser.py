@@ -272,7 +272,9 @@ def test_force_release_requires_confirmation_and_keeps_running_terminal(lease_br
     dashboard_page.get_by_role("button", name="Cancel", exact=True).click()
     assert hub.service.leases.get_lease(lease["lease_id"])["state"] == "active"
     dashboard_page.locator("[data-force-release]").click()
-    browser_api.expect(dashboard_page.locator(".lease-dialog")).to_contain_text("Running jobs keep running")
+    browser_api.expect(dashboard_page.locator(".lease-dialog")).to_contain_text(
+        "remote work may still be running"
+    )
     with dashboard_page.expect_response(lambda response: response.url.endswith("/force-release")) as released:
         dashboard_page.locator(".lease-dialog").get_by_role(
             "button", name="Force release", exact=True

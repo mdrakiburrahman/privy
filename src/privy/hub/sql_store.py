@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import sqlite3
 import struct
 import threading
@@ -25,6 +26,56 @@ log = logging.getLogger("privy.hub")
 
 class StorageError(RuntimeError):
     """An authoritative operation or durable delivery could not complete."""
+
+
+class _HomeLock:
+    """Prevent two processes from using the same home identity and local outbox."""
+
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._stream = path.open("a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self._stream.seek(0, os.SEEK_END)
+                if self._stream.tell() == 0:
+                    self._stream.write(b"\0")
+                    self._stream.flush()
+                self._stream.seek(0)
+                msvcrt.locking(self._stream.fileno(), msvcrt.LK_NBLCK, 1)
+                self._unlock = lambda: msvcrt.locking(self._stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._unlock = lambda: fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
+        except (OSError, BlockingIOError) as exc:
+            self._stream.close()
+            raise StorageError("another Azure SQL hub process is already using this home") from exc
+
+    def close(self) -> None:
+        if self._stream.closed:
+            return
+        try:
+            self._unlock()
+        finally:
+            self._stream.close()
+
+
+def _home_identity(home: Path) -> str:
+    path = home / ".sql-hub-id"
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        value = path.read_text(encoding="ascii").strip()
+    else:
+        value = uuid.uuid4().hex
+        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+            stream.write(value + "\n")
+    if len(value) != 32 or any(char not in "0123456789abcdef" for char in value):
+        raise StorageError(f"invalid Azure SQL hub identity file: {path}")
+    return value
 
 
 class DurableOutbox:
@@ -298,19 +349,39 @@ FROM @latest n WHERE n.kind='output' AND NOT EXISTS(
 class SqlBackend:
     def __init__(self, settings: SqlSettings, home: Path, *, connect=None, start_worker: bool = True) -> None:
         self.settings = settings
-        self.owner = uuid.uuid4().hex
-        self._connect = connect or AzureSqlConnections(settings)
+        self._home_lock = _HomeLock(home / "sql-home.lock")
+        try:
+            self.hub_id = _home_identity(home)
+            self.owner = uuid.uuid4().hex
+            self._fenced = False
+            self._closed = False
+            self._migration_status: dict[str, Any] | None = None
+            self._connect = connect or AzureSqlConnections(settings)
+        except BaseException:
+            self._home_lock.close()
+            raise
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._flush_lock = threading.Lock()
         self._last_error: str | None = None
         self._thread: threading.Thread | None = None
-        self.bootstrap()
-        self.outbox = DurableOutbox(home / "sql-outbox.sqlite3", max_bytes=settings.outbox_max_bytes)
+        self.outbox = None
+        try:
+            self.bootstrap()
+            self.outbox = DurableOutbox(home / "sql-outbox.sqlite3", max_bytes=settings.outbox_max_bytes)
+            self._register_incarnation()
+        except BaseException:
+            if self.outbox is not None:
+                self.outbox.close()
+            if hasattr(self._connect, "close"):
+                self._connect.close()
+            self._home_lock.close()
+            raise
         log.info(
-            "Storage: azure_sql (%s/%s); owner incarnation %s; no file fallback",
+            "Storage: azure_sql (%s/%s); hub %s; owner incarnation %s; no file fallback",
             settings.server,
             settings.database,
+            self.hub_id,
             self.owner,
         )
         if start_worker:
@@ -365,6 +436,50 @@ class SqlBackend:
                     json.dumps(config),
                 )
 
+    def _register_incarnation(self) -> None:
+        with self.transaction("privy.leases") as cursor:
+            cursor.execute(
+                "SELECT id, payload, CASE WHEN updated < DATEADD(second,-90,SYSUTCDATETIME()) "
+                "THEN 1 ELSE 0 END FROM dbo.privy_coordination "
+                "WHERE kind='hub' AND id<>? AND JSON_VALUE(payload,'$.hub_id')=?",
+                self.owner,
+                self.hub_id,
+            )
+            previous = cursor.fetchall()
+            for owner, payload, stale in previous:
+                heartbeat = json.loads(payload)
+                if heartbeat.get("active", True) and not stale:
+                    raise StorageError(
+                        "another active Azure SQL process is using this hub home identity"
+                    )
+                cursor.execute(
+                    "UPDATE dbo.privy_coordination SET payload=?,updated=SYSUTCDATETIME() "
+                    "WHERE kind='hub' AND id=?",
+                    json.dumps({**heartbeat, "active": False}),
+                    owner,
+                )
+            cursor.execute(
+                "INSERT dbo.privy_coordination(kind,id,payload) VALUES('hub',?,?)",
+                self.owner,
+                json.dumps({"owner": self.owner, "hub_id": self.hub_id, "active": True}),
+            )
+
+    def assert_owner_active(self, cursor) -> None:
+        if self._fenced or self._closed:
+            raise StorageError("this Azure SQL hub incarnation is no longer active")
+        cursor.execute(
+            "SELECT 1 FROM dbo.privy_coordination WHERE kind='hub' AND id=? "
+            "AND JSON_VALUE(payload,'$.active')='true'",
+            self.owner,
+        )
+        if cursor.fetchone() is None:
+            self._fenced = True
+            self._stop.set()
+            raise StorageError("this Azure SQL hub incarnation was fenced; restart the hub")
+
+    def set_migration_status(self, status: dict[str, Any]) -> None:
+        self._migration_status = dict(status)
+
     def check_config(self, name: str, payload: dict) -> None:
         with self.transaction("privy.leases") as cursor:
             cursor.execute("SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id=?", name)
@@ -402,7 +517,7 @@ class SqlBackend:
 
     def _drain(self) -> None:
         with self._flush_lock:
-            rows = self.outbox.pending(100)
+            rows = self.outbox.pending(500)
             if not rows:
                 return
             batch = []
@@ -424,7 +539,8 @@ class SqlBackend:
                         "client_id": payload.get("client_id"),
                     }
                 )
-            with self.transaction() as cursor:
+            with self.transaction("privy.leases") as cursor:
+                self.assert_owner_active(cursor)
                 cursor.execute(_FLUSH_BATCH, json.dumps(batch, ensure_ascii=True))
             self.outbox.ack_batch([row[0] for row in rows])
             self._last_error = None
@@ -606,15 +722,65 @@ class SqlBackend:
             )
 
     def heartbeat(self) -> None:
+        with self.transaction("privy.leases") as cursor:
+            cursor.execute(
+                "UPDATE dbo.privy_coordination SET payload=?,updated=SYSUTCDATETIME() "
+                "WHERE kind='hub' AND id=? AND JSON_VALUE(payload,'$.active')='true'",
+                json.dumps({"owner": self.owner, "hub_id": self.hub_id, "active": True}),
+                self.owner,
+            )
+            cursor.execute(
+                "SELECT 1 FROM dbo.privy_coordination WHERE kind='hub' AND id=? "
+                "AND JSON_VALUE(payload,'$.active')='true'",
+                self.owner,
+            )
+            if cursor.fetchone() is None:
+                self._fenced = True
+                self._stop.set()
+                raise StorageError("this Azure SQL hub incarnation was fenced; restart the hub")
+
+    def mark_stopped(self) -> None:
+        if self._closed or self._fenced:
+            return
+        try:
+            with self.transaction("privy.leases") as cursor:
+                cursor.execute(
+                    "UPDATE dbo.privy_coordination SET payload=?,updated=SYSUTCDATETIME() "
+                    "WHERE kind='hub' AND id=? AND JSON_VALUE(payload,'$.active')='true'",
+                    json.dumps({"owner": self.owner, "hub_id": self.hub_id, "active": False}),
+                    self.owner,
+                )
+        except Exception:
+            log.warning("Could not mark Azure SQL hub incarnation stopped; heartbeat will expire")
+
+    def owner_is_stale(self, owner: str) -> bool:
+        if owner == "unresolved-file-import":
+            return True
+        if not owner or len(owner) > 64:
+            return False
         with self.transaction() as cursor:
             cursor.execute(
-                "UPDATE dbo.privy_coordination SET payload=?,updated=SYSUTCDATETIME() WHERE kind='hub' AND id=?; "
-                "IF @@ROWCOUNT=0 INSERT dbo.privy_coordination(kind,id,payload) VALUES('hub',?,?)",
-                json.dumps({"owner": self.owner}),
-                self.owner,
-                self.owner,
-                json.dumps({"owner": self.owner}),
+                "SELECT CASE WHEN JSON_VALUE(payload,'$.active')='false' OR "
+                "updated < DATEADD(second,-90,SYSUTCDATETIME()) THEN 1 ELSE 0 END "
+                "FROM dbo.privy_coordination WHERE kind='hub' AND id=?",
+                owner,
             )
+            row = cursor.fetchone()
+            return bool(row and row[0])
+
+    def existing(self, kind: str, keys: list[str], *, batch_size: int = 1000) -> set[str]:
+        existing = set()
+        for start in range(0, len(keys), batch_size):
+            batch = keys[start : start + batch_size]
+            with self.transaction() as cursor:
+                cursor.execute(
+                    "SELECT id FROM dbo.privy_records WHERE kind=? AND id IN "
+                    "(SELECT value FROM OPENJSON(?))",
+                    kind,
+                    json.dumps(batch),
+                )
+                existing.update(row[0] for row in cursor.fetchall())
+        return existing
 
     def collect(self, batch: int = 500) -> dict:
         if not 1 <= batch <= 1000:
@@ -683,7 +849,16 @@ class SqlBackend:
         return True
 
     def status(self) -> dict:
-        return {"mode": "azure_sql", "owner": self.owner, "error": self._last_error, **self.outbox.status()}
+        result = {
+            "mode": "azure_sql",
+            "hub_id": self.hub_id,
+            "owner": self.owner,
+            "error": self._last_error,
+            **self.outbox.status(),
+        }
+        if self._migration_status is not None:
+            result["audit_import"] = dict(self._migration_status)
+        return result
 
     def _work(self) -> None:
         maintenance = 0.0
@@ -712,9 +887,12 @@ class SqlBackend:
                 raise StorageError("SQL delivery thread did not stop; journal remains open")
         if not self.flush():
             log.error("SQL journal has pending writes on shutdown; next start will replay them")
+        self.mark_stopped()
+        self._closed = True
         self.outbox.close()
         if hasattr(self._connect, "close"):
             self._connect.close()
+        self._home_lock.close()
 
 
 class SqlLeaseLock:
@@ -737,6 +915,9 @@ class SqlLeaseLock:
             cursor = transaction.__enter__()
             self._local.transaction = transaction
             self._local.cursor = cursor
+            assert_active = getattr(self.backend, "assert_owner_active", None)
+            if assert_active is not None:
+                assert_active(cursor)
             cursor.execute("SELECT DATEDIFF_BIG(millisecond,'1970-01-01',SYSUTCDATETIME())/1000.0")
             self._local.now = float(cursor.fetchone()[0])
             cursor.execute("SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id='targets'")
