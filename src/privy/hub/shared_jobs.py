@@ -505,9 +505,7 @@ class SharedJobManager(JobManager):
 
         def run() -> None:
             try:
-                imported = self.import_audit(
-                    path, timeout=300, cancel_event=self._audit_import_stop
-                )
+                imported = self.import_audit(path, timeout=300, cancel_event=self._audit_import_stop)
                 self._set_migration_status(
                     {"state": "complete", "imported_jobs": imported, "source": "audit.jsonl"}
                 )
@@ -516,14 +514,10 @@ class SharedJobManager(JobManager):
                 if self._audit_import_stop.is_set():
                     self._set_migration_status({"state": "stopped", "source": "audit.jsonl"})
                     return
-                self._set_migration_status(
-                    {"state": "failed", "error": str(exc), "source": "audit.jsonl"}
-                )
+                self._set_migration_status({"state": "failed", "error": str(exc), "source": "audit.jsonl"})
                 log.exception("Azure SQL audit import failed; it can be retried on restart")
 
-        self._audit_import_thread = threading.Thread(
-            target=run, name="privy-sql-audit-import", daemon=True
-        )
+        self._audit_import_thread = threading.Thread(target=run, name="privy-sql-audit-import", daemon=True)
         self._audit_import_thread.start()
 
     def import_audit(
