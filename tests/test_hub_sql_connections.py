@@ -104,6 +104,7 @@ def test_lease_lock_loads_snapshot_with_one_batched_read():
     class Cursor:
         def __init__(self):
             self.result_sets = [
+                [(1,)],
                 [(1_800_000_000.25,)],
                 [(json.dumps(target_config),)],
                 [
@@ -142,7 +143,12 @@ def test_lease_lock_loads_snapshot_with_one_batched_read():
         _leases={},
         _uses={},
     )
-    backend = SimpleNamespace(transaction=transaction, assert_owner_active=lambda _cursor: None)
+    backend = SimpleNamespace(
+        transaction=transaction,
+        assert_owner_active=lambda _cursor: None,
+        _assert_owner_current=lambda: None,
+        owner="hub-1",
+    )
     lock = SqlLeaseLock(store, backend)
 
     with lock:
@@ -150,11 +156,49 @@ def test_lease_lock_loads_snapshot_with_one_batched_read():
 
     assert len(cursor.queries) == 1
     query, params = cursor.queries[0]
-    assert params == ()
-    assert query.count(";") == 2
+    assert params == ("hub-1",)
+    assert "kind='hub'" in query
+    assert query.count(";") == 3
     assert store._clients == {"client-1": client}
     assert store._leases == {"lease-1": lease}
     assert store._uses == {"dev/box": use}
+
+
+def test_lease_lock_rejects_snapshot_for_fenced_owner():
+    class Cursor:
+        def __init__(self):
+            self.queries = []
+
+        def execute(self, query, *params):
+            self.queries.append((query, params))
+
+        def fetchone(self):
+            return (0,)
+
+    cursor = Cursor()
+
+    @contextmanager
+    def transaction(_resource):
+        yield cursor
+
+    def assert_active(_cursor):
+        raise StorageError("this Azure SQL hub incarnation was fenced; restart the hub")
+
+    backend = SimpleNamespace(
+        transaction=transaction,
+        assert_owner_active=assert_active,
+        _assert_owner_current=lambda: None,
+        owner="fenced-hub",
+    )
+    store = SimpleNamespace(_clients={}, _leases={}, _uses={})
+    lock = SqlLeaseLock(store, backend)
+
+    with pytest.raises(StorageError, match="was fenced"):
+        with lock:
+            pass
+
+    assert len(cursor.queries) == 1
+    assert cursor.queries[0][1] == ("fenced-hub",)
 
 
 def test_transaction_closes_cursor_before_returning_connection():

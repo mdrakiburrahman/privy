@@ -625,8 +625,7 @@ class SqlBackend:
             )
 
     def assert_owner_active(self, cursor) -> None:
-        if self._fenced or self._closed:
-            raise StorageError("this Azure SQL hub incarnation is no longer active")
+        self._assert_owner_current()
         cursor.execute(
             "SELECT 1 FROM dbo.privy_coordination WHERE kind='hub' AND id=? "
             "AND JSON_VALUE(payload,'$.active')='true'",
@@ -636,6 +635,10 @@ class SqlBackend:
             self._fenced = True
             self._stop.set()
             raise StorageError("this Azure SQL hub incarnation was fenced; restart the hub")
+
+    def _assert_owner_current(self) -> None:
+        if self._fenced or self._closed:
+            raise StorageError("this Azure SQL hub incarnation is no longer active")
 
     def set_migration_status(self, status: dict[str, Any]) -> None:
         self._migration_status = dict(status)
@@ -1514,15 +1517,37 @@ class SqlLeaseLock:
             self._local.transaction = transaction
             self._local.cursor = cursor
             assert_active = getattr(self.backend, "assert_owner_active", None)
-            if assert_active is not None:
+            assert_current = getattr(self.backend, "_assert_owner_current", None)
+            owner = getattr(self.backend, "owner", None)
+            if assert_current is not None:
+                assert_current()
+            elif assert_active is not None:
                 assert_active(cursor)
             cursor.execute(
-                "SELECT DATEDIFF_BIG(millisecond,'1970-01-01',SYSUTCDATETIME())/1000.0;"
+                (
+                    "SELECT CASE WHEN EXISTS(SELECT 1 FROM dbo.privy_coordination "
+                    "WHERE kind='hub' AND id=? AND JSON_VALUE(payload,'$.active')='true') "
+                    "THEN 1 ELSE 0 END;"
+                    if owner is not None
+                    else ""
+                )
+                + "SELECT DATEDIFF_BIG(millisecond,'1970-01-01',SYSUTCDATETIME())/1000.0;"
                 "SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id='targets';"
                 "SELECT kind,id,payload FROM dbo.privy_coordination "
-                "WHERE kind IN('client','lease','use') ORDER BY ordinal"
+                "WHERE kind IN('client','lease','use') ORDER BY ordinal",
+                *((owner,) if owner is not None else ()),
             )
             now_row = cursor.fetchone()
+            if owner is not None:
+                if now_row is None:
+                    raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
+                if not now_row[0]:
+                    if assert_active is not None:
+                        assert_active(cursor)
+                    raise StorageError("this Azure SQL hub incarnation was fenced; restart the hub")
+                if not cursor.nextset():
+                    raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
+                now_row = cursor.fetchone()
             if now_row is None or not cursor.nextset():
                 raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
             self._local.now = float(now_row[0])
