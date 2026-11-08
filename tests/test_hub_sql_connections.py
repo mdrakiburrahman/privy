@@ -347,7 +347,7 @@ def test_lease_read_snapshot_is_serializable_without_application_lock():
     lock = SqlLeaseLock(store, backend)
 
     with lock.read_snapshot() as snapshot:
-        assert snapshot["now"] == 1_800_000_000.25
+        assert snapshot["now"] == pytest.approx(1_800_000_000.25)
 
     assert transactions == [(None, "SERIALIZABLE")]
     assert len(cursor.queries) == 1

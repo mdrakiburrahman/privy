@@ -308,8 +308,7 @@ def test_failed_refresh_does_not_return_expired_success(caplog):
         cache.close()
 
 
-@pytest.mark.parametrize("operation", ["use", "touch"])
-def test_deferred_accounting_runs_once_off_thread_not_forever(model, operation):
+def test_deferred_advisory_accounting_runs_once_off_thread_not_forever(model):
     delivered = threading.Event()
     calls = []
     foreground_thread = threading.get_ident()
@@ -319,18 +318,10 @@ def test_deferred_accounting_runs_once_off_thread_not_forever(model, operation):
         calls.append((target, lease_id, origin))
         delivered.set()
 
-    def touch(lease_id):
-        assert threading.get_ident() != foreground_thread
-        calls.append((None, lease_id, None))
-        delivered.set()
-
-    if operation == "use":
-        model.defer_use(SimpleNamespace(use=use), "box", "lease", "rest")
-    else:
-        model.defer_touch(SimpleNamespace(touch=touch), "lease")
+    model.defer_use(SimpleNamespace(use=use), "box", None, "rest")
     assert delivered.wait(2)
     time.sleep(0.35)
-    assert calls == [("box", "lease", "rest") if operation == "use" else (None, "lease", None)]
+    assert calls == [("box", None, "rest")]
 
 
 def test_outbox_pending_keys_are_not_limited_to_one_flush_batch(tmp_path):
@@ -422,22 +413,28 @@ def advisory_store():
     return store, snapshot, calls
 
 
-def test_read_accounting_returns_warning_without_entering_authoritative_lock():
+def test_read_use_keeps_lease_renewal_authoritative_and_defers_only_advisory_accounting():
     store, _, calls = advisory_store()
+    store.use = lambda target, lease_id=None, *, origin="rest": (
+        calls.append(("authoritative-use", target, lease_id, origin)) or {"purpose": "work"}
+    )
     assert store.read_use("box", "lease") == {"purpose": "work"}
-    assert len(calls) == 1
+    assert calls == [("authoritative-use", "box", "lease", "rest")]
     assert store.read_use("box")["lease_warning"]["lease_id"] == "lease"
+    assert calls[-1] == (store, "box", None, "rest")
 
 
-def test_read_header_touch_does_not_enter_authoritative_lock():
+def test_read_header_touch_renews_authoritatively():
     store, _, calls = advisory_store()
+    store.touch = lambda lease_id: calls.append(("authoritative-touch", lease_id))
     store.read_touch("lease")
-    assert calls == [(store, "lease")]
+    assert calls == [("authoritative-touch", "lease")]
 
 
 @pytest.mark.parametrize("state,code", [("released", "lease_released"), ("superseded", "lease_lost")])
-def test_known_released_or_superseded_lease_is_rejected_before_deferred_use(state, code):
+def test_known_released_or_superseded_lease_is_rejected_by_authoritative_use(state, code):
     store, snapshot, calls = advisory_store()
+    store.use = lambda target, lease_id=None, *, origin="rest": store._read_lease(snapshot, lease_id)
     if state == "released":
         snapshot["leases"]["lease"]["state"] = "released"
     else:

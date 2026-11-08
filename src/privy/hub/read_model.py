@@ -478,9 +478,6 @@ class SqlReadModel:
     def defer_use(self, store, target, lease_id, origin):
         self._defer(("use", target, lease_id, origin), lambda: store.use(target, lease_id, origin=origin))
 
-    def defer_touch(self, store, lease_id):
-        self._defer(("touch", lease_id), lambda: store.touch(lease_id))
-
     def _defer(self, key, action):
         with self._lock:
             error = self._use_errors.pop(key, None)

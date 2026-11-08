@@ -1026,9 +1026,9 @@ class LeaseStore:
             return result
 
     def read_use(self, target: str, lease_id: str | None = None, *, origin: str = "rest") -> dict[str, Any]:
-        """Advisory read accounting; renewal and warning events flush off-thread."""
+        """Renew lease-backed reads authoritatively; defer only advisory unleased accounting."""
         model = getattr(self.sql_backend, "read_model", None)
-        if model is None:
+        if model is None or lease_id is not None:
             return self.use(target, lease_id, origin=origin)
         with self._lock.read_snapshot() as snapshot:
             _, membership = self._membership()
@@ -1057,13 +1057,8 @@ class LeaseStore:
         return result
 
     def read_touch(self, lease_id: str) -> None:
-        model = getattr(self.sql_backend, "read_model", None)
-        if model is None:
-            self.touch(lease_id)
-            return
-        with self._lock.read_snapshot() as snapshot:
-            self._read_lease(snapshot, lease_id)
-        model.defer_touch(self, lease_id)
+        # Renewal is lease authority, not advisory read accounting.
+        self.touch(lease_id)
 
     def _read_lease(self, snapshot: dict[str, Any], lease_id: str) -> dict[str, Any]:
         lease = snapshot["leases"].get(lease_id)
