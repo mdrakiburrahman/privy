@@ -10,6 +10,7 @@ import copy
 import json
 import logging
 import os
+import socket
 import sqlite3
 import struct
 import threading
@@ -66,13 +67,19 @@ class _HomeLock:
 def _home_identity(home: Path) -> str:
     path = home / ".sql-hub-id"
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
         value = path.read_text(encoding="ascii").strip()
-    else:
+    except FileNotFoundError:
         value = uuid.uuid4().hex
-        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
-            stream.write(value + "\n")
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+                stream.write(value + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
     if len(value) != 32 or any(char not in "0123456789abcdef" for char in value):
         raise StorageError(f"invalid Azure SQL hub identity file: {path}")
     return value
@@ -352,6 +359,7 @@ class SqlBackend:
         self._home_lock = _HomeLock(home / "sql-home.lock")
         try:
             self.hub_id = _home_identity(home)
+            self.home_scope = f"{socket.gethostname().casefold()}:{str(home.resolve()).casefold()}"
             self.owner = uuid.uuid4().hex
             self._fenced = False
             self._closed = False
@@ -448,10 +456,12 @@ class SqlBackend:
             previous = cursor.fetchall()
             for owner, payload, stale in previous:
                 heartbeat = json.loads(payload)
-                if heartbeat.get("active", True) and not stale:
-                    raise StorageError(
-                        "another active Azure SQL process is using this hub home identity"
-                    )
+                if (
+                    heartbeat.get("active", True)
+                    and not stale
+                    and heartbeat.get("home_scope") != self.home_scope
+                ):
+                    raise StorageError("another active Azure SQL process is using this hub home identity")
                 cursor.execute(
                     "UPDATE dbo.privy_coordination SET payload=?,updated=SYSUTCDATETIME() "
                     "WHERE kind='hub' AND id=?",
@@ -461,7 +471,14 @@ class SqlBackend:
             cursor.execute(
                 "INSERT dbo.privy_coordination(kind,id,payload) VALUES('hub',?,?)",
                 self.owner,
-                json.dumps({"owner": self.owner, "hub_id": self.hub_id, "active": True}),
+                json.dumps(
+                    {
+                        "owner": self.owner,
+                        "hub_id": self.hub_id,
+                        "home_scope": self.home_scope,
+                        "active": True,
+                    }
+                ),
             )
 
     def assert_owner_active(self, cursor) -> None:
@@ -726,7 +743,14 @@ class SqlBackend:
             cursor.execute(
                 "UPDATE dbo.privy_coordination SET payload=?,updated=SYSUTCDATETIME() "
                 "WHERE kind='hub' AND id=? AND JSON_VALUE(payload,'$.active')='true'",
-                json.dumps({"owner": self.owner, "hub_id": self.hub_id, "active": True}),
+                json.dumps(
+                    {
+                        "owner": self.owner,
+                        "hub_id": self.hub_id,
+                        "home_scope": self.home_scope,
+                        "active": True,
+                    }
+                ),
                 self.owner,
             )
             cursor.execute(
@@ -747,7 +771,14 @@ class SqlBackend:
                 cursor.execute(
                     "UPDATE dbo.privy_coordination SET payload=?,updated=SYSUTCDATETIME() "
                     "WHERE kind='hub' AND id=? AND JSON_VALUE(payload,'$.active')='true'",
-                    json.dumps({"owner": self.owner, "hub_id": self.hub_id, "active": False}),
+                    json.dumps(
+                        {
+                            "owner": self.owner,
+                            "hub_id": self.hub_id,
+                            "home_scope": self.home_scope,
+                            "active": False,
+                        }
+                    ),
                     self.owner,
                 )
         except Exception:
@@ -774,8 +805,7 @@ class SqlBackend:
             batch = keys[start : start + batch_size]
             with self.transaction() as cursor:
                 cursor.execute(
-                    "SELECT id FROM dbo.privy_records WHERE kind=? AND id IN "
-                    "(SELECT value FROM OPENJSON(?))",
+                    "SELECT id FROM dbo.privy_records WHERE kind=? AND id IN (SELECT value FROM OPENJSON(?))",
                     kind,
                     json.dumps(batch),
                 )

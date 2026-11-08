@@ -936,7 +936,7 @@ def test_audit_import_pending_delivery_never_commits_marker(tmp_path):
 
     def flush(timeout=10):
         calls.append(timeout)
-        return len(calls) == 1
+        return False
 
     backend.flush = flush
     try:
@@ -1175,7 +1175,7 @@ def test_sql_process_harness_starts_and_serves_with_fake_backend(missing_depende
     home.mkdir()
     settings = home / "appsettings.yaml"
     settings.write_text(
-        "version: 1\nstorage: {mode: azure_sql, server: simulated.invalid, database: fake_harness_db}\n",
+        "version: 1\nstorage: {mode: azure_sql, server: simulated.invalid, database: fake_harness_test}\n",
         encoding="utf-8",
     )
     unavailable = (

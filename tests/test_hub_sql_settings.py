@@ -1,9 +1,11 @@
+import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from privy.hub.settings import SettingsError, load_settings
-from privy.hub.sql_store import StorageError, _HomeLock, _home_identity
+from privy.hub.sql_store import SqlBackend, StorageError, _home_identity, _HomeLock
 
 
 def test_absent_settings_preserve_file_mode(tmp_path, monkeypatch):
@@ -49,6 +51,70 @@ def test_sql_settings_and_resolution(tmp_path, monkeypatch):
     assert settings.retention_days == 7
     assert settings.driver == "ODBC Driver 18 for SQL Server"
     assert load_settings(home, Path("appsettings.yaml")) is None
+
+
+def test_sql_identity_file_is_created_atomically_and_ignores_orphan_temp_file(tmp_path):
+    (tmp_path / ".sql-hub-id.orphan.tmp").write_text("partial", encoding="ascii")
+    identity = _home_identity(tmp_path)
+    assert identity == _home_identity(tmp_path)
+    assert len(identity) == 32
+
+
+def test_same_home_successor_fences_previous_incarnation_without_releasing_pins():
+    previous_payload = json.dumps(
+        {"owner": "previous", "hub_id": "home-id", "home_scope": "host:/home", "active": True}
+    )
+    cursor = FakeCursor([("previous", previous_payload, 0)])
+
+    @contextmanager
+    def transaction(_lock=None):
+        yield cursor
+
+    backend = object.__new__(SqlBackend)
+    backend.owner = "current"
+    backend.hub_id = "home-id"
+    backend.home_scope = "host:/home"
+    backend.transaction = transaction
+    backend._register_incarnation()
+
+    update = next(args for query, args in cursor.statements if query.startswith("UPDATE"))
+    insert = next(args for query, args in cursor.statements if query.startswith("INSERT"))
+    assert json.loads(update[0])["active"] is False
+    assert json.loads(insert[1])["active"] is True
+    assert json.loads(insert[1])["home_scope"] == "host:/home"
+
+
+def test_active_incarnation_from_a_different_home_scope_blocks_startup():
+    previous_payload = json.dumps(
+        {"owner": "previous", "hub_id": "copied-home-id", "home_scope": "other-host:/home", "active": True}
+    )
+    cursor = FakeCursor([("previous", previous_payload, 0)])
+
+    @contextmanager
+    def transaction(_lock=None):
+        yield cursor
+
+    backend = object.__new__(SqlBackend)
+    backend.owner = "current"
+    backend.hub_id = "copied-home-id"
+    backend.home_scope = "host:/home"
+    backend.transaction = transaction
+    with pytest.raises(StorageError, match="another active Azure SQL process"):
+        backend._register_incarnation()
+    assert len(cursor.statements) == 1
+    assert cursor.statements[0][0].startswith("SELECT")
+
+
+class FakeCursor:
+    def __init__(self, rows):
+        self.rows = rows
+        self.statements = []
+
+    def execute(self, query, *args):
+        self.statements.append((query, args))
+
+    def fetchall(self):
+        return self.rows
 
 
 def test_sql_home_identity_is_stable_and_single_process_exclusive(tmp_path):

@@ -826,13 +826,11 @@ class LeaseStore:
                 live = [
                     job
                     for job in lease["running_jobs"]
-                    if not self.sql_backend.owner_is_stale(
-                        owners.get(job, "unresolved-file-import")
-                    )
+                    if not self.sql_backend.owner_is_stale(owners.get(job, "unresolved-file-import"))
                 ]
                 if live:
                     raise LeaseError(
-                        "cannot reconcile pins owned by an active or unknown hub; confirm remote jobs have stopped",
+                        "cannot reconcile pinned jobs owned by an active or unknown hub; confirm remote jobs have stopped",
                         status=409,
                         code="lease_pinned",
                         details={"running_jobs": live},

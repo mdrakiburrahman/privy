@@ -75,12 +75,13 @@ each home and its `sql-outbox.sqlite3` files until all pending deliveries have b
 
 Either hub can inspect/follow shared jobs and request cancellation. Cancellation is durably recorded
 in SQL and only acknowledged by the executing hub after it processes the request. Acceptance does
-not promise immediate cancellation while that owner is offline. A new process incarnation does not
-restart another process's work or clear its pins. **Stale heartbeats do not prove remote execution
-stopped.** SQL mode refuses lease release, including force release, while leased jobs are pinned;
-unleased running jobs also keep their group unavailable for fresh lease admission. If an owner dies
-with unresolved work, confirm remote completion before administrator-led reconciliation. This
-conservative behavior differs intentionally from file mode's restart pin clearing and force release.
+not promise immediate cancellation while that owner is offline. A same-home successor fences the
+previous SQL incarnation but neither restarts its work nor clears its pins. **Stale heartbeats do not
+prove remote execution stopped.** Normal release refuses while leased jobs are pinned; the explicit
+force-release action can reconcile pins only after every owner is marked stopped, stale, or unresolved
+file import. Verify remote work has ended before using it, because reconciliation may make the box
+available while remote work continues. Unleased running jobs also keep their group unavailable for
+fresh lease admission.
 
 If a new SQL-enabled home already contains `leases-state.json`, startup imports it once under the
 same SQL lock, preserving active pins and rejecting conflicting client identities/allocations.
