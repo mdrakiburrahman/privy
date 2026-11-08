@@ -911,8 +911,7 @@ class SqlBackend:
 
             where, params = query("probe")
             cursor.execute(
-                "SELECT target,at,id,probe_status,probe_latency_ms "
-                f"FROM dbo.privy_records WHERE {where}",
+                f"SELECT target,at,id,probe_status,probe_latency_ms FROM dbo.privy_records WHERE {where}",
                 *params,
             )
             probe_rows = cursor.fetchall()

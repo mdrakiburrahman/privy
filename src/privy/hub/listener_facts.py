@@ -316,7 +316,11 @@ def facts_for(
     store: ListenerInfoStore, target_id: str, path: str, probe: ProbeResult | None
 ) -> dict[str, Any]:
     """Facts from the live probe, else the last known description (``info_stale``)."""
-    known = None if probe is not None and probe.status == ONLINE and probe.info is not None else store.last(target_id)
+    known = (
+        None
+        if probe is not None and probe.status == ONLINE and probe.info is not None
+        else store.last(target_id)
+    )
     return _facts_from_known(path, probe, known)
 
 
