@@ -1328,6 +1328,80 @@ class SqlBackend:
             )
             return [json.loads(row[0]) for row in cursor.fetchall()]
 
+    def read_view_output(self, job_id: str, ranges) -> tuple[dict[str, int], dict[str, list[dict]]]:
+        selected = tuple(ranges)
+        if any(stream not in ("stdout", "stderr") for stream in selected):
+            raise ValueError("output streams must be stdout or stderr")
+        if not selected:
+            return {}, {}
+        values, params = [], []
+        for stream, (offset, total, limit) in ranges.items():
+            values.append("(?,CAST(? AS bigint),CAST(? AS bigint),CAST(? AS bigint))")
+            params.extend((stream, offset, total, max(0, limit)))
+        # Materialize offsets once so a concurrent claim cannot change the
+        # range between the cursor result and the output result.
+        query = (
+            "SET NOCOUNT ON; DECLARE @ranges TABLE(stream varchar(6),offset bigint,total bigint,lim bigint); "
+            "INSERT @ranges SELECT r.stream,COALESCE(r.offset,c.offset,0),r.total,r.lim "
+            f"FROM (VALUES {','.join(values)}) r(stream,offset,total,lim) "
+            "LEFT JOIN dbo.privy_cursors c ON c.job_id=? AND c.stream=r.stream AND r.offset IS NULL; "
+            "SELECT stream,offset FROM @ranges; "
+            "SELECT o.stream,o.payload FROM @ranges r "
+            "CROSS APPLY (SELECT CASE WHEN r.offset<0 THEN 0 WHEN r.offset>r.total THEN r.total "
+            "ELSE r.offset END AS begin_offset) b "
+            "JOIN dbo.privy_output o ON o.job_id=? AND o.stream=r.stream "
+            "AND o.end_offset>b.begin_offset AND o.start_offset<b.begin_offset+r.lim "
+            "AND o.start_offset<r.total AND r.lim>0 ORDER BY o.stream,o.start_offset"
+        )
+        chunks = {stream: [] for stream in selected}
+        with self.transaction() as cursor:
+            cursor.execute(query, *params, job_id, job_id)
+            offsets = {str(row[0]): int(row[1]) for row in cursor.fetchall()}
+            cursor.nextset()
+            for stream, payload in cursor.fetchall():
+                chunks[str(stream)].append(json.loads(payload))
+        return offsets, chunks
+
+    def advance_cursors(self, job_id: str, ends: dict[str, int]) -> dict[str, int]:
+        if any(stream not in ("stdout", "stderr") or end <= 0 for stream, end in ends.items()):
+            raise ValueError("cursor claims require stdout or stderr and positive ends")
+        if not ends:
+            return {}
+        statements, params = [], []
+        # All callers lock streams in the same order, including missing keys.
+        for stream in sorted(ends):
+            statements.append(
+                "SET @previous=NULL; "
+                "SELECT @previous=offset FROM dbo.privy_cursors WITH(UPDLOCK,HOLDLOCK) "
+                "WHERE job_id=? AND stream=?; "
+                "IF @previous IS NULL INSERT dbo.privy_cursors(job_id,stream,offset) VALUES(?,?,?); "
+                "ELSE UPDATE dbo.privy_cursors SET offset=CASE WHEN offset<? THEN ? ELSE offset END,"
+                "updated=SYSUTCDATETIME() WHERE job_id=? AND stream=?; "
+                "INSERT @claims VALUES(?,COALESCE(@previous,0)); "
+            )
+            params.extend(
+                (
+                    job_id,
+                    stream,
+                    job_id,
+                    stream,
+                    ends[stream],
+                    ends[stream],
+                    ends[stream],
+                    job_id,
+                    stream,
+                    stream,
+                )
+            )
+        query = (
+            "SET NOCOUNT ON; DECLARE @previous bigint; DECLARE @claims TABLE(stream varchar(6),offset bigint); "
+            + "".join(statements)
+            + "SELECT stream,offset FROM @claims"
+        )
+        with self.transaction() as cursor:
+            cursor.execute(query, *params)
+            return {str(row[0]): int(row[1]) for row in cursor.fetchall()}
+
     def read_cursors(self, job_id: str, streams) -> dict[str, int]:
         selected = tuple(dict.fromkeys(streams))
         if any(stream not in ("stdout", "stderr") for stream in selected):

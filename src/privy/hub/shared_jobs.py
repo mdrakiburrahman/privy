@@ -373,11 +373,12 @@ class SharedJob(HubJob):
         result["owner"] = self.owner
         return result
 
-    def _bytes(self, stream: str, offset: int, limit: int) -> tuple[int, bytes]:
+    def _bytes(self, stream: str, offset: int, limit: int, *, chunks=None) -> tuple[int, bytes]:
         # Never skip a temporarily absent chunk: the output row may still be flushing.
         begin = min(max(0, offset), self.buffer(stream).total)
         end = min(begin + max(0, limit), self.buffer(stream).total)
-        chunks = self.backend.output(self.id, stream, begin, max(0, end - begin)) if end > begin else []
+        if chunks is None:
+            chunks = self.backend.output(self.id, stream, begin, max(0, end - begin)) if end > begin else []
         data = bytearray()
         position = begin
         for chunk in chunks:
@@ -434,7 +435,24 @@ class SharedJob(HubJob):
                 result["result"] = dict(self.transfer)
             return result
         cursor_streams = [stream for stream in STREAMS if offsets is None or offsets.get(stream) is None]
-        cursors = self.backend.read_cursors(self.id, cursor_streams) if cursor_streams else {}
+        read_batch = getattr(self.backend, "read_view_output", None)
+        if read_batch is not None:
+            cursors, chunks = read_batch(
+                self.id,
+                {
+                    stream: (
+                        None if offsets is None else offsets.get(stream),
+                        self.buffer(stream).total,
+                        max_output_bytes,
+                    )
+                    for stream in STREAMS
+                },
+            )
+        else:
+            cursors = self.backend.read_cursors(self.id, cursor_streams) if cursor_streams else {}
+            chunks = {}
+        candidates = {}
+        claims = {}
         for stream in STREAMS:
             explicit = None if offsets is None else offsets.get(stream)
             start = cursors[stream] if explicit is None else explicit
@@ -442,19 +460,30 @@ class SharedJob(HubJob):
             # Consume a contiguous prefix; a summary is not evidence that its
             # newest output chunks have reached SQL yet.
             desired = start
-            begin, data = self._bytes(stream, desired, max_output_bytes)
+            begin, data = self._bytes(stream, desired, max_output_bytes, chunks=chunks.get(stream))
             lead = _skip_continuation_bytes(data)
             begin, data = begin + lead, data[lead:]
             if begin + len(data) < self.buffer(stream).total or self.state not in TERMINAL_STATES:
                 data = data[: _utf8_safe_length(data)]
             end = begin + len(data)
             if advance and explicit is None and data:
-                previous = self.backend.advance_cursor(self.id, stream, end)
+                claims[stream] = end
+            candidates[stream] = (start, begin, data)
+        claim_batch = getattr(self.backend, "advance_cursors", None)
+        previous_offsets = (
+            claim_batch(self.id, claims)
+            if claims and claim_batch is not None
+            else {stream: self.backend.advance_cursor(self.id, stream, end) for stream, end in claims.items()}
+        )
+        for stream in STREAMS:
+            start, begin, data = candidates[stream]
+            if stream in claims:
+                previous = previous_offsets[stream]
                 # Another hub may have consumed some or all of our candidate bytes.
                 consumed = min(len(data), max(0, previous - begin))
                 begin, data = begin + consumed, data[consumed:]
                 start = max(start, previous)
-                self.cursor[stream] = max(previous, end)
+                self.cursor[stream] = max(previous, claims[stream])
             if not data:
                 begin = start
             result[stream] = data.decode("utf-8", "replace")
