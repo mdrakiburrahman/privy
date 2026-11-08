@@ -63,6 +63,24 @@ def test_hycos_show_whole_group_lease_and_filter_with_escaped_metadata(leased_hu
     assert " style=" not in text and "unsafe-inline" not in response.headers["Content-Security-Policy"]
 
 
+def test_html_report_reuses_fresh_lease_group_snapshot(leased_hub, monkeypatch):
+    hub, _, lease = leased_hub
+    store = hub.service.leases
+    calls = []
+    original = store.groups
+
+    def groups():
+        calls.append(True)
+        return original()
+
+    monkeypatch.setattr(store, "groups", groups)
+    response = hub.call("GET", "/ui/hycos")
+
+    assert response.status == 200
+    assert len(calls) == 1
+    assert f"lease {lease['lease_id']} · group dev/box1" in response.text
+
+
 def test_leases_tab_clients_groups_peek_and_effective_rules_are_read_only(leased_hub):
     hub, client, lease = leased_hub
     before = hub.service.leases.get_lease(lease["lease_id"])["expires_at"]

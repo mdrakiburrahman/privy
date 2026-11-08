@@ -867,6 +867,111 @@ class SqlBackend:
             )
         return result
 
+    def report_history(self, *, after=None, before=None):
+        """Read all dashboard history on one fresh connection and transaction."""
+        started = time.perf_counter()
+
+        def query(kind):
+            clauses, params = ["kind=?"], [kind]
+            if after is not None:
+                clauses.append("at>=?")
+                params.append(after)
+            if before is not None:
+                clauses.append("at<?")
+                params.append(before)
+            return " AND ".join(clauses), params
+
+        decoded = {}
+        with self.transaction() as cursor:
+            for name, kind in (("jobs", "job"), ("purposes", "purpose"), ("calls", "call")):
+                where, params = query(kind)
+                cursor.execute(f"SELECT payload FROM dbo.privy_records WHERE {where}", *params)
+                rows = cursor.fetchall()
+                decode_started = time.perf_counter()
+                decoded[name] = [json.loads(row[0]) for row in rows]
+                if _profile_sql_enabled():
+                    log.info(
+                        "sql_profile record_decode thread=%s kind=%s rows=%d duration_ms=%.1f",
+                        threading.get_ident(),
+                        kind,
+                        len(rows),
+                        (time.perf_counter() - decode_started) * 1000,
+                    )
+
+            if after is not None:
+                cursor.execute(
+                    "WITH ranked AS (SELECT payload,ROW_NUMBER() OVER(PARTITION BY kind,target "
+                    "ORDER BY at DESC,id DESC) AS n FROM dbo.privy_records "
+                    "WHERE kind IN('job','purpose') AND at<?) SELECT payload FROM ranked WHERE n=1",
+                    after,
+                )
+                decoded["latest_before"] = [json.loads(row[0]) for row in cursor.fetchall()]
+            else:
+                decoded["latest_before"] = []
+
+            where, params = query("probe")
+            cursor.execute(
+                "SELECT target,at,id,probe_status,probe_latency_ms "
+                f"FROM dbo.privy_records WHERE {where}",
+                *params,
+            )
+            probe_rows = cursor.fetchall()
+            latest = {}
+            for target, at, key, *_ in probe_rows:
+                candidate = (float(at), str(key))
+                if target not in latest or candidate > latest[target]:
+                    latest[target] = candidate
+            latest_ids = [key for _, key in latest.values()]
+            payloads = {}
+            if latest_ids:
+                cursor.execute(
+                    "SELECT id,payload FROM dbo.privy_records WHERE kind='probe' "
+                    "AND id IN (SELECT value FROM OPENJSON(?))",
+                    json.dumps(latest_ids, ensure_ascii=True),
+                )
+                payload_rows = cursor.fetchall()
+                decode_started = time.perf_counter()
+                payloads = {str(key): json.loads(payload) for key, payload in payload_rows}
+                if _profile_sql_enabled():
+                    log.info(
+                        "sql_profile record_decode thread=%s kind=probe_latest rows=%d duration_ms=%.1f",
+                        threading.get_ident(),
+                        len(payload_rows),
+                        (time.perf_counter() - decode_started) * 1000,
+                    )
+
+            decoded["probes"] = []
+            for target, at, key, status, latency_ms in probe_rows:
+                row = {"target": target, "at": float(at), "status": status, "latency_ms": latency_ms}
+                if latest.get(target) == (float(at), str(key)) and str(key) in payloads:
+                    row.update(payloads[str(key)])
+                decoded["probes"].append(row)
+
+            cursor.execute(
+                "SELECT JSON_VALUE(payload,'$.state'),COUNT_BIG(*) "
+                "FROM dbo.privy_records WHERE kind='job' GROUP BY JSON_VALUE(payload,'$.state')"
+            )
+            counts = {row[0]: int(row[1]) for row in cursor.fetchall()}
+            decoded["job_counts"] = {
+                "queued": counts.get("queued", 0),
+                "running": counts.get("running", 0),
+                "retained": sum(counts.values()),
+            }
+
+        if _profile_sql_enabled():
+            log.info(
+                "sql_profile report_history thread=%s duration_ms=%.1f jobs=%d purposes=%d "
+                "probes=%d calls=%d latest_before=%d",
+                threading.get_ident(),
+                (time.perf_counter() - started) * 1000,
+                len(decoded["jobs"]),
+                len(decoded["purposes"]),
+                len(decoded["probes"]),
+                len(decoded["calls"]),
+                len(decoded["latest_before"]),
+            )
+        return decoded
+
     def scan(self, kind: str, *, before=None, after=None, target=None, lease_id=None, client_id=None):
         page_size = 5000
         clauses, params = ["kind=?"], [kind]

@@ -292,7 +292,11 @@ def gather_probes(service: Any) -> dict[str, ProbeResult | None]:
 
 
 def build_report(
-    service: Any, range_name: str = DEFAULT_RANGE, *, selection: ReportSelection | None = None
+    service: Any,
+    range_name: str = DEFAULT_RANGE,
+    *,
+    selection: ReportSelection | None = None,
+    include_lease_groups: bool = False,
 ) -> dict[str, Any]:
     targets = list(service.registry.snapshot().targets)
     probes = gather_probes(service)
@@ -312,6 +316,9 @@ def build_report(
         probe = probes.get(row["id"])
         row["terminal_shells"] = terminal_languages(probe.info if probe else None)
         row.update(facts[row["id"]])
+    leases = getattr(service, "leases", None)
+    if include_lease_groups and leases is not None:
+        report["_lease_groups"] = leases.groups()
     return report
 
 
@@ -968,7 +975,9 @@ def lease_cell(group: dict[str, Any], now: float) -> str:
 
 def enrich_lease_report(service: Any, report: dict[str, Any]) -> None:
     store = getattr(service, "leases", None)
-    groups = store.groups() if store is not None else []
+    groups = report.pop("_lease_groups", None)
+    if groups is None:
+        groups = store.groups() if store is not None else []
     by_target = {target: group for group in groups for target in group["members"].values()}
     for row in report["targets"]:
         row["lease_group"] = by_target.get(row["id"])
@@ -1600,7 +1609,7 @@ def render(service: Any, page: str, query: Mapping[str, list[str]], base_url: st
         if page in ("leases", "jobs"):
             report = build_shell_report(service, selection)
         else:
-            report = build_report(service, selection=selection)
+            report = build_report(service, selection=selection, include_lease_groups=True)
             enrich_lease_report(service, report)
     except Exception:
         if profile:
