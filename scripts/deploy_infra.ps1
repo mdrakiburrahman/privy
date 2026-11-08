@@ -131,7 +131,7 @@ if ($group.Count) {
             $skuMismatch = if ($isHyperscale) {
                 $zoneRedundancy = $database.PSObject.Properties["zoneRedundant"]
                 $expectedSkuName = if ($isMemoryOptimizedHyperscale) { "HS_MOPRMS" } else { "HS_Gen5" }
-                $expectedFamily = if ($isMemoryOptimizedHyperscale) { "8IH" } else { "Gen5" }
+                $expectedFamily = if ($isMemoryOptimizedHyperscale) { "MOPRMS" } else { "Gen5" }
                 $expectedCapacity = if ($isMemoryOptimizedHyperscale) { 16 } else { 8 }
                 $database.currentServiceObjectiveName -ne $target.Sku -or
                 $database.sku.name -ne $expectedSkuName -or

@@ -36,7 +36,7 @@ resource database 'Microsoft.Sql/servers/databases@2023-08-01' = {
   sku: isHyperscale ? {
     name: isMemoryOptimizedHyperscale ? 'HS_MOPRMS' : 'HS_Gen5'
     tier: 'Hyperscale'
-    family: isMemoryOptimizedHyperscale ? '8IH' : 'Gen5'
+    family: isMemoryOptimizedHyperscale ? 'MOPRMS' : 'Gen5'
     capacity: isMemoryOptimizedHyperscale ? 16 : 8
   } : isBusinessCritical ? {
     name: 'BC_Gen5'

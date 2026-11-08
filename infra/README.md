@@ -37,18 +37,23 @@ redundancy must be explicitly reported as boolean `false`, not missing, null, or
 The default server name is `privy-sql`; override `-ServerName` if needed for global uniqueness. The
 database name and supported SKUs are parameters. `HS_Gen5_8` remains the default baseline until a
 controlled benchmark selects a winner; `S0`, `S1`, `S2`, and `S3` remain available for intentional
-Standard-tier deployments. The opt-in `HS_MOPRMS_16` override maps to Hyperscale `HS_MOPRMS`, family
-`8IH`, capacity 16. Both Hyperscale options use one high-availability replica, enable read
-scale-out, disable zone redundancy, and retain Local backup storage redundancy. The opt-in
-`BC_Gen5_16` override maps to Business Critical `BC_Gen5`, family `Gen5`, capacity 16 and does not
-set the Hyperscale-only high-availability replica count; it also enables read scale-out, disables
-zone redundancy, and retains Local backup storage redundancy. No SKU or infrastructure setting
-guarantees P99 below 3 seconds; measure the application under a controlled two-machine workload.
+Standard-tier deployments. The opt-in `HS_MOPRMS_16` override maps to Hyperscale `HS_MOPRMS`, ARM
+SKU family `MOPRMS`, capacity 16; the Azure capability API identifies its hardware family as `8IH`.
+These are distinct representations, and existing-resource validation requires the ARM family. Both
+Hyperscale options use one high-availability replica, enable read scale-out, disable zone
+redundancy, and retain Local backup storage redundancy. The opt-in `BC_Gen5_16` override maps to
+Business Critical `BC_Gen5`, family `Gen5`, capacity 16 and does not set the Hyperscale-only
+high-availability replica count; it also enables read scale-out, disables zone redundancy, and
+retains Local backup storage redundancy. No SKU or infrastructure setting guarantees P99 below 3
+seconds; measure the application under a controlled two-machine workload.
 
 Direct Hyperscale-to-Business-Critical changes are rejected. The supported migration path is
 Hyperscale to General Purpose within 45 days of initial conversion, then Business Critical; the
-deployment script does not attempt migration. Plan and perform any required tier migration
-separately, following the supported Azure migration path. All Azure operations pass the explicit
+deployment script does not attempt migration. A Hyperscale-to-General-Purpose cutover generally
+takes a few minutes. As soon as reverse migration starts, backups older than the immediately
+previous architecture tier become unavailable, even if the operation is canceled. Review the
+[reverse migration guidance](https://learn.microsoft.com/en-us/azure/azure-sql/database/reverse-migrate-from-hyperscale?view=azuresql)
+and confirm backup requirements before starting. All Azure operations pass the explicit
 subscription; the script does not run `az account set`. Deployment outputs are nonsecret resource
 IDs, FQDN, tiers, the firewall range, and explicit settings locations.
 

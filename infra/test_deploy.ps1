@@ -56,6 +56,11 @@ function az {
                     "memoryOptimizedHyperscale" {
                         $database.currentServiceObjectiveName = "HS_MOPRMS_16"
                         $database.requestedServiceObjectiveName = "HS_MOPRMS_16"
+                        $database.sku = @{name="HS_MOPRMS"; tier="Hyperscale"; family="MOPRMS"; capacity=16}
+                    }
+                    "memoryOptimizedHyperscaleWrongFamily" {
+                        $database.currentServiceObjectiveName = "HS_MOPRMS_16"
+                        $database.requestedServiceObjectiveName = "HS_MOPRMS_16"
                         $database.sku = @{name="HS_MOPRMS"; tier="Hyperscale"; family="8IH"; capacity=16}
                     }
                     "businessCritical" {
@@ -170,7 +175,7 @@ $sqlTemplate = Get-Content -LiteralPath (Join-Path $PSScriptRoot "sql.bicep") -R
 if ($mainTemplate -notmatch "@allowed\(\['S0', 'S1', 'S2', 'S3', 'HS_Gen5_8', 'HS_MOPRMS_16', 'BC_Gen5_16'\]\)\s*param databaseSku string = 'HS_Gen5_8'") {
     throw "Bicep SKU choices/default do not preserve Standard support and the benchmark baseline."
 }
-if ($sqlTemplate -notmatch "family: isMemoryOptimizedHyperscale \? '8IH' : 'Gen5'" -or
+if ($sqlTemplate -notmatch "family: isMemoryOptimizedHyperscale \? 'MOPRMS' : 'Gen5'" -or
     $sqlTemplate -notmatch "name: 'BC_Gen5'\s+tier: 'BusinessCritical'\s+family: 'Gen5'\s+capacity: 16" -or
     $sqlTemplate -notmatch "(?s)properties: isHyperscale \? \{.*?zoneRedundant: false\s*\} : isBusinessCritical \? \{\s*collation: 'SQL_Latin1_General_CP1_CI_AS'\s+requestedBackupStorageRedundancy: 'Local'\s+readScale: 'Enabled'\s+zoneRedundant: false\s*\} : \{\s*collation: 'SQL_Latin1_General_CP1_CI_AS'\s+requestedBackupStorageRedundancy: 'Local'\s*\}" -or
     $sqlTemplate -notmatch "highAvailabilityReplicaCount: 1" -or
@@ -230,6 +235,12 @@ try {
     & $deployScript -DatabaseSku HS_MOPRMS_16 -ValidateOnly
     if ($global:PrivyInfraValidatedSku -ne "HS_MOPRMS_16") {
         throw "Memory-optimized Hyperscale override did not pass its exact SKU to validation."
+    }
+    $global:PrivyInfraDatabaseState = "memoryOptimizedHyperscaleWrongFamily"
+    $global:PrivyInfraCalls = @()
+    Assert-Fails { & $deployScript -DatabaseSku HS_MOPRMS_16 -ValidateOnly } "SKU/HA/read-scale/zone"
+    if (@($global:PrivyInfraCalls | Where-Object { $_[0] -eq "deployment" }).Count) {
+        throw "Unexpected Hyperscale family reached deployment."
     }
     $global:PrivyInfraDatabaseState = "businessCritical"
     $global:PrivyInfraCalls = @()
