@@ -170,8 +170,10 @@ class ListenerInfoStore:
         *,
         clock: Callable[[], float] = time.time,
         save_delay_s: float = SAVE_DELAY_S,
+        backend: Any = None,
     ) -> None:
-        self.path = home / STATE_FILENAME if home is not None else None
+        self._backend = backend
+        self.path = home / STATE_FILENAME if home is not None and backend is None else None
         self._clock = clock
         self._save_delay_s = save_delay_s
         self._lock = threading.Lock()
@@ -208,6 +210,21 @@ class ListenerInfoStore:
         if result.status != ONLINE or not isinstance(result.info, dict):
             return
         info = {key: value for key, value in result.info.items() if key not in _VOLATILE}
+        if self._backend is not None:
+            from privy.hub.shared_jobs import shared_payload
+
+            info = shared_payload(info)
+            self._backend.enqueue(
+                "listener",
+                target.id,
+                {
+                    "target": target.id,
+                    "owner": self._backend.owner,
+                    "created_at": result.checked_at,
+                    "seen_at": result.checked_at,
+                    "info": info,
+                },
+            )
         with self._lock:
             previous = self._known.get(target.id)
             self._known[target.id] = {"seen_at": result.checked_at, "info": info}
@@ -226,10 +243,19 @@ class ListenerInfoStore:
     def last(self, target_id: str) -> tuple[dict[str, Any], float] | None:
         with self._lock:
             item = self._known.get(target_id)
+        if self._backend is not None:
+            shared = self._backend.get("listener", target_id)
+            if shared is not None and (item is None or shared["seen_at"] >= item["seen_at"]):
+                item = shared
+        if self._backend is not None and item and item["seen_at"] < self._clock() - FORGET_S:
+            return None
         return (item["info"], item["seen_at"]) if item else None
 
     def flush(self) -> None:
         """Write pending changes now."""
+        if self._backend is not None:
+            self._backend.flush()
+            return
         with self._write_lock:
             with self._lock:
                 if self._timer is not None:
