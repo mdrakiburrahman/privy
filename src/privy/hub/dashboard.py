@@ -298,9 +298,17 @@ def build_report(
     selection: ReportSelection | None = None,
     include_lease_groups: bool = False,
 ) -> dict[str, Any]:
+    profile = os.environ.get("PRIVY_SQL_PROFILE") == "1"
+    phase_started = time.perf_counter()
     targets = list(service.registry.snapshot().targets)
+    target_snapshot_ms = (time.perf_counter() - phase_started) * 1000
+    phase_started = time.perf_counter()
     probes = gather_probes(service)
+    probe_gather_ms = (time.perf_counter() - phase_started) * 1000
+    phase_started = time.perf_counter()
     counts = service.jobs.counts()
+    job_counts_ms = (time.perf_counter() - phase_started) * 1000
+    phase_started = time.perf_counter()
     report = service.metrics.report(
         targets,
         probes,
@@ -311,14 +319,37 @@ def build_report(
         jobs_retained=counts["retained"],
         max_running=service.jobs.max_running,
     )
+    metrics_report_ms = (time.perf_counter() - phase_started) * 1000
+    phase_started = time.perf_counter()
     facts = service.listener_facts_many(targets, probes)
+    listener_facts_ms = (time.perf_counter() - phase_started) * 1000
     for row in report["targets"]:
         probe = probes.get(row["id"])
         row["terminal_shells"] = terminal_languages(probe.info if probe else None)
         row.update(facts[row["id"]])
     leases = getattr(service, "leases", None)
     if include_lease_groups and leases is not None:
-        report["_lease_groups"] = leases.groups()
+        phase_started = time.perf_counter()
+        groups = leases.groups()
+        lease_groups_ms = (time.perf_counter() - phase_started) * 1000
+        report["_lease_groups"] = groups
+        report["_active_lease_count"] = sum(group["lease"] is not None for group in groups)
+    else:
+        lease_groups_ms = 0.0
+    if profile:
+        log.info(
+            "dashboard_profile build_report_phases thread=%s targets=%d snapshot_ms=%.1f "
+            "probe_gather_ms=%.1f job_counts_ms=%.1f metrics_report_ms=%.1f "
+            "listener_facts_ms=%.1f lease_groups_ms=%.1f",
+            threading.get_ident(),
+            len(targets),
+            target_snapshot_ms,
+            probe_gather_ms,
+            job_counts_ms,
+            metrics_report_ms,
+            listener_facts_ms,
+            lease_groups_ms,
+        )
     return report
 
 
@@ -399,7 +430,10 @@ def shell(
         "jobs": report["jobs"]["total"],
     }
     if getattr(service, "leases", None) is not None:
-        nav_counts["leases"] = len(service.leases.list_leases())
+        active_leases = report.get("_active_lease_count")
+        if active_leases is None:
+            active_leases = len(service.leases.list_leases())
+        nav_counts["leases"] = active_leases
     nav = "".join(
         f'<a href="{esc(link(path, range=rng if rng in ("1h", "7d") else None))}"'
         f"{ON if name == page else ''}>{nav_icon(name)}{esc(label)}"

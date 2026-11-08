@@ -261,6 +261,8 @@ class SharedMetrics(HubMetrics):
         after = None if selection.range_name == "all" else window_start
         before = window_end if selection.range_name == "custom" else None
         history_read_started = time.perf_counter()
+        probe_stats = None
+        call_stats = None
         report_history = getattr(self.backend, "report_history", None)
         report_counts = None
         if report_history is not None:
@@ -271,7 +273,9 @@ class SharedMetrics(HubMetrics):
             )
             purpose_rows = [*history["jobs"], *history["purposes"], *history["latest_before"]]
             probe_rows = history["probes"]
-            calls = history["calls"]
+            calls = []
+            probe_stats = history["probe_stats"]
+            call_stats = history["call_stats"]
             report_counts = history["job_counts"]
         else:
             snapshot._entries = self.entries(after=after, before=before)
@@ -314,6 +318,15 @@ class SharedMetrics(HubMetrics):
         calls.sort(key=lambda row: row["at"])
         snapshot._calls.extend(CallSample(r["at"], r["surface"], r["status"], r["seconds"]) for r in calls)
         earliest.extend(r["at"] for r in calls)
+        if probe_stats is not None:
+            for target_id, stats in probe_stats["by_target"].items():
+                snapshot._status_since[target_id] = stats["status_since"]
+                snapshot._status_since_first_check[target_id] = stats["status_since_first_check"]
+                if stats["last_online"] is not None:
+                    snapshot._last_online[target_id] = stats["last_online"]
+                earliest.append(stats["earliest_at"])
+        if call_stats is not None and call_stats["earliest_at"] is not None:
+            earliest.append(call_stats["earliest_at"])
         snapshot.started_at = min([self.started_at, *earliest])
         snapshot.restored_jobs = sum(entry.job.owner != self.backend.owner for entry in snapshot._entries)
         history_read_ms = (time.perf_counter() - history_read_started) * 1000
@@ -323,6 +336,8 @@ class SharedMetrics(HubMetrics):
             kwargs.setdefault("jobs_queued", counts["queued"])
             kwargs.setdefault("jobs_retained", counts["retained"])
         report_started = time.perf_counter()
+        kwargs["probe_stats"] = probe_stats
+        kwargs["call_stats"] = call_stats
         result = snapshot.report(targets, shared_probes, **kwargs)
         report_math_ms = (time.perf_counter() - report_started) * 1000
         result["hub_started_at"] = utc_iso(self.started_at)
@@ -337,8 +352,8 @@ class SharedMetrics(HubMetrics):
                 report_math_ms,
                 len(snapshot._entries),
                 max(0, len(purpose_rows) - len(snapshot._entries)),
-                len(probe_rows),
-                len(calls),
+                probe_stats["samples"] if probe_stats is not None else len(probe_rows),
+                call_stats["total"] if call_stats is not None else len(calls),
             )
         return result
 

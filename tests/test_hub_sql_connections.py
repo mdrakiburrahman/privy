@@ -188,7 +188,7 @@ def test_pooled_transactions_close_cursors_under_concurrent_reads_and_flushes():
     assert not cursor_open
 
 
-def test_report_history_reads_all_kinds_in_one_transaction():
+def test_report_history_aggregates_probe_and_call_data_in_one_transaction():
     import json
 
     backend = object.__new__(SqlBackend)
@@ -196,14 +196,15 @@ def test_report_history_reads_all_kinds_in_one_transaction():
     purpose = {"id": "p1", "target": "box", "created_at": 3, "purpose": "current"}
     previous = {"job_id": "old", "target": "box", "created_at": 1, "purpose": "earlier"}
     probe = {"target": "box", "at": 3, "status": "online", "latency_ms": 4, "info": {"os": "test"}}
-    call = {"at": 3, "surface": "ui", "status": 200, "seconds": 0.1}
     results = [
         [(json.dumps(job),)],
         [(json.dumps(purpose),)],
-        [(json.dumps(call),)],
         [(json.dumps(previous),)],
-        [("box", 3, "probe-1", "online", 4)],
-        [("probe-1", json.dumps(probe))],
+        [("box", 4, 3, 3.0, 1.0, 3.0, "probe-1", "online", 4, json.dumps(probe))],
+        [("box", 3.0, 1)],
+        [("box", 4.0)],
+        [(4.0, 4.0)],
+        [("ui", 1, 0, 3.0)],
         [("queued", 1), ("running", 2)],
     ]
 
@@ -220,6 +221,10 @@ def test_report_history_reads_all_kinds_in_one_transaction():
         def fetchall(self):
             return results[self.index]
 
+        def fetchone(self):
+            rows = results[self.index]
+            return rows[0] if rows else None
+
     cursor = Cursor()
     transactions = []
 
@@ -232,10 +237,42 @@ def test_report_history_reads_all_kinds_in_one_transaction():
     history = backend.report_history(after=2, before=4)
 
     assert transactions == [True]
-    assert len(cursor.executed) == 7
+    assert len(cursor.executed) == 9
+    assert "ROW_NUMBER() OVER(PARTITION BY target" in cursor.executed[3][0]
+    assert "JOIN dbo.privy_records payloads" in cursor.executed[3][0]
+    assert "kind='probe'" in cursor.executed[3][0]
+    assert cursor.executed[3][1] == (2, 4)
+    assert "LAG(probe_status)" in cursor.executed[4][0]
+    assert "ROW_NUMBER() OVER(PARTITION BY target ORDER BY probe_latency_ms,at,id)" in cursor.executed[5][0]
+    assert "ORDER BY probe_latency_ms,target,at,id" in cursor.executed[6][0]
+    assert cursor.executed[5][1] == (2, 4)
+    assert cursor.executed[6][1] == (2, 4, 2, 4, 2, 4)
+    assert "GROUP BY JSON_VALUE(payload,'$.surface')" in cursor.executed[7][0]
     assert history["jobs"] == [job]
     assert history["purposes"] == [purpose]
     assert history["latest_before"] == [previous]
     assert history["probes"] == [{**probe, "latency_ms": 4}]
-    assert history["calls"] == [call]
+    assert history["probe_stats"] == {
+        "by_target": {
+            "box": {
+                "samples": 4,
+                "online": 3,
+                "latency_p50_ms": 4.0,
+                "last_online": 3.0,
+                "earliest_at": 1.0,
+                "status_since": 3.0,
+                "status_since_first_check": True,
+            }
+        },
+        "samples": 4,
+        "latency_p50_ms": 4.0,
+        "latency_p95_ms": 4.0,
+    }
+    assert history["calls"] == []
+    assert history["call_stats"] == {
+        "total": 1,
+        "by_surface": {"ui": 1},
+        "errors": 0,
+        "earliest_at": 3.0,
+    }
     assert history["job_counts"] == {"queued": 1, "running": 2, "retained": 3}

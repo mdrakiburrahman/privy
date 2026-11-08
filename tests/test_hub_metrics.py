@@ -119,3 +119,48 @@ def test_stats_and_overview_selection_contract(tmp_path):
     assert hub.call("GET", "/ui?range=custom&start=nope&end=nope").status == 400
     assert hub.call("GET", "/v1/stats?resolution=nope").status == 400
     assert hub.call("GET", "/v1/stats?target=nope").status == 400
+
+
+def test_summary_backed_report_matches_full_probe_and_call_history(history):
+    metrics, target, now = history
+    for offset, status, latency in (
+        (-40, "online", 10),
+        (-30, "online", 20),
+        (-20, "offline", None),
+        (-10, "online", 30),
+    ):
+        metrics.probe(target, ProbeResult(status, now[0] + offset, latency_ms=latency))
+    metrics.call("rest", 200, 0.1)
+    metrics.call("ui", 500, 0.2)
+    now[0] += 1
+    selection = ReportSelection(range_name="7d")
+    probes = {target.id: metrics.last_probe(target.id)}
+    full = metrics.report([target], probes, selection=selection)
+    summary = metrics.report(
+        [target],
+        probes,
+        selection=selection,
+        probe_stats={
+            "by_target": {
+                target.id: {
+                    "samples": 4,
+                    "online": 3,
+                    "latency_p50_ms": 20,
+                    "last_online": now[0] - 11,
+                    "earliest_at": now[0] - 41,
+                    "status_since": now[0] - 11,
+                    "status_since_first_check": False,
+                }
+            },
+            "samples": 4,
+            "latency_p50_ms": 20,
+            "latency_p95_ms": 30,
+        },
+        call_stats={
+            "total": 2,
+            "by_surface": {"rest": 1, "ui": 1},
+            "errors": 1,
+            "earliest_at": now[0],
+        },
+    )
+    assert summary == full
