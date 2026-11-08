@@ -5,6 +5,7 @@ $global:PrivyInfraCalls = @()
 $global:PrivyInfraFailAzure = $false
 $global:PrivyInfraExistingServer = $false
 $global:PrivyInfraWideFirewall = $false
+$global:PrivyInfraAllowAll = $false
 $tenant = "11111111-1111-1111-1111-111111111111"
 $objectId = "22222222-2222-2222-2222-222222222222"
 $claims = @{tid=$tenant; oid=$objectId} | ConvertTo-Json -Compress
@@ -27,11 +28,16 @@ function az {
         "sql server ad-admin" { ,@(@{sid=$objectId; tenantId=$tenant}) | ConvertTo-Json -AsArray }
         "sql server ad-only-auth" { '{"azureAdOnlyAuthentication":true}' }
         "sql server firewall-rule" {
-            if ($global:PrivyInfraWideFirewall) { '[{"startIpAddress":"0.0.0.0","endIpAddress":"255.255.255.255"}]' } else { '[]' }
+            if ($global:PrivyInfraWideFirewall) { '[{"name":"unexpected-range","startIpAddress":"0.0.0.0","endIpAddress":"255.255.255.255"}]' }
+            elseif ($global:PrivyInfraAllowAll) { '[{"name":"privy-allow-all","startIpAddress":"0.0.0.0","endIpAddress":"255.255.255.255"}]' }
+            else { '[]' }
         }
         "sql db list" { '[]' }
         "deployment sub validate" { '{}' }
         "deployment sub create" {
+            $parameterIndex = [Array]::IndexOf($args, "--parameters")
+            $parameters = Get-Content -LiteralPath $args[$parameterIndex + 1].Substring(1) -Raw | ConvertFrom-Json
+            if ($parameters.PSObject.Properties.Name -contains "clientIPv4Addresses") { throw "Deployment accepts client IPs." }
             @{
                 id="/test/deployment"
                 properties=@{
@@ -66,29 +72,33 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("privy-infra-test-" + [guid]::
 $production = Join-Path $testRoot "production\appsettings.yaml"
 $test = Join-Path $testRoot "test\appsettings.yaml"
 try {
-    foreach ($ip in @("0.0.0.0", "10.1.2.3", "127.0.0.1", "1.2.3.256", "1.2.3.4/24", "::1", "1.2.003.4")) {
-        Assert-Fails { & $deployScript -ClientIPv4Addresses $ip -ValidateOnly } "IPv4"
-    }
-    Assert-Fails { & $deployScript -ClientIPv4Addresses "1.2.3.4" -SettingsPath ".\appsettings.yaml" } "absolute"
-    Assert-Fails { & $deployScript -ClientIPv4Addresses "1.2.3.4" -SettingsPath "C:\.temp\privy-hub\appsettings.yaml" } "protected"
-    Assert-Fails { & $deployScript -ClientIPv4Addresses "1.2.3.4" -DatabaseName privy -TestDatabaseName privy } "different names"
+    Assert-Fails { & $deployScript -ClientIPv4Addresses "1.2.3.4" -ValidateOnly } "parameter"
+    Assert-Fails { & $deployScript -SettingsPath ".\appsettings.yaml" } "absolute"
+    Assert-Fails { & $deployScript -SettingsPath "C:\.temp\privy-hub\appsettings.yaml" } "protected"
+    Assert-Fails { & $deployScript -DatabaseName privy -TestDatabaseName privy } "different names"
     if ($global:PrivyInfraCalls.Count -ne 0) { throw "Invalid input reached Azure." }
 
     $global:PrivyInfraFailAzure = $true
-    Assert-Fails { & $deployScript -ClientIPv4Addresses "1.2.3.4" -ValidateOnly } "exit code 17"
+    Assert-Fails { & $deployScript -ValidateOnly } "exit code 17"
     $global:PrivyInfraFailAzure = $false
     $global:PrivyInfraCalls = @()
-    & $deployScript -ClientIPv4Addresses "1.2.3.4" -SettingsPath $production -ValidateOnly
+    & $deployScript -SettingsPath $production -ValidateOnly
     if (Test-Path -LiteralPath $production) { throw "Validation wrote settings." }
     if (@($global:PrivyInfraCalls | Where-Object { $_[2] -eq "create" }).Count) { throw "Validation deployed resources." }
 
     $global:PrivyInfraExistingServer = $true
     $global:PrivyInfraWideFirewall = $true
-    Assert-Fails { & $deployScript -ClientIPv4Addresses "1.2.3.4" } "firewall bypass"
+    Assert-Fails { & $deployScript } "firewall bypass"
     $global:PrivyInfraWideFirewall = $false
     $global:PrivyInfraCalls = @()
-    $result = & $deployScript -ClientIPv4Addresses @("1.2.3.4", "5.6.7.8") -SettingsPath $production -TestSettingsPath $test | ConvertFrom-Json
+    $result = & $deployScript -SettingsPath $production -TestSettingsPath $test | ConvertFrom-Json
     if ($result.provisioningState -ne "Succeeded") { throw "Incorrect deployment state." }
+    if ($result.firewallRule -ne "privy-allow-all" -or $result.startIpAddress -ne "0.0.0.0" -or $result.endIpAddress -ne "255.255.255.255") {
+        throw "Incorrect allow-all firewall output."
+    }
+    $global:PrivyInfraAllowAll = $true
+    & $deployScript -ValidateOnly
+    & $deployScript | ConvertFrom-Json | Out-Null
     $expected = @"
 version: 1
 storage:
@@ -110,7 +120,7 @@ storage:
             if ($call[$nameIndex + 1] -notmatch '^privy-sql-\d{14}$') { throw "Malformed deployment name." }
         }
     }
-    Assert-Fails { & $deployScript -ClientIPv4Addresses "1.2.3.4" -TestSettingsPath $test } "overwrite"
+    Assert-Fails { & $deployScript -TestSettingsPath $test } "overwrite"
     Write-Host "Infrastructure script tests passed (guards, native failures, validation, existing-server safety, settings schema, explicit subscription)."
 }
 finally {
@@ -120,5 +130,5 @@ finally {
     foreach ($directory in @((Split-Path $production), (Split-Path $test), $testRoot)) {
         if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory }
     }
-    Remove-Variable -Name PrivyInfraCalls, PrivyInfraFailAzure, PrivyInfraExistingServer, PrivyInfraWideFirewall -Scope Global
+    Remove-Variable -Name PrivyInfraCalls, PrivyInfraFailAzure, PrivyInfraExistingServer, PrivyInfraWideFirewall, PrivyInfraAllowAll -Scope Global
 }

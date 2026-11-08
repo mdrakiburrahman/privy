@@ -7,7 +7,6 @@ param administratorLogin string
 param tenantId string
 param databaseSku string
 param testDatabaseSku string
-param clientIPv4Addresses array
 
 resource server 'Microsoft.Sql/servers@2023-08-01' = {
   name: serverName
@@ -72,14 +71,14 @@ resource testDatabaseEncryption 'Microsoft.Sql/servers/databases/transparentData
   }
 }
 
-resource firewall 'Microsoft.Sql/servers/firewallRules@2023-08-01' = [for ip in clientIPv4Addresses: {
+resource firewall 'Microsoft.Sql/servers/firewallRules@2023-08-01' = {
   parent: server
-  name: 'privy-client-${replace(ip, '.', '-')}'
+  name: 'privy-allow-all'
   properties: {
-    startIpAddress: ip
-    endIpAddress: ip
+    startIpAddress: '0.0.0.0'
+    endIpAddress: '255.255.255.255'
   }
-}]
+}
 
 output serverFqdn string = server.properties.fullyQualifiedDomainName
 output serverResourceId string = server.id

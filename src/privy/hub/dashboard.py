@@ -396,6 +396,15 @@ def shell(
         f"privy {esc(str(service.version))}<br>pid {os.getpid()}<br>{esc(base_url)}<br>"
         f"up {fmt_span(now - service.started_at)}<br>rendered {local_time(now, short=True)}"
     )
+    backend = getattr(service.jobs, "backend", None)
+    if backend is not None:
+        storage = backend.status()
+        app += (
+            "<br>storage Azure SQL"
+            f"<br>pending {fmt_int(storage['pending_writes'])} · rejected {fmt_int(storage['rejected_writes'])}"
+        )
+        if storage.get("error"):
+            app += "<br>SQL delivery error; see /v1"
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex"><title>{esc(title)} · privy hub</title>

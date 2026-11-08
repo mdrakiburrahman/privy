@@ -69,6 +69,7 @@ def test_hub_serve_builds_the_runtime_and_stops_on_interrupt(tmp_path, monkeypat
 
     class FakeRuntime:
         url = "http://127.0.0.1:7748"
+        storage = None
         relays_file = tmp_path / "relays.json"
 
         def __init__(self):

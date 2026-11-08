@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import datetime as dt
+import hashlib
 import json
 import logging
 import math
@@ -94,6 +95,7 @@ class LeaseStore:
         home: Path | None = None,
         audit: AuditLog | None = None,
         clock: Callable[[], float] = time.time,
+        sql_backend: Any = None,
     ) -> None:
         self.registry, self._clock = registry, clock
         self.audit = audit or AuditLog(None)
@@ -104,6 +106,7 @@ class LeaseStore:
         self._leases: dict[str, dict[str, Any]] = {}
         self._uses: dict[str, dict[str, Any]] = {}
         self._rules: list[tuple[dict[str, Any], re.Pattern[str]]] = []
+        self.sql_backend = sql_backend
         if self.config_path is not None and not self.config_path.exists():
             _write_private(self.config_path, DEFAULT_CONFIG)
         try:
@@ -117,6 +120,29 @@ class LeaseStore:
                 self._membership()
             except LeaseError as exc:
                 raise ValueError(f"Invalid leases.yaml ({self.config_path}): {exc}") from exc
+        if sql_backend is not None:
+            from privy.hub.sql_store import SqlLeaseLock
+
+            import_path = self.state_path
+            self.state_path = None
+            sql_backend.check_config("leases", self.config)
+            sql_backend.check_config(
+                "targets",
+                {
+                    "targets": [
+                        {"id": t.id, "namespace": t.namespace, "path": t.path}
+                        for t in self.registry.snapshot().targets
+                    ]
+                },
+            )
+            self._lock = SqlLeaseLock(self, sql_backend)
+            self._clock = self._lock.now
+            if import_path is not None and import_path.exists():
+                self._import_sql_state(import_path)
+            with self._lock:
+                self._validate_state()
+                self._sweep()
+            return
         if self.state_path is not None and self.state_path.exists():
             try:
                 state = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -180,6 +206,57 @@ class LeaseStore:
                     self._uses[key] = {"at": moment, "by": {"origin": record.get("origin") or "ui"}}
             except (ValueError, TypeError, KeyError, AttributeError):
                 log.warning("Ignoring a malformed audit record while restoring lease cooldowns from %s", path)
+
+    def _import_sql_state(self, path: Path) -> None:
+        """Merge a new home's file state once, rejecting conflicting allocations."""
+        from privy.hub.sql_store import StorageError
+
+        raw = path.read_bytes()
+        try:
+            state = json.loads(raw)
+            if not isinstance(state, dict) or state.get("version") != 1:
+                raise ValueError("expected version: 1")
+            self._clients = state["clients"]
+            self._leases = state["leases"]
+            self._uses = state["last_use"]
+            self._validate_state()
+            if any(lease["running_jobs"] and lease["state"] != "active" for lease in self._leases.values()):
+                raise StorageError(
+                    "File import has released/expired pinned jobs; verify remote completion before importing"
+                )
+            imported = copy.deepcopy((self._clients, self._leases, self._uses))
+        except (ValueError, KeyError, TypeError, LeaseError) as exc:
+            raise ValueError(f"Invalid SQL import state ({path}): {exc}") from exc
+        digest = hashlib.sha256(raw).hexdigest()
+        with self._lock:
+            cursor = self._lock._local.cursor
+            cursor.execute("SELECT payload FROM dbo.privy_coordination WHERE kind='import' AND id=?", digest)
+            if cursor.fetchone():
+                return
+            for current, source in zip((self._clients, self._leases, self._uses), imported):
+                for key, payload in source.items():
+                    if key in current and current[key] != payload:
+                        raise StorageError("Local lease-state import conflicts with shared SQL records")
+                    if current is self._clients and any(
+                        payload.get("session_id")
+                        and c.get("session_id") == payload["session_id"]
+                        and c["client_id"] != key
+                        for c in current.values()
+                    ):
+                        raise StorageError("Local client session import conflicts with shared SQL clients")
+                    current[key] = payload
+            self._validate_state()
+            # File-owned pins are unresolved, not evidence that remote execution stopped.
+            for lease in self._leases.values():
+                if lease["running_jobs"]:
+                    lease.setdefault("job_owners", {}).update(
+                        (job, "unresolved-file-import") for job in lease["running_jobs"]
+                    )
+            cursor.execute(
+                "INSERT dbo.privy_coordination(kind,id,payload) VALUES('import',?,?)",
+                digest,
+                json.dumps({"version": 1}),
+            )
 
     def _validate_config(self) -> None:
         config = self.config
@@ -482,6 +559,8 @@ class LeaseStore:
             if leasable > self._clock()
             else "free"
         )
+        if self.sql_backend is not None and use.get("running_jobs") and not lease:
+            state = "unavailable"
         return {
             **copy.deepcopy(group),
             "state": state,
@@ -723,6 +802,13 @@ class LeaseStore:
                 raise LeaseError(
                     "only the holder may release this lease", status=403, code="not_lease_holder"
                 )
+            if self.sql_backend is not None and lease["running_jobs"]:
+                raise LeaseError(
+                    "running or unresolved pinned jobs must finish before SQL lease release",
+                    status=409,
+                    code="lease_pinned",
+                    details={"running_jobs": lease["running_jobs"]},
+                )
             if lease["state"] != "released":
                 lease["state"], lease["released_ts"] = "released", self._clock()
                 self._event(lease, "force_released" if force else "released")
@@ -761,6 +847,7 @@ class LeaseStore:
                 self.validate_targets(lease_id, [target])
                 lease = self._lease(lease_id)
             self._uses[key] = {
+                **self._uses.get(key, {}),
                 "at": self._clock(),
                 "by": {"lease_id": lease_id} if lease_id else {"origin": origin},
             }
@@ -783,8 +870,15 @@ class LeaseStore:
                 if job.purpose is None:
                     job.purpose = lease["purpose"]
                 lease["running_jobs"].append(job.id)
+                if self.sql_backend is not None:
+                    lease.setdefault("job_owners", {})[job.id] = self.sql_backend.owner
                 self._event(lease, "pinned", job_id=job.id, target=job.target.id)
                 self._save()
+            elif self.sql_backend is not None:
+                _, membership = self._membership()
+                key = membership[job.target.id][0]
+                use = self._uses[key]
+                use.setdefault("running_jobs", {})[job.id] = self.sql_backend.owner
 
     def job_finished(self, job: Any) -> None:
         with self._lock:
@@ -792,15 +886,36 @@ class LeaseStore:
             key = membership.get(job.target.id, (None, None))[0]
             if key is not None:
                 self._uses[key] = {
+                    **self._uses.get(key, {}),
                     "at": self._clock(),
                     "by": {"lease_id": job.lease_id} if job.lease_id else {"origin": job.origin},
                 }
             if job.lease_id:
                 lease = self._lease(job.lease_id)
+                if (
+                    self.sql_backend is not None
+                    and lease.get("job_owners", {}).get(job.id) != self.sql_backend.owner
+                ):
+                    raise LeaseError(
+                        "only the executing hub may acknowledge a job pin",
+                        code="job_owner_mismatch",
+                        status=409,
+                    )
                 if job.id in lease["running_jobs"]:
                     lease["running_jobs"].remove(job.id)
+                    if self.sql_backend is not None:
+                        lease["job_owners"].pop(job.id, None)
                     self._event(lease, "unpinned", job_id=job.id, state=job.state)
                     if lease["state"] == "active" and not lease["running_jobs"]:
                         lease["renewed_ts"] = self._clock()
                         lease["expires_ts"] = self._clock() + lease["ttl_s"]
+            elif self.sql_backend is not None and key is not None:
+                running = self._uses[key].get("running_jobs", {})
+                if running.get(job.id) != self.sql_backend.owner:
+                    raise LeaseError(
+                        "only the executing hub may acknowledge an unleased job",
+                        code="job_owner_mismatch",
+                        status=409,
+                    )
+                running.pop(job.id)
             self._save()

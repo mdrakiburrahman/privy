@@ -13,9 +13,6 @@ param(
     [string] $DatabaseSku = "S0",
     [ValidateSet("Basic", "S0")]
     [string] $TestDatabaseSku = "Basic",
-    [Parameter(Mandatory)]
-    [ValidateCount(1, 128)]
-    [string[]] $ClientIPv4Addresses,
     [string] $SettingsPath,
     [string] $TestSettingsPath,
     [switch] $ValidateOnly
@@ -87,22 +84,6 @@ Assert-IsolatedSettingsPath $TestSettingsPath
 if ($SettingsPath -and $TestSettingsPath -and [IO.Path]::GetFullPath($SettingsPath) -eq [IO.Path]::GetFullPath($TestSettingsPath)) {
     throw "Production and test settings must have different paths."
 }
-$clients = @($ClientIPv4Addresses | Sort-Object -Unique)
-foreach ($ip in $clients) {
-    $parsed = $null
-    if ($ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$' -or
-        -not [Net.IPAddress]::TryParse($ip, [ref] $parsed) -or
-        $parsed.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or $parsed.ToString() -ne $ip) {
-        throw "Invalid client IPv4 address: $ip"
-    }
-    $bytes = $parsed.GetAddressBytes()
-    if ($bytes[0] -eq 0 -or $bytes[0] -eq 10 -or $bytes[0] -eq 127 -or $bytes[0] -ge 224 -or
-        ($bytes[0] -eq 169 -and $bytes[1] -eq 254) -or
-        ($bytes[0] -eq 172 -and $bytes[1] -ge 16 -and $bytes[1] -le 31) -or
-        ($bytes[0] -eq 192 -and $bytes[1] -eq 168)) {
-        throw "Specify an individual public client IPv4 address, not a private/loopback/bypass address: $ip"
-    }
-}
 
 $account = Invoke-Azure @("account", "show")
 if ($account.user.type -ne "user") { throw "Deployment requires the signed-in user identity as Entra admin." }
@@ -136,7 +117,9 @@ if ($group.Count) {
         }
         $rules = @(Invoke-Azure @("sql", "server", "firewall-rule", "list", "--resource-group", $ResourceGroupName, "--server", $ServerName))
         foreach ($rule in $rules) {
-            if ($rule.startIpAddress -ne $rule.endIpAddress -or $rule.startIpAddress -eq "0.0.0.0") {
+            $allowAll = $rule.name -eq "privy-allow-all" -and
+                $rule.startIpAddress -eq "0.0.0.0" -and $rule.endIpAddress -eq "255.255.255.255"
+            if (-not $allowAll -and ($rule.startIpAddress -ne $rule.endIpAddress -or $rule.startIpAddress -eq "0.0.0.0")) {
                 throw "Existing target server has a range or Azure-services firewall bypass; review separately."
             }
         }
@@ -164,7 +147,6 @@ $parameters = @{
     administratorObjectId = @{value=$objectId}
     administratorLogin = @{value=$account.user.name}
     tenantId = @{value=$tenantId}
-    clientIPv4Addresses = @{value=$clients}
 }
 $parameterFile = Join-Path ([IO.Path]::GetTempPath()) ("privy-infra-" + [guid]::NewGuid() + ".json")
 try {
@@ -196,7 +178,9 @@ try {
         testDatabaseSku = $outputs.testDatabaseSku.value
         settingsPath = $SettingsPath
         testSettingsPath = $TestSettingsPath
-        allowedClientIPv4Addresses = $clients
+        firewallRule = "privy-allow-all"
+        startIpAddress = "0.0.0.0"
+        endIpAddress = "255.255.255.255"
     } | ConvertTo-Json -Depth 4
 }
 finally { Remove-Item -LiteralPath $parameterFile -Force -ErrorAction Stop }

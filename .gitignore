@@ -9,6 +9,10 @@ __pycache__/
 # Secrets
 .env
 credentials.json
+appsettings.yaml
+appsettings.*.yaml
+!appsettings.template.yaml
+sql-outbox.sqlite3*
 
 # C extensions
 *.so
@@ -151,6 +155,7 @@ celerybeat.pid
 .env
 .envrc
 .venv
+.venv-native/
 env/
 venv/
 ENV/
