@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from privy.hub.settings import SqlSettings
-from privy.hub.sql_store import AzureSqlConnections, SqlLeaseLock, StorageError
+from privy.hub.sql_store import AzureSqlConnections, SqlBackend, SqlLeaseLock, StorageError
 
 
 @pytest.fixture
