@@ -366,8 +366,9 @@ class SharedJob(HubJob):
             return self._record.get("duration_ms")
         return super().duration_ms()
 
-    def summary(self, *, include_created: bool = False) -> dict[str, Any]:
-        self.refresh()
+    def summary(self, *, include_created: bool = False, refresh: bool = True) -> dict[str, Any]:
+        if refresh:
+            self.refresh()
         result = super().summary(include_created=include_created)
         result["owner"] = self.owner
         return result
@@ -389,8 +390,9 @@ class SharedJob(HubJob):
                 position = right
         return begin, bytes(data)
 
-    def read_output(self, stream: str, offset: int, limit: int) -> dict[str, Any]:
-        self.refresh()
+    def read_output(self, stream: str, offset: int, limit: int, *, refresh: bool = True) -> dict[str, Any]:
+        if refresh:
+            self.refresh()
         done = self.state in TERMINAL_STATES
         begin, data = self._bytes(stream, offset, limit)
         total = self.buffer(stream).total
@@ -412,11 +414,13 @@ class SharedJob(HubJob):
         return self._bytes(stream, max(since, self.buffer(stream).total - max(0, limit)), limit)
 
     def read_cursor(self) -> dict[str, int]:
-        self.cursor = {stream: self.backend.advance_cursor(self.id, stream, 0) for stream in STREAMS}
+        self.cursor = self.backend.read_cursors(self.id, STREAMS)
         return dict(self.cursor)
 
-    def view(self, *, max_output_bytes: int, offsets=None, advance: bool = True) -> dict[str, Any]:
-        result = self.summary()
+    def view(
+        self, *, max_output_bytes: int, offsets=None, advance: bool = True, refresh: bool = True
+    ) -> dict[str, Any]:
+        result = self.summary(refresh=refresh)
         if self.type != "exec":
             result.update(local_path=self.spec["local_path"], remote_path=self.spec["remote_path"])
             if self.progress is not None:
@@ -429,10 +433,11 @@ class SharedJob(HubJob):
             if self.transfer is not None:
                 result["result"] = dict(self.transfer)
             return result
+        cursor_streams = [stream for stream in STREAMS if offsets is None or offsets.get(stream) is None]
+        cursors = self.backend.read_cursors(self.id, cursor_streams) if cursor_streams else {}
         for stream in STREAMS:
             explicit = None if offsets is None else offsets.get(stream)
-            # advance_cursor(..., 0) is a non-reserving atomic read.
-            start = self.backend.advance_cursor(self.id, stream, 0) if explicit is None else explicit
+            start = cursors[stream] if explicit is None else explicit
             # Unlike a bounded memory buffer, shared output has not been discarded.
             # Consume a contiguous prefix; a summary is not evidence that its
             # newest output chunks have reached SQL yet.
@@ -795,8 +800,10 @@ class SharedJobManager(JobManager):
         )
         return broadcast, [self.get(job_id) for job_id in broadcast.job_ids]
 
-    def cancel(self, job_id):
-        job = self.get(job_id)
+    def cancel(self, job_id, *, current: SharedJob | None = None):
+        if current is not None and current.id != job_id.strip():
+            raise JobLookupError(f"unknown job {job_id!r}")
+        job = current if current is not None else self.get(job_id)
         if not job.done:
             self.backend.request_cancel(job.id)
         return job

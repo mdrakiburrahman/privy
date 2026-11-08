@@ -67,6 +67,51 @@ def test_invalidated_connection_is_never_reused(connections):
     assert len(tokens) == 1
 
 
+def test_cursor_reads_are_batched_read_only_but_consumption_stays_atomic():
+    class Cursor:
+        def __init__(self):
+            self.queries = []
+            self.rows = []
+
+        def execute(self, query, *params):
+            self.queries.append((query, params))
+            if query.startswith("SELECT stream,offset"):
+                self.rows = [("stdout", 7)]
+            elif query.startswith("SELECT offset"):
+                self.rows = [(7,)]
+            else:
+                self.rows = []
+
+        def fetchall(self):
+            rows, self.rows = self.rows, []
+            return rows
+
+        def fetchone(self):
+            rows, self.rows = self.rows, []
+            return rows[0] if rows else None
+
+    cursor = Cursor()
+
+    @contextmanager
+    def transaction():
+        yield cursor
+
+    backend = SimpleNamespace(transaction=transaction)
+    assert SqlBackend.read_cursors(backend, "job-1", ("stdout", "stderr")) == {"stdout": 7, "stderr": 0}
+    select = cursor.queries[-1][0]
+    assert "stream IN (?,?)" in select and "UPDLOCK" not in select
+
+    cursor.queries.clear()
+    assert SqlBackend.advance_cursor(backend, "job-1", "stdout", 0) == 7
+    assert len(cursor.queries) == 1 and "UPDLOCK" not in cursor.queries[0][0]
+    assert not any(query.startswith("UPDATE") for query, _ in cursor.queries)
+
+    cursor.queries.clear()
+    assert SqlBackend.advance_cursor(backend, "job-1", "stdout", 12) == 7
+    assert "UPDLOCK,HOLDLOCK" in cursor.queries[0][0]
+    assert any(query.startswith("UPDATE") for query, _ in cursor.queries)
+
+
 def test_failed_lease_entry_and_rollback_does_not_strand_process_lock():
     @contextmanager
     def failed_transaction(resource):

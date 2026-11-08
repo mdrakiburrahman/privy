@@ -32,6 +32,7 @@ class Backend:
         self.events = []
         self.lock = threading.RLock()
         self.output_reads = 0
+        self.cursor_read_calls = 0
         self.query_count = 0
         self.list_calls = []
 
@@ -118,6 +119,11 @@ class Backend:
             [r for r in self.list("output", target=job_id, limit=100000) if r["index"] >= index],
             key=lambda r: r["index"],
         )[:limit]
+
+    def read_cursors(self, job_id, streams):
+        self.cursor_read_calls += 1
+        with self.lock:
+            return {stream: self.records.get(("cursor", f"{job_id}:{stream}"), 0) for stream in streams}
 
     def advance_cursor(self, job_id, stream, end):
         with self.lock:
@@ -285,6 +291,50 @@ def test_list_summaries_use_one_snapshot_without_per_job_queries(tmp_path):
         assert len([job.summary(include_created=True) for job in page]) == 200
         assert backend.query_count == queried
         assert backend.output_reads == 0
+    finally:
+        jobs.close()
+
+
+def test_shared_summary_reads_once_and_zero_wait_does_not_refresh(tmp_path):
+    hub = Hub(tmp_path)
+    backend = Backend()
+    jobs = manager(hub, backend)
+    job = start(jobs, hub)
+    try:
+        proxy = SharedJob(backend, backend.get("job", job.id))
+        before = backend.query_count
+        proxy.summary()
+        assert backend.query_count == before + 1
+        before = backend.query_count
+        jobs.wait(proxy, 0)
+        assert backend.query_count == before
+    finally:
+        jobs.close()
+
+
+def test_shared_view_batches_cursor_reads_and_output_can_reuse_job_snapshot(tmp_path):
+    hub = Hub(tmp_path)
+    backend = Backend()
+    jobs = manager(hub, backend)
+    job = HubJob(
+        job_type="exec",
+        target=hub.registry.resolve("dev/box1_windows"),
+        spec={"language": "bash", "code": "x"},
+        origin="test",
+        output_limit=100,
+    )
+    try:
+        jobs._admit(job)
+        jobs._append_output(job, "stdout", b"abcdef")
+        proxy = SharedJob(backend, backend.get("job", job.id))
+        before = backend.cursor_read_calls
+        view = proxy.view(max_output_bytes=100, advance=False, refresh=False)
+        assert view["stdout"] == "abcdef"
+        assert backend.cursor_read_calls == before + 1
+        before = backend.query_count
+        result = proxy.read_output("stdout", 0, 100, refresh=False)
+        assert result["data"] == "abcdef"
+        assert backend.query_count == before + 1
     finally:
         jobs.close()
 
@@ -562,7 +612,7 @@ def test_async_summary_does_not_move_cursor_over_uncommitted_output(tmp_path):
         proxy = SharedJob(backend, backend.get("job", job.id))
         view = proxy.view(max_output_bytes=3)
         assert view["stdout"] == "" and view["stdout_offset"] == 0
-        assert backend.records["cursor", f"{job.id}:stdout"] == 0
+        assert backend.records.get(("cursor", f"{job.id}:stdout"), 0) == 0
         pieces, index, complete = proxy.next_pieces(0, 0)
         assert pieces == [] and index == 0 and not complete
     finally:

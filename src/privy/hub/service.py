@@ -19,6 +19,7 @@ from typing import Any
 from privy.hub.config import Relay, RelaysSnapshot, Target
 from privy.hub.jobs import (
     STREAMS,
+    TERMINAL_STATES,
     TICK_S,
     Broadcast,
     HubBusyError,
@@ -40,6 +41,7 @@ from privy.hub.registry import (
     language_from,
     machine_name,
 )
+from privy.hub.shared_jobs import SharedJob
 from privy.hub.sql_store import StorageError
 from privy.hub.sync import validate_source
 from privy.transfer import TransferError
@@ -1038,8 +1040,12 @@ class HubService:
         max_output_bytes: int,
         *,
         offsets: Mapping[str, int | None] | None = None,
+        refresh: bool = True,
     ) -> dict[str, Any]:
-        view = job.view(max_output_bytes=max_output_bytes, offsets=offsets)
+        if isinstance(job, SharedJob):
+            view = job.view(max_output_bytes=max_output_bytes, offsets=offsets, refresh=refresh)
+        else:
+            view = job.view(max_output_bytes=max_output_bytes, offsets=offsets)
         if not view["done"]:
             view["next_step"] = (
                 f"Still running. Call get_job with job_id '{job.id}' (REST: GET /v1/jobs/{job.id}) for "
@@ -1227,13 +1233,15 @@ class HubService:
     ) -> dict[str, Any]:
         job, usage = self.job_usage(job_id, lease_id=lease_id, origin=origin)
         self._wait([job], wait_s, progress, prefix=False)
+        if isinstance(job, SharedJob) and wait_s > 0 and job.state not in TERMINAL_STATES:
+            job.refresh()
         offsets = None
         if stdout_offset is not None or stderr_offset is not None:
             offsets = {"stdout": stdout_offset, "stderr": stderr_offset}
         return {
             **{
                 k: v
-                for k, v in self._job_view(job, max_output_bytes, offsets=offsets).items()
+                for k, v in self._job_view(job, max_output_bytes, offsets=offsets, refresh=False).items()
                 if k != "lease_warning"
             },
             **{k: v for k, v in usage.items() if k == "lease_warning"},
@@ -1246,18 +1254,26 @@ class HubService:
         if job.type != "exec":
             raise _invalid(f"job {job_id!r} is a file transfer and has no output streams")
         return {
-            **job.read_output(stream, offset, limit),
+            **(
+                job.read_output(stream, offset, limit, refresh=False)
+                if isinstance(job, SharedJob)
+                else job.read_output(stream, offset, limit)
+            ),
             **{k: v for k, v in usage.items() if k == "lease_warning"},
         }
 
     def _op_cancel_job(self, *, origin: str, job_id: str, lease_id: str | None = None) -> dict[str, Any]:
         current = self.jobs.get(job_id)
         usage = self.leases.use(current.target.id, lease_id, origin=origin)
-        job = self.jobs.cancel(job_id)
+        job = self.jobs.cancel(job_id, current=current)
         self.jobs.wait(job, CANCEL_SETTLE_S)
+        if isinstance(job, SharedJob) and job.state not in TERMINAL_STATES:
+            job.refresh()
         return {
             **{
-                k: v for k, v in self._job_view(job, DEFAULT_MAX_OUTPUT_BYTES).items() if k != "lease_warning"
+                k: v
+                for k, v in self._job_view(job, DEFAULT_MAX_OUTPUT_BYTES, refresh=False).items()
+                if k != "lease_warning"
             },
             **{k: v for k, v in usage.items() if k == "lease_warning"},
         }

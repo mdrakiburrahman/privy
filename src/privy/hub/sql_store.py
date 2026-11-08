@@ -1252,6 +1252,23 @@ class SqlBackend:
             )
             return [json.loads(row[0]) for row in cursor.fetchall()]
 
+    def read_cursors(self, job_id: str, streams) -> dict[str, int]:
+        selected = tuple(dict.fromkeys(streams))
+        if any(stream not in ("stdout", "stderr") for stream in selected):
+            raise ValueError("cursor streams must be stdout or stderr")
+        offsets = dict.fromkeys(selected, 0)
+        if not selected:
+            return offsets
+        placeholders = ",".join("?" for _ in selected)
+        with self.transaction() as cursor:
+            cursor.execute(
+                f"SELECT stream,offset FROM dbo.privy_cursors WHERE job_id=? AND stream IN ({placeholders})",
+                job_id,
+                *selected,
+            )
+            offsets.update({str(row[0]): int(row[1]) for row in cursor.fetchall()})
+        return offsets
+
     def pieces(self, job_id: str, index: int, limit: int = 200) -> list[dict]:
         with self.transaction() as cursor:
             cursor.execute(
@@ -1263,6 +1280,15 @@ class SqlBackend:
             return [json.loads(row[0]) for row in cursor.fetchall()]
 
     def advance_cursor(self, job_id: str, stream: str, end: int) -> int:
+        if end == 0:
+            with self.transaction() as cursor:
+                cursor.execute(
+                    "SELECT offset FROM dbo.privy_cursors WHERE job_id=? AND stream=?",
+                    job_id,
+                    stream,
+                )
+                row = cursor.fetchone()
+                return int(row[0]) if row else 0
         with self.transaction() as cursor:
             cursor.execute(
                 "SELECT offset FROM dbo.privy_cursors WITH(UPDLOCK,HOLDLOCK) WHERE job_id=? AND stream=?",
