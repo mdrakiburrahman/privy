@@ -501,29 +501,11 @@ class SqlBackend:
         with self.transaction("privy.leases") as cursor:
             cursor.execute("SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id=?", name)
             row = cursor.fetchone()
-            if row:
-                stored = json.loads(row[0])
-                if stored != payload:
-                    compatible = False
-                    if name == "leases":
-                        from privy.hub.leases import effective_lease_config
-
-                        try:
-                            compatible = effective_lease_config(stored) == payload
-                        except (KeyError, TypeError, ValueError):
-                            compatible = False
-                    if not compatible:
-                        raise StorageError(
-                            f"Shared hub {name} configuration differs; refusing independent coordination"
-                        )
-                    cursor.execute(
-                        "UPDATE dbo.privy_coordination SET payload=?, updated=SYSUTCDATETIME() "
-                        "WHERE kind='config' AND id=?",
-                        json.dumps(payload, sort_keys=True),
-                        name,
-                    )
-                    log.info("Normalized equivalent legacy shared leases configuration in Azure SQL")
-            else:
+            if row and json.loads(row[0]) != payload:
+                raise StorageError(
+                    f"Shared hub {name} configuration differs; refusing independent coordination"
+                )
+            if not row:
                 cursor.execute(
                     "INSERT dbo.privy_coordination(kind,id,payload) VALUES('config',?,?)",
                     name,
