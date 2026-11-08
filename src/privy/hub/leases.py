@@ -521,12 +521,22 @@ class LeaseStore:
             return {**self._client_view(client), "created": True}
 
     def list_clients(self, active: bool = False) -> list[dict[str, Any]]:
+        if getattr(self.sql_backend, "read_model", None) is not None:
+            with self._lock.read_snapshot() as snapshot:
+                views = [self._client_view(c, snapshot=snapshot) for c in snapshot["clients"].values()]
+                return [v for v in views if v["leases"]] if active else views
         with self._lock:
             self._sweep()
             views = [self._client_view(c) for c in self._clients.values()]
             return [v for v in views if v["leases"]] if active else views
 
     def get_client(self, client_id: str) -> dict[str, Any]:
+        if getattr(self.sql_backend, "read_model", None) is not None:
+            with self._lock.read_snapshot() as snapshot:
+                client = snapshot["clients"].get(client_id)
+                if client is None:
+                    raise LeaseError(f"unknown client {client_id!r}", status=404, code="unknown_client")
+                return self._client_view(client, snapshot=snapshot)
         with self._lock:
             self._sweep()
             return self._client_view(self._client(client_id))
@@ -832,6 +842,17 @@ class LeaseStore:
         filters = [label] if isinstance(label, str) else list(label or [])
         if any("=" not in item or not item.split("=", 1)[0] for item in filters):
             raise LeaseError("label filters must be key=value")
+        if getattr(self.sql_backend, "read_model", None) is not None:
+            with self._lock.read_snapshot() as snapshot:
+                self._expire_read_snapshot(snapshot)
+                return [
+                    self._view(item, snapshot=snapshot)
+                    for item in snapshot["leases"].values()
+                    if (not client_id or item["client_id"] == client_id)
+                    and (not group or item["group"] == group)
+                    and (state == "all" or item["state"] == state)
+                    and all(item["labels"].get(k) == v for k, v in (f.split("=", 1) for f in filters))
+                ]
         with self._lock:
             self._sweep()
             return [
@@ -844,9 +865,27 @@ class LeaseStore:
             ]
 
     def get_lease(self, lease_id: str) -> dict[str, Any]:
+        if getattr(self.sql_backend, "read_model", None) is not None:
+            with self._lock.read_snapshot() as snapshot:
+                self._expire_read_snapshot(snapshot)
+                lease = snapshot["leases"].get(lease_id)
+                if lease is None:
+                    raise LeaseError(f"unknown lease {lease_id!r}", status=404, code="unknown_lease")
+                return self._view(lease, snapshot=snapshot)
         with self._lock:
             self._sweep()
             return self._view(self._lease(lease_id))
+
+    @staticmethod
+    def _expire_read_snapshot(snapshot):
+        for lease in snapshot["leases"].values():
+            if (
+                lease["state"] == "active"
+                and not lease["running_jobs"]
+                and lease["expires_ts"] <= snapshot["now"]
+            ):
+                lease["state"] = "expired"
+                lease["expired_ts"] = lease["expires_ts"]
 
     def _renew(self, lease: dict[str, Any]) -> None:
         if lease["state"] == "released":
@@ -985,6 +1024,46 @@ class LeaseStore:
                 self._event(active, "warning", target=target, origin=origin)
             self._save()
             return result
+
+    def read_use(self, target: str, lease_id: str | None = None, *, origin: str = "rest") -> dict[str, Any]:
+        """Advisory read accounting; renewal and warning events flush off-thread."""
+        model = getattr(self.sql_backend, "read_model", None)
+        if model is None:
+            return self.use(target, lease_id, origin=origin)
+        with self._lock.read_snapshot() as snapshot:
+            _, membership = self._membership()
+            key, _ = membership[target]
+            lease = snapshot["leases"].get(lease_id) if lease_id else None
+            if lease_id:
+                if lease is None:
+                    raise LeaseError(f"unknown lease {lease_id!r}", status=404, code="unknown_lease")
+                if lease["state"] == "released":
+                    raise LeaseError("lease was released", status=409, code="lease_released")
+                latest = next(
+                    (item for item in reversed(snapshot["leases"].values()) if item["group"] == key), None
+                )
+                if latest is not None and latest["lease_id"] != lease_id:
+                    raise LeaseError("this lease was superseded", status=409, code="lease_lost")
+                if lease["group"] != key or target not in lease["members"].values():
+                    raise LeaseError(
+                        "target is outside this lease's group", status=409, code="target_not_in_lease"
+                    )
+            result = {"purpose": lease["purpose"] if lease else None}
+            active = next(
+                (
+                    item
+                    for item in snapshot["leases"].values()
+                    if item["group"] == key
+                    and item["state"] == "active"
+                    and (item["running_jobs"] or item["expires_ts"] > snapshot["now"])
+                ),
+                None,
+            )
+            if active and not lease_id:
+                view = self._view(active, snapshot=snapshot)
+                result["lease_warning"] = {k: view[k] for k in ("lease_id", "group", "holder", "expires_at")}
+        model.defer_use(self, target, lease_id, origin)
+        return result
 
     def job_started(self, job: Any) -> None:
         with self._lock:

@@ -1,0 +1,364 @@
+import contextlib
+import copy
+import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+
+import pytest
+
+from privy.hub.leases import LeaseError, LeaseStore
+from privy.hub.read_model import BackgroundReads, SqlReadModel
+from privy.hub.sql_store import DurableOutbox, SqlBackend, StorageError
+
+
+class Backend:
+    owner = "hub-a"
+
+    def __init__(self):
+        self.records = {}
+        self.pending = set()
+        self.outbox = SimpleNamespace(pending_keys=lambda: self.pending)
+        self.chunks = []
+        self.sql_reads = 0
+        self.cursors = {"stdout": 0, "stderr": 0}
+        self.claims = 0
+
+    def read_changes(self, version):
+        self.sql_reads += 1
+        return version, [(kind, key, copy.deepcopy(row)) for (kind, key), row in self.records.items()], True
+
+    def read_record_keys(self):
+        self.sql_reads += 1
+        return set(self.records)
+
+    def get(self, kind, key):
+        self.sql_reads += 1
+        return copy.deepcopy(self.records.get((kind, key)))
+
+    def get_many(self, kind, keys):
+        self.sql_reads += 1
+        return {key: copy.deepcopy(self.records[kind, key]) for key in keys if (kind, key) in self.records}
+
+    def read_output_snapshot(self, job_id):
+        self.sql_reads += 1
+        return copy.deepcopy(self.chunks)
+
+    def output(self, job_id, stream, offset, limit):
+        self.sql_reads += 1
+        return [{"stream": stream, "start": offset, "end": offset + limit, "data": "earlier"}]
+
+    def read_cursors(self, job_id, streams):
+        self.sql_reads += 1
+        return {stream: self.cursors[stream] for stream in streams}
+
+    def advance_cursors(self, job_id, ends):
+        self.claims += 1
+        previous = {stream: self.cursors[stream] for stream in ends}
+        for stream, end in ends.items():
+            self.cursors[stream] = max(end, self.cursors[stream])
+        return previous
+
+
+@pytest.fixture
+def model():
+    value = SqlReadModel(Backend(), start=False)
+    # Disable periodic refresh so foreground round-trip assertions are exact.
+    value.reads.interval = 3600
+    yield value
+    value.close()
+
+
+def job(state="running", **kwargs):
+    return {"job_id": "j", "created_at": 1, "target": "box", "state": state, **kwargs}
+
+
+def test_warm_metadata_reads_and_counts_do_not_acquire_sql(model):
+    model.backend.records = {("job", "j"): job(lease_id="lease")}
+    model.refresh_once()
+    reads = model.backend.sql_reads
+    assert model.get("job", "j")["state"] == "running"
+    assert model.get_many("job", ["j", "missing"]) == {"j": job(lease_id="lease")}
+    assert model.list("job", target="BOX")[0]["job_id"] == "j"
+    assert model.count_jobs() == {"running": 1, "queued": 0, "retained": 1}
+    assert model.count_jobs_by_target() == {"box": 1}
+    assert model.count_jobs_by_lease() == {"lease": 1}
+    assert model.count_job_records(states={"running"}) == 1
+    assert model.backend.sql_reads == reads
+    model.get("job", "j")["state"] = "corrupted"
+    assert model.get("job", "j")["state"] == "running"
+
+
+def test_startup_listener_batch_does_not_fan_out_per_target(model):
+    model.backend.records = {("listener", str(i)): {"info": i} for i in range(60)}
+    assert len(model.get_many("listener", [str(i) for i in range(60)])) == 60
+    assert model.backend.sql_reads == 1
+
+
+def test_refresh_observes_remote_changes_and_old_writer_deletions(model):
+    model.backend.records = {("job", "j"): job()}
+    model.refresh_once()
+    model.backend.records["job", "j"] = job("completed")
+    model.refresh_once()
+    assert model.get("job", "j")["state"] == "completed"
+    del model.backend.records["job", "j"]
+    model.refresh_once()
+    assert model.get("job", "j") is None
+    assert model.count_jobs()["retained"] == 0
+
+
+def test_pending_local_write_survives_old_snapshot_but_not_later_remote_writer(model):
+    model.backend.records = {("job", "j"): job("queued")}
+    model.backend.pending.add(("job", "j"))
+    model.apply("job", "j", job("running"))
+    assert model.get("job", "j")["state"] == "running"  # Even during startup.
+    model.refresh_once()
+    assert model.get("job", "j")["state"] == "running"
+    model.backend.pending.clear()
+    # The own-write version can be superseded before hydration ever sees it.
+    model.backend.records["job", "j"] = job("completed")
+    model.refresh_once()
+    assert model.get("job", "j")["state"] == "completed"
+    assert not model._pending
+
+
+def test_raw_probe_history_is_not_retained(model):
+    model.apply("probe", "probe", {"data": "large"})
+    model.apply("call", "call", {"data": "large"})
+    assert not model._records
+
+
+def test_stale_metadata_fails_explicitly(model):
+    model.refresh_once()
+    model._updated = time.monotonic() - 5
+    with pytest.raises(StorageError, match="stale"):
+        model.get("job", "missing")
+
+
+def test_progressive_startup_serves_exact_record_before_full_hydration():
+    entered, release = threading.Event(), threading.Event()
+    backend = Backend()
+    backend.records["job", "j"] = job()
+    original = backend.read_changes
+
+    def slow_hydration(version):
+        entered.set()
+        assert release.wait(2)
+        return original(version)
+
+    backend.read_changes = slow_hydration
+    model = SqlReadModel(backend)
+    try:
+        assert entered.wait(1)
+        assert model.get("job", "j")["state"] == "running"
+        assert not model._ready.is_set()
+    finally:
+        release.set()
+        model.close()
+
+
+def test_periodic_refresh_converges_within_five_seconds():
+    backend = Backend()
+    backend.records["job", "j"] = job()
+    model = SqlReadModel(backend)
+    try:
+        assert model._ready.wait(2)
+        backend.records["job", "j"] = job("completed")
+        deadline = time.monotonic() + 5
+        while model.get("job", "j")["state"] != "completed" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert model.get("job", "j")["state"] == "completed"
+        assert time.monotonic() < deadline
+    finally:
+        model.close()
+
+
+def test_warm_explicit_output_is_sql_free_but_cursor_claims_stay_authoritative(model):
+    model.backend.chunks = [{"index": 0, "stream": "stdout", "start": 0, "end": 4, "data": "YWJjZA=="}]
+    ranges = {"stdout": (0, 4, 4), "stderr": (0, 0, 4)}
+    offsets, chunks = model.read_view_output("j", ranges)
+    reads = model.backend.sql_reads
+    assert offsets == {"stdout": 0, "stderr": 0}
+    assert chunks["stdout"][0]["end"] == 4
+    model.read_view_output("j", ranges)
+    assert model.backend.sql_reads == reads
+    model.read_view_output("j", {"stdout": (None, 4, 4)})
+    assert model.backend.sql_reads == reads + 1
+    assert model.advance_cursors("j", {"stdout": 4}) == {"stdout": 0}
+    assert model.advance_cursors("j", {"stdout": 2}) == {"stdout": 4}
+    assert model.backend.cursors["stdout"] == 4
+
+
+def test_truncated_output_tail_fetches_earlier_range_instead_of_inventing_gap(model):
+    model.backend.chunks = [{"index": 10, "stream": "stdout", "start": 100, "end": 104, "data": "YWJjZA=="}]
+    assert model.output("j", "stdout", 0, 4)[0]["data"] == "earlier"
+    reads = model.backend.sql_reads
+    assert model.output("j", "stdout", 100, 4)[0]["end"] == 104
+    assert model.backend.sql_reads == reads
+
+
+def test_cold_reads_coalesce_parallel_requests():
+    entered, release = threading.Event(), threading.Event()
+    count = 0
+
+    def load():
+        nonlocal count
+        count += 1
+        entered.set()
+        assert release.wait(2)
+        return {"answer": 42}
+
+    cache = BackgroundReads(interval=3600)
+    try:
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            futures = [workers.submit(cache.get, ("report",), load) for _ in range(4)]
+            assert entered.wait(1)
+            release.set()
+            assert all(f.result()["answer"] == 42 for f in futures)
+        assert count == 1
+    finally:
+        cache.close()
+
+
+def test_local_commit_publication_cannot_be_overwritten_by_older_inflight_read():
+    entered, release = threading.Event(), threading.Event()
+    cache = BackgroundReads(interval=3600)
+
+    def old_load():
+        entered.set()
+        assert release.wait(2)
+        return {"lease": "old"}
+
+    try:
+        cache.get(("coordination",), old_load, wait=False)
+        assert entered.wait(1)
+        cache.publish(("coordination",), {"lease": "new"}, lambda: {"lease": "new"})
+        release.set()
+        cache._reads[("coordination",)].future.result()
+        assert cache.get(("coordination",), old_load) == {"lease": "new"}
+    finally:
+        release.set()
+        cache.close()
+
+
+def test_failed_refresh_does_not_return_expired_success(caplog):
+    now = [0]
+    cache = BackgroundReads(interval=3600, clock=lambda: now[0])
+
+    def fail():
+        raise RuntimeError("database unavailable")
+
+    try:
+        assert cache.get(("report",), lambda: {"ok": True}) == {"ok": True}
+        now[0] = 5
+        with pytest.raises(StorageError, match="refresh failed"):
+            cache.get(("report",), fail)
+        assert "Background SQL read refresh failed" in caplog.text
+    finally:
+        cache.close()
+
+
+def test_deferred_accounting_runs_once_not_forever(model):
+    delivered = threading.Event()
+    calls = []
+
+    def use(target, lease_id, *, origin):
+        calls.append((target, lease_id, origin))
+        delivered.set()
+
+    model.defer_use(SimpleNamespace(use=use), "box", "lease", "rest")
+    assert delivered.wait(2)
+    time.sleep(0.35)
+    assert calls == [("box", "lease", "rest")]
+
+
+def test_outbox_pending_keys_are_not_limited_to_one_flush_batch(tmp_path):
+    outbox = DurableOutbox(tmp_path / "pending.sqlite", max_bytes=1024 * 1024)
+    try:
+        sequences = [outbox.append("job", str(i), job(), "hub-a") for i in range(501)]
+        assert len(outbox.pending_keys()) == 501
+        outbox.ack_batch(sequences)
+        assert outbox.pending_keys() == set()
+    finally:
+        outbox.close()
+
+
+def test_change_watermark_stops_before_uncommitted_transaction():
+    cursor = SimpleNamespace()
+    executes = []
+    cursor.execute = lambda *args: executes.append(args)
+    cursor.fetchone = lambda: ((12).to_bytes(8, "big"),)
+    cursor.fetchall = lambda: [(bytes(8), "job", "j", json.dumps(job()))]
+    backend = object.__new__(SqlBackend)
+
+    @contextlib.contextmanager
+    def transaction():
+        yield cursor
+
+    backend.transaction = transaction
+    watermark, rows, complete = backend.read_changes(bytes(8))
+    assert complete and int.from_bytes(watermark, "big") == 11
+    assert rows[0][:2] == ("job", "j")
+    assert executes[0] == ("SELECT MIN_ACTIVE_ROWVERSION()",)
+    assert "change_version<?" in executes[1][0]
+    assert executes[1][-1] == (12).to_bytes(8, "big")
+
+
+def advisory_store():
+    calls = []
+    lease = {
+        "lease_id": "lease",
+        "group": "group",
+        "client_id": "client",
+        "holder_name": "holder",
+        "purpose": "work",
+        "state": "active",
+        "members": {"windows": "box"},
+        "running_jobs": [],
+        "expires_ts": 100,
+        "acquired_ts": 1,
+        "renewed_ts": 1,
+        "labels": {},
+    }
+    snapshot = {"now": 10, "leases": {"lease": lease}, "clients": {}, "uses": {}}
+
+    @contextlib.contextmanager
+    def read_snapshot():
+        yield copy.deepcopy(snapshot)
+
+    store = object.__new__(LeaseStore)
+    store.sql_backend = SimpleNamespace(
+        read_model=SimpleNamespace(defer_use=lambda *args: calls.append(args))
+    )
+    store._lock = SimpleNamespace(read_snapshot=read_snapshot)
+    store._membership = lambda: ({}, {"box": ("group", "windows")})
+    return store, snapshot, calls
+
+
+def test_read_accounting_returns_warning_without_entering_authoritative_lock():
+    store, _, calls = advisory_store()
+    assert store.read_use("box", "lease") == {"purpose": "work"}
+    assert len(calls) == 1
+    assert store.read_use("box")["lease_warning"]["lease_id"] == "lease"
+
+
+@pytest.mark.parametrize("state,code", [("released", "lease_released"), ("superseded", "lease_lost")])
+def test_known_released_or_superseded_lease_is_rejected_before_deferred_use(state, code):
+    store, snapshot, calls = advisory_store()
+    if state == "released":
+        snapshot["leases"]["lease"]["state"] = "released"
+    else:
+        snapshot["leases"]["new"] = {**snapshot["leases"]["lease"], "lease_id": "new"}
+    with pytest.raises(LeaseError) as error:
+        store.read_use("box", "lease")
+    assert error.value.code == code
+    assert not calls
+
+
+def test_expired_lease_view_does_not_mutate_authoritative_snapshot():
+    store, snapshot, _ = advisory_store()
+    snapshot["now"] = 101
+    assert store.list_leases(state="active") == []
+    assert store.get_lease("lease")["state"] == "expired"
+    assert snapshot["leases"]["lease"]["state"] == "active"

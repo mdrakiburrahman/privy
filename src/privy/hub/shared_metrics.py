@@ -129,11 +129,25 @@ class _SharedPurposes:
 
 
 class SharedMetrics(HubMetrics):
-    def __init__(self, backend: Any, registry=None, *, clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self, backend: Any, registry=None, *, clock: Callable[[], float] = time.time, max_running=0
+    ) -> None:
         super().__init__(clock=clock)
         self.backend = backend
         self.registry = registry
         self.purposes = _SharedPurposes(backend, clock)
+        self.max_running = max_running
+        reads = getattr(backend, "reads", None)
+        if reads is not None and registry is not None:
+            for range_name in (DEFAULT_RANGE, "1h", "7d", "30d", "all"):
+                selection = ReportSelection(range_name)
+                reads.get(
+                    ("report", selection, (("max_running", max_running),)),
+                    lambda selection=selection: self._report(
+                        registry.snapshot().targets, {}, selection=selection, max_running=max_running
+                    ),
+                    wait=False,
+                )
 
     def job_added(self, job: HubJob) -> None:
         # The manager writes admission after all callbacks (including lease pinning).
@@ -251,6 +265,21 @@ class SharedMetrics(HubMetrics):
         )
 
     def report(self, targets, probes, **kwargs):
+        reads = getattr(self.backend, "reads", None)
+        if reads is None:
+            return self._report(targets, probes, **kwargs)
+        selection = kwargs.get("selection") or ReportSelection(kwargs.get("range_name", DEFAULT_RANGE))
+        options = {k: v for k, v in kwargs.items() if k not in ("range_name", "selection")}
+        options.setdefault("max_running", self.max_running)
+        key = ("report", selection, tuple(sorted(options.items())))
+
+        def build():
+            current_targets = self.registry.snapshot().targets if self.registry is not None else targets
+            return self._report(current_targets, probes, selection=selection, **options)
+
+        return reads.get(key, build)
+
+    def _report(self, targets, probes, **kwargs):
         profile_started = time.perf_counter()
         profile = os.environ.get("PRIVY_SQL_PROFILE") == "1"
         snapshot = HubMetrics(clock=self._clock)

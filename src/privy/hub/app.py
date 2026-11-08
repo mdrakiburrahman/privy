@@ -404,16 +404,19 @@ def build_hub(
         leases = LeaseStore(registry, home=home, audit=jobs.audit)
         listener_infos = ListenerInfoStore(home)
     else:
+        from privy.hub.read_model import SqlReadModel
         from privy.hub.shared_jobs import SharedAuditLog, SharedJobManager
         from privy.hub.sql_store import SqlBackend
 
         storage = SqlBackend(sql_settings, home, connect=sql_connect)
         try:
+            if callable(getattr(storage, "read_changes", None)):
+                storage.read_model = SqlReadModel(storage)
             jobs = SharedJobManager(
                 registry, backend=storage, max_running=max_jobs, audit=SharedAuditLog(storage)
             )
             leases = LeaseStore(registry, home=home, audit=jobs.audit, sql_backend=storage)
-            listener_infos = ListenerInfoStore(home, backend=storage)
+            listener_infos = ListenerInfoStore(home, backend=getattr(storage, "read_model", storage))
         except BaseException:
             storage.close()
             raise
@@ -429,7 +432,9 @@ def build_hub(
     else:
         from privy.hub.shared_metrics import SharedHubMetrics
 
-        service.metrics = SharedHubMetrics(storage, registry)
+        service.metrics = SharedHubMetrics(
+            getattr(storage, "read_model", storage), registry, max_running=jobs.max_running
+        )
     app = HubApp(service, port=port)
     try:
         server = HubHTTPServer((host, port), app)
