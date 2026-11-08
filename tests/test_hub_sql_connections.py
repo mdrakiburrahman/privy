@@ -1,3 +1,4 @@
+import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -91,6 +92,69 @@ def test_failed_lease_entry_and_rollback_does_not_strand_process_lock():
 
     with ThreadPoolExecutor(1) as pool:
         assert pool.submit(another_thread).result(timeout=2)
+
+
+def test_lease_lock_loads_snapshot_with_one_batched_read():
+    target = SimpleNamespace(id="dev/box_windows", namespace="dev", path="/tmp/box")
+    target_config = {"targets": [{"id": target.id, "namespace": target.namespace, "path": target.path}]}
+    client = {"client_id": "client-1"}
+    lease = {"lease_id": "lease-1", "group": "dev/box", "state": "active"}
+    use = {"at": 1.0, "by": "client-1"}
+
+    class Cursor:
+        def __init__(self):
+            self.result_sets = [
+                [(1_800_000_000.25,)],
+                [(json.dumps(target_config),)],
+                [
+                    ("client", "client-1", json.dumps(client)),
+                    ("lease", "lease-1", json.dumps(lease)),
+                    ("use", "dev/box", json.dumps(use)),
+                ],
+            ]
+            self.result_set_index = 0
+            self.queries = []
+
+        def execute(self, query, *params):
+            self.queries.append((query, params))
+
+        def fetchone(self):
+            rows = self.result_sets[self.result_set_index]
+            return rows[0] if rows else None
+
+        def fetchall(self):
+            return self.result_sets[self.result_set_index]
+
+        def nextset(self):
+            self.result_set_index += 1
+            return self.result_set_index < len(self.result_sets)
+
+    cursor = Cursor()
+
+    @contextmanager
+    def transaction(resource):
+        assert resource == "privy.leases"
+        yield cursor
+
+    store = SimpleNamespace(
+        registry=SimpleNamespace(snapshot=lambda: SimpleNamespace(targets=[target])),
+        _clients={},
+        _leases={},
+        _uses={},
+    )
+    backend = SimpleNamespace(transaction=transaction, assert_owner_active=lambda _cursor: None)
+    lock = SqlLeaseLock(store, backend)
+
+    with lock:
+        assert lock.now() == 1_800_000_000.25
+
+    assert len(cursor.queries) == 1
+    query, params = cursor.queries[0]
+    assert params == ()
+    assert query.count(";") == 2
+    assert store._clients == {"client-1": client}
+    assert store._leases == {"lease-1": lease}
+    assert store._uses == {"dev/box": use}
 
 
 def test_transaction_closes_cursor_before_returning_connection():

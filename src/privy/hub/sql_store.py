@@ -1511,9 +1511,16 @@ class SqlLeaseLock:
             assert_active = getattr(self.backend, "assert_owner_active", None)
             if assert_active is not None:
                 assert_active(cursor)
-            cursor.execute("SELECT DATEDIFF_BIG(millisecond,'1970-01-01',SYSUTCDATETIME())/1000.0")
-            self._local.now = float(cursor.fetchone()[0])
-            cursor.execute("SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id='targets'")
+            cursor.execute(
+                "SELECT DATEDIFF_BIG(millisecond,'1970-01-01',SYSUTCDATETIME())/1000.0;"
+                "SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id='targets';"
+                "SELECT kind,id,payload FROM dbo.privy_coordination "
+                "WHERE kind IN('client','lease','use') ORDER BY ordinal"
+            )
+            now_row = cursor.fetchone()
+            if now_row is None or not cursor.nextset():
+                raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
+            self._local.now = float(now_row[0])
             row = cursor.fetchone()
             targets = {
                 "targets": [
@@ -1525,12 +1532,13 @@ class SqlLeaseLock:
                 raise StorageError(
                     "Local target configuration changed or differs from shared SQL configuration"
                 )
-            cursor.execute(
-                "SELECT kind,id,payload FROM dbo.privy_coordination WHERE kind IN('client','lease','use') ORDER BY ordinal"
-            )
+            if not cursor.nextset():
+                raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
             state = {"client": {}, "lease": {}, "use": {}}
             for kind, key, raw in cursor.fetchall():
                 state[kind][key] = json.loads(raw)
+            if cursor.nextset():
+                raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
             self.store._clients, self.store._leases, self.store._uses = (
                 state["client"],
                 state["lease"],
