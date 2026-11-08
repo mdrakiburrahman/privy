@@ -74,7 +74,7 @@ class SimulatedListener:
         return None
 
 
-def main() -> None:
+def main(*, connections_factory=TestConnections) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--home", required=True, type=Path)
     parser.add_argument("--settings", required=True, type=Path)
@@ -101,7 +101,7 @@ def main() -> None:
     settings = load_settings(args.home, args.settings)
     if settings is None or not settings.database.endswith("_test"):
         parser.error("an explicitly isolated *_test database is required")
-    connections = TestConnections(settings)
+    connections = connections_factory(settings)
     runtime = build_hub(
         home=args.home,
         settings_file=args.settings,

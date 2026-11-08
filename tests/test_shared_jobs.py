@@ -1116,6 +1116,17 @@ class ProcessBackend(Backend):
         return self.status()
 
 
+class ProcessConnections:
+    def __init__(self, settings):
+        self.unavailable = threading.Event()
+
+    def __call__(self):
+        raise AssertionError("fake backend must not open a SQL connection")
+
+    def close(self):
+        pass
+
+
 class ProcessCursor:
     def __init__(self, backend):
         self.backend = backend
@@ -1152,7 +1163,8 @@ class ProcessCursor:
         return self.rows
 
 
-def test_sql_process_harness_starts_and_serves_with_fake_backend():
+@pytest.mark.parametrize("missing_dependency", ["sql_modules", "odbc_driver"])
+def test_sql_process_harness_starts_and_serves_with_fake_backend(missing_dependency):
     import requests
 
     root = pathlib.Path(__file__).resolve().parents[1]
@@ -1163,11 +1175,19 @@ def test_sql_process_harness_starts_and_serves_with_fake_backend():
         "version: 1\nstorage: {mode: azure_sql, server: simulated.invalid, database: privy_test}\n",
         encoding="utf-8",
     )
+    unavailable = (
+        "sys.modules['pyodbc']=None; sys.modules['azure.identity']=None; "
+        if missing_dependency == "sql_modules"
+        else "import types; sys.modules['pyodbc']=types.SimpleNamespace(drivers=lambda: []); "
+    )
     script = (
         "import runpy,sys; from pathlib import Path; "
         "sys.path[:0]=[str(Path.cwd()/'tests'),str(Path.cwd()/'src')]; "
-        "from test_shared_jobs import ProcessBackend; import privy.hub.sql_store as sql; "
-        "sql.SqlBackend=ProcessBackend; runpy.run_path(str(Path.cwd()/'tests'/'sql_hub_process.py'),run_name='__main__')"
+        + unavailable
+        + "from test_shared_jobs import ProcessBackend,ProcessConnections; import privy.hub.sql_store as sql; "
+        "sql.SqlBackend=ProcessBackend; "
+        "harness=runpy.run_path(str(Path.cwd()/'tests'/'sql_hub_process.py')); "
+        "harness['main'](connections_factory=ProcessConnections)"
     )
     process = subprocess.Popen(
         [sys.executable, "-u", "-c", script, "--home", str(home), "--settings", str(settings), "--port", "0"],
