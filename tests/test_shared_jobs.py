@@ -903,6 +903,135 @@ def test_audit_import_marks_only_after_durable_flush_and_retries(tmp_path):
         jobs.close()
 
 
+def test_audit_import_resume_skips_already_delivered_audit_rows(tmp_path):
+    hub = Hub(tmp_path)
+    backend = Backend()
+    jobs = manager(hub, backend)
+    now = time.time()
+    path = audit_fixture(
+        tmp_path / "legacy.jsonl",
+        [
+            {
+                "ts": utc_iso(now - 1),
+                "event": "job.start",
+                "job_id": "resume",
+                "target": "dev/box1_windows",
+                "type": "exec",
+            },
+            {"ts": utc_iso(now), "event": "job.finish", "job_id": "resume", "state": SUCCEEDED},
+        ],
+    )
+    backend.flush = lambda timeout=10: False
+    try:
+        with pytest.raises(StorageError, match="durable delivery"):
+            jobs.import_audit(path, now=now)
+        delivered = list(backend.events)
+        assert len(delivered) == 3
+        backend.flush = lambda timeout=10: True
+        assert jobs.import_audit(path, now=now) == 0
+        assert backend.events[:-1] == delivered
+        assert backend.events[-1][0] == "import"
+    finally:
+        jobs.close()
+
+
+class BulkImportBackend(Backend):
+    def __init__(self):
+        super().__init__()
+        self.batches = []
+        self.fail_after = None
+
+    def existing(self, kind, keys):
+        return {key for key in keys if (kind, key) in self.records}
+
+    def import_records(self, records):
+        if self.fail_after is not None and len(self.batches) >= self.fail_after:
+            raise StorageError("interrupted SQL batch")
+        self.batches.append(copy.deepcopy(records))
+        inserted = set()
+        for kind, key, payload in records:
+            if (kind, key) not in self.records:
+                self.put(kind, key, payload)
+                inserted.add((kind, key))
+        return inserted
+
+    def enqueue(self, kind, key, payload):
+        pytest.fail("bulk import must not enqueue on the interactive delivery journal")
+
+
+def test_audit_bulk_import_resumes_committed_batches_and_marker_is_last(tmp_path):
+    hub = Hub(tmp_path)
+    backend = BulkImportBackend()
+    jobs = manager(hub, backend)
+    now = time.time()
+    path = audit_fixture(
+        tmp_path / "legacy.jsonl",
+        [
+            {
+                "ts": utc_iso(now - 1),
+                "event": "job.start",
+                "job_id": f"job-{i}",
+                "target": "dev/box1_windows",
+                "type": "exec",
+            }
+            for i in range(600)
+        ],
+    )
+    backend.fail_after = 1
+    try:
+        with pytest.raises(StorageError, match="interrupted SQL batch"):
+            jobs.import_audit(path, now=now)
+        committed = set(backend.records)
+        assert len(committed) == 500 and backend.list("import") == []
+        backend.fail_after = None
+        assert jobs.import_audit(path, now=now) == 350
+        resumed = backend.batches[1:]
+        assert all(len(batch) <= 500 for batch in resumed)
+        assert not any((kind, key) in committed for batch in resumed for kind, key, _ in batch)
+        assert len(backend.list("job", limit=1000)) == 600
+        assert len(backend.list("audit", limit=1000)) == 600
+        assert len(resumed[-1]) == 1 and resumed[-1][0][0] == "import"
+        queries, batches = backend.query_count, len(backend.batches)
+        assert jobs.import_audit(path, now=now + 1) == 0
+        assert backend.query_count == queries + 1 and len(backend.batches) == batches
+    finally:
+        jobs.close()
+
+
+def test_audit_bulk_import_refuses_marker_when_source_changes_during_last_commit(tmp_path):
+    hub = Hub(tmp_path)
+    backend = BulkImportBackend()
+    jobs = manager(hub, backend)
+    now = time.time()
+    path = audit_fixture(
+        tmp_path / "legacy.jsonl",
+        [
+            {
+                "ts": utc_iso(now),
+                "event": "job.start",
+                "job_id": "mutated",
+                "target": "dev/box1_windows",
+                "type": "exec",
+            }
+        ],
+    )
+    commit = backend.import_records
+
+    def mutate(records):
+        result = commit(records)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write("{}\n")
+        return result
+
+    backend.import_records = mutate
+    try:
+        with pytest.raises(StorageError, match="changed during import"):
+            jobs.import_audit(path, now=now)
+        assert backend.list("import") == []
+    finally:
+        jobs.close()
+
+
 def test_audit_import_rejects_unflushed_spool_and_never_overwrites_shared_jobs(tmp_path):
     hub = Hub(tmp_path)
     now = time.time()

@@ -569,12 +569,21 @@ class SharedJobManager(JobManager):
     ) -> int:
         """Import a supplied migration home's bounded, last-week audit once.
 
-        No worker or lease callback is invoked. Flush both before resuming a
-        partial import and before committing its content-addressed marker.
+        No worker or lease callback is invoked. SQL batches insert only missing
+        records and commit before the content-addressed completion marker.
         """
         now = time.time() if now is None else now
         if not math.isfinite(now):
             raise ValueError("audit import time must be finite")
+        deadline = time.monotonic() + timeout
+
+        def check_progress():
+            if cancel_event is not None and cancel_event.is_set():
+                raise StorageError("audit import stopped before completion")
+            if time.monotonic() >= deadline:
+                raise StorageError("audit import timed out before durable delivery")
+
+        bulk_import = getattr(self.backend, "import_records", None)
         try:
             stream = Path(path).open("rb")
         except FileNotFoundError:
@@ -589,8 +598,7 @@ class SharedJobManager(JobManager):
             content = hashlib.sha256()
             remaining = size
             while remaining:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise StorageError("audit import stopped before completion")
+                check_progress()
                 data = stream.read(min(remaining, IMPORT_LINE_BYTES))
                 if not data:
                     raise StorageError("migration audit changed during hashing")
@@ -598,20 +606,28 @@ class SharedJobManager(JobManager):
                 remaining -= len(data)
             digest = content.hexdigest()
             transaction = getattr(self.backend, "transaction", None)
-            guard = transaction("privy.audit.import") if transaction else contextlib.nullcontext()
+            guard = (
+                transaction("privy.audit.import")
+                if transaction and bulk_import is None
+                else contextlib.nullcontext()
+            )
             with guard:
                 marker_key = f"audit:{digest}"
                 if self.backend.get("import", marker_key) is not None:
                     return 0
+                if bulk_import is not None and not self.backend.flush(
+                    timeout=max(0, deadline - time.monotonic())
+                ):
+                    raise StorageError("cannot resume audit import before durable delivery")
                 begin = max(0, size - IMPORT_MAX_BYTES)
                 stream.seek(begin)
                 if begin:
                     stream.readline(IMPORT_LINE_BYTES + 1)
                 starts, finishes, local_paths = {}, {}, {}
+                finish_keys = set()
                 cutoff = now - IMPORT_HISTORY_S
                 for line_hash, at, raw in _audit_lines(stream):
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise StorageError("audit import stopped before completion")
+                    check_progress()
                     if not cutoff <= at <= now or raw["event"] not in ("job.start", "job.finish"):
                         continue
                     job_id = raw.get("job_id")
@@ -624,6 +640,7 @@ class SharedJobManager(JobManager):
                         if isinstance(local_path, str):
                             local_paths[job_id] = local_path
                     else:
+                        finish_keys.add((job_id, f"file:{line_hash}"))
                         previous = finishes.get(job_id)
                         if previous is None or at >= previous[0]:
                             finishes[job_id] = (at, safe)
@@ -632,10 +649,39 @@ class SharedJobManager(JobManager):
                     if hasattr(self.backend, "existing")
                     else {job_id for job_id in starts if self.backend.get("job", job_id) is not None}
                 )
+                audit_keys = [f"file:{value[0]}" for value in starts.values()]
+                audit_keys.extend(key for job_id, key in finish_keys if job_id in starts)
+                existing_audits = (
+                    self.backend.existing("audit", audit_keys)
+                    if hasattr(self.backend, "existing")
+                    else {key for key in audit_keys if self.backend.get("audit", key) is not None}
+                )
                 imported = 0
+                batch = []
+
+                def commit_batch():
+                    nonlocal imported
+                    check_progress()
+                    inserted = bulk_import(batch)
+                    imported += sum(kind == "job" for kind, _ in inserted)
+                    batch.clear()
+
+                def write(kind, key, payload):
+                    nonlocal imported
+                    if kind == "audit":
+                        if key in existing_audits:
+                            return
+                        existing_audits.add(key)
+                    if bulk_import is not None:
+                        batch.append((kind, key, payload))
+                        if len(batch) == 500:
+                            commit_batch()
+                    else:
+                        self.backend.enqueue(kind, key, payload)
+                        imported += kind == "job"
+
                 for index, (job_id, (line_hash, at, start)) in enumerate(starts.items(), 1):
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise StorageError("audit import stopped before completion")
+                    check_progress()
                     finish = finishes.get(job_id)
                     finish = finish if finish is not None and finish[0] >= at else None
                     if finish is not None:
@@ -644,9 +690,8 @@ class SharedJobManager(JobManager):
                     if record is None:
                         continue
                     if job_id not in existing_jobs:
-                        self.backend.enqueue("job", job_id, record)
-                        imported += 1
-                    self.backend.enqueue(
+                        write("job", job_id, record)
+                    write(
                         "audit",
                         f"file:{line_hash}",
                         {
@@ -672,15 +717,14 @@ class SharedJobManager(JobManager):
                 if begin:
                     stream.readline(IMPORT_LINE_BYTES + 1)
                 for line_hash, at, raw in _audit_lines(stream):
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise StorageError("audit import stopped before completion")
+                    check_progress()
                     if (
                         cutoff <= at <= now
                         and raw["event"] == "job.finish"
                         and isinstance(raw.get("job_id"), str)
                         and raw["job_id"] in starts
                     ):
-                        self.backend.enqueue(
+                        write(
                             "audit",
                             f"file:{line_hash}",
                             {
@@ -690,22 +734,27 @@ class SharedJobManager(JobManager):
                                 "imported": True,
                             },
                         )
+                if batch:
+                    commit_batch()
                 final_stat = os.fstat(stream.fileno())
                 if final_stat.st_size != size or final_stat.st_mtime_ns != initial_stat.st_mtime_ns:
                     raise StorageError("migration audit changed during import; no marker committed")
-                if not self.backend.flush(timeout=timeout):
+                check_progress()
+                if bulk_import is None and not self.backend.flush(
+                    timeout=max(0, deadline - time.monotonic())
+                ):
                     raise StorageError("cannot commit audit import before durable delivery")
-                self.backend.put(
-                    "import",
-                    marker_key,
-                    {
-                        "owner": self.backend.owner,
-                        "created_at": now,
-                        "sha256": digest,
-                        "jobs": len(starts),
-                        "window_s": IMPORT_HISTORY_S,
-                    },
-                )
+                marker = {
+                    "owner": self.backend.owner,
+                    "created_at": now,
+                    "sha256": digest,
+                    "jobs": len(starts),
+                    "window_s": IMPORT_HISTORY_S,
+                }
+                if bulk_import is not None:
+                    bulk_import([("import", marker_key, marker)])
+                else:
+                    self.backend.put("import", marker_key, marker)
                 return imported
 
     def _admit(self, job: HubJob) -> None:

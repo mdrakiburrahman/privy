@@ -1,6 +1,9 @@
+import threading
+from types import SimpleNamespace
+
 import pytest
 
-from privy.hub.sql_store import DurableOutbox, StorageError
+from privy.hub.sql_store import DurableOutbox, SqlBackend, StorageError
 
 
 def test_outbox_replays_ordered_records_after_restart(tmp_path):
@@ -39,3 +42,26 @@ def test_acknowledgment_does_not_reset_sequence(tmp_path):
     outbox = DurableOutbox(path, max_bytes=4096)
     assert outbox.append("audit", "two", {}, "owner") > first
     outbox.close()
+
+
+def test_delivery_worker_does_not_sleep_between_backlogged_batches():
+    backend = object.__new__(SqlBackend)
+    backend._stop = threading.Event()
+    backend._last_error = None
+    backend._wake = SimpleNamespace(
+        wait=lambda timeout: pytest.fail("delivery worker slept with a pending backlog"),
+        clear=lambda: None,
+    )
+    drained = []
+
+    def drain():
+        drained.append(500)
+        if len(drained) == 2:
+            backend._stop.set()
+
+    backend._drain = drain
+    backend.heartbeat = lambda: None
+    backend.collect = lambda: {}
+    backend.outbox = SimpleNamespace(pending=lambda limit: [(1,)])
+    backend._work()
+    assert drained == [500, 500]

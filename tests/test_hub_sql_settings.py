@@ -8,7 +8,15 @@ import yaml
 
 from privy.hub.leases import DEFAULT_CONFIG, effective_lease_config
 from privy.hub.settings import SettingsError, load_settings
-from privy.hub.sql_store import _SCHEMA, SqlBackend, StorageError, _home_identity, _HomeLock, _ProfileCursor
+from privy.hub.sql_store import (
+    _IMPORT_BATCH,
+    _SCHEMA,
+    SqlBackend,
+    StorageError,
+    _home_identity,
+    _HomeLock,
+    _ProfileCursor,
+)
 
 
 def test_absent_settings_preserve_file_mode(tmp_path, monkeypatch):
@@ -117,6 +125,57 @@ def test_sql_get_many_skips_empty_key_sets():
 
     backend.transaction = unexpected_transaction
     assert backend.get_many("listener", []) == {}
+
+
+def test_sql_import_commits_deduplicated_insert_only_batch_before_return():
+    cursor = FakeCursor([("audit", "missing")])
+    committed = []
+
+    @contextmanager
+    def transaction(lock=None):
+        assert lock == "privy.leases"
+        yield cursor
+        committed.append(True)
+
+    backend = object.__new__(SqlBackend)
+    backend.owner = "incarnation"
+    backend.transaction = transaction
+    backend.assert_owner_active = lambda cursor: None
+    payload = {"created_at": 100, "job_id": "old-job"}
+    assert backend.import_records([("audit", "missing", payload)] * 2) == {("audit", "missing")}
+    assert committed == [True]
+    query, args = cursor.statements[0]
+    assert query == _IMPORT_BATCH
+    assert "OUTPUT inserted.kind,inserted.id" in query and "NOT EXISTS" in query
+    assert "UPDATE " not in query and "DELETE " not in query
+    assert json.loads(args[0]) == [
+        {
+            "kind": "audit",
+            "id": "missing",
+            "payload": payload,
+            "owner": "incarnation",
+            "at": 100,
+            "target": None,
+            "lease_id": None,
+            "client_id": None,
+        }
+    ]
+
+
+def test_sql_import_failed_commit_does_not_acknowledge_rows():
+    cursor = FakeCursor([("job", "new-job")])
+
+    @contextmanager
+    def transaction(lock=None):
+        yield cursor
+        raise StorageError("SQL commit failed")
+
+    backend = object.__new__(SqlBackend)
+    backend.owner = "incarnation"
+    backend.transaction = transaction
+    backend.assert_owner_active = lambda cursor: None
+    with pytest.raises(StorageError, match="commit failed"):
+        backend.import_records([("job", "new-job", {"created_at": 100})])
 
 
 def test_sql_job_pages_apply_state_filters_and_aggregate_counts():

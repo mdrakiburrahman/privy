@@ -76,6 +76,15 @@ owner/revision checks. It is **not** a second leasing authority. Outages retain 
 full journals reject new writes and report errors/backpressure rather than dropping old data. Keep
 each home and its `sql-outbox.sqlite3` files until all pending deliveries have been flushed.
 
+Legacy `audit.jsonl` cutover runs in a background thread, scanning at most its last 64 MiB and
+seven days of job starts/finishes. It checks existing job and deterministic audit keys in bulk,
+then commits missing records in insert-only SQL batches of at most 500, without flooding the live
+delivery journal or replacing shared jobs. Interrupted imports resume from already committed
+keys. The file's SHA-256 completion marker is committed only after every import batch is durable
+and the source is verified unchanged; an unchanged completed file needs only hashing and one marker
+lookup on restart. An existing journal must drain before migration begins. Failures remain visible
+in storage health and can be retried on restart.
+
 Either hub can inspect/follow shared jobs and request cancellation. Cancellation is durably recorded
 in SQL and only acknowledged by the executing hub after it processes the request. Acceptance does
 not promise immediate cancellation while that owner is offline. A same-home successor fences the

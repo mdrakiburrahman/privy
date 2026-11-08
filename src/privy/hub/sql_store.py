@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import os
 import socket
 import sqlite3
@@ -472,8 +473,9 @@ WITH(kind nvarchar(32), id nvarchar(400), payload nvarchar(max) AS JSON,
 DECLARE @latest TABLE(kind nvarchar(32), id nvarchar(400), payload nvarchar(max),
     owner nvarchar(64), revision bigint, at float, target nvarchar(300),
     lease_id nvarchar(80), client_id nvarchar(80), PRIMARY KEY(kind,id));
-INSERT @latest SELECT r.* FROM @rows r WHERE revision=(
-    SELECT MAX(revision) FROM @rows p WHERE p.kind=r.kind AND p.id=r.id);
+INSERT @latest SELECT kind,id,payload,owner,revision,at,target,lease_id,client_id
+FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY kind,id ORDER BY revision DESC) AS n FROM @rows) ranked
+WHERE n=1;
 IF EXISTS(SELECT 1 FROM @latest n JOIN dbo.privy_records p WITH(UPDLOCK,HOLDLOCK)
     ON p.kind=n.kind AND p.id=n.id WHERE n.kind='job' AND p.owner<>n.owner)
     THROW 51001, 'Privy job ownership conflict', 1;
@@ -505,6 +507,21 @@ IF NOT EXISTS(SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.privy_rec
     AND name='IX_privy_read_changes')
     EXEC('CREATE INDEX IX_privy_read_changes ON dbo.privy_records(change_version)
         INCLUDE(kind,id) WHERE kind<>''probe'' AND kind<>''call''');
+"""
+
+_IMPORT_BATCH = """
+DECLARE @rows TABLE(kind nvarchar(32), id nvarchar(400), payload nvarchar(max),
+    owner nvarchar(64), at float, target nvarchar(300),
+    lease_id nvarchar(80), client_id nvarchar(80), PRIMARY KEY(kind,id));
+INSERT @rows SELECT * FROM OPENJSON(?)
+WITH(kind nvarchar(32), id nvarchar(400), payload nvarchar(max) AS JSON,
+     owner nvarchar(64), at float, target nvarchar(300),
+     lease_id nvarchar(80), client_id nvarchar(80));
+INSERT dbo.privy_records(kind,id,payload,owner,revision,at,target,lease_id,client_id)
+OUTPUT inserted.kind,inserted.id
+SELECT n.kind,n.id,n.payload,n.owner,0,n.at,n.target,n.lease_id,n.client_id
+FROM @rows n WHERE NOT EXISTS(
+    SELECT 1 FROM dbo.privy_records p WITH(UPDLOCK,HOLDLOCK) WHERE p.kind=n.kind AND p.id=n.id);
 """
 
 
@@ -790,8 +807,38 @@ class SqlBackend:
                 return
         raise StorageError("SQL synchronous write did not complete; retained in delivery journal")
 
+    def import_records(self, records: list[tuple[str, str, dict]]) -> set[tuple[str, str]]:
+        """Commit insert-only migration batches without competing with live delivery."""
+        if not records:
+            return set()
+        if len(records) > 500:
+            raise StorageError("SQL import batch must contain at most 500 records")
+        batch = {}
+        for kind, key, payload in records:
+            if kind not in ("job", "audit", "import") or not key or len(key) > 400:
+                raise StorageError("SQL import record identity is invalid")
+            at = payload.get("created_at", payload.get("at"))
+            if not isinstance(at, (int, float)) or not math.isfinite(at):
+                raise StorageError("SQL import record time must be finite")
+            batch[kind, key] = {
+                "kind": kind,
+                "id": key,
+                "payload": payload,
+                "owner": self.owner,
+                "at": at,
+                "target": payload.get("target"),
+                "lease_id": payload.get("lease_id"),
+                "client_id": payload.get("client_id"),
+            }
+        with self.transaction("privy.leases") as cursor:
+            self.assert_owner_active(cursor)
+            cursor.execute(_IMPORT_BATCH, json.dumps(list(batch.values()), ensure_ascii=True))
+            inserted = {(str(kind), str(key)) for kind, key in cursor.fetchall()}
+        return inserted
+
     def _drain(self) -> None:
         with self._flush_lock:
+            started = time.perf_counter()
             rows = self.outbox.pending(500)
             if not rows:
                 return
@@ -814,11 +861,22 @@ class SqlBackend:
                         "client_id": payload.get("client_id"),
                     }
                 )
+            encoded = json.dumps(batch, ensure_ascii=True)
+            prepared = time.perf_counter()
             with self.transaction("privy.leases") as cursor:
                 self.assert_owner_active(cursor)
-                cursor.execute(_FLUSH_BATCH, json.dumps(batch, ensure_ascii=True))
+                cursor.execute(_FLUSH_BATCH, encoded)
+            committed = time.perf_counter()
             self.outbox.ack_batch([row[0] for row in rows])
             self._last_error = None
+            if _profile_sql_enabled():
+                log.info(
+                    "sql_profile drain rows=%d prepare_ms=%.1f sql_ms=%.1f ack_ms=%.1f",
+                    len(rows),
+                    (prepared - started) * 1000,
+                    (committed - prepared) * 1000,
+                    (time.perf_counter() - committed) * 1000,
+                )
 
     def read_changes(self, version: bytes, *, limit: int = 2000):
         with self.transaction() as cursor:
@@ -1635,7 +1693,7 @@ class SqlBackend:
             row = cursor.fetchone()
             return bool(row and row[0])
 
-    def existing(self, kind: str, keys: list[str], *, batch_size: int = 1000) -> set[str]:
+    def existing(self, kind: str, keys: list[str], *, batch_size: int = 10000) -> set[str]:
         existing = set()
         for start in range(0, len(keys), batch_size):
             batch = keys[start : start + batch_size]
@@ -1747,6 +1805,8 @@ class SqlBackend:
                     self.collect()
                     maintenance = time.monotonic() + 30
                     self._last_error = None
+                if self.outbox.pending(1):
+                    continue
             except Exception:
                 if self._last_error is None:
                     log.error("SQL delivery/maintenance failed; journal retained, no file leasing fallback")
