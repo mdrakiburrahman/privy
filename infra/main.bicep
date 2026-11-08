@@ -9,7 +9,7 @@ param administratorObjectId string
 param administratorLogin string
 param tenantId string
 
-@allowed(['S0', 'S1', 'S2', 'S3', 'HS_Gen5_8'])
+@allowed(['S0', 'S1', 'S2', 'S3', 'HS_Gen5_8', 'HS_MOPRMS_16', 'BC_Gen5_16'])
 param databaseSku string = 'HS_Gen5_8'
 
 resource group 'Microsoft.Resources/resourceGroups@2025-04-01' = {

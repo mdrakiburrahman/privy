@@ -6,7 +6,9 @@ param administratorLogin string
 param tenantId string
 param databaseSku string
 
-var isHyperscale = databaseSku == 'HS_Gen5_8'
+var isHyperscale = contains(['HS_Gen5_8', 'HS_MOPRMS_16'], databaseSku)
+var isMemoryOptimizedHyperscale = databaseSku == 'HS_MOPRMS_16'
+var isBusinessCritical = databaseSku == 'BC_Gen5_16'
 
 resource server 'Microsoft.Sql/servers@2023-08-01' = {
   name: serverName
@@ -32,10 +34,15 @@ resource database 'Microsoft.Sql/servers/databases@2023-08-01' = {
   name: databaseName
   location: location
   sku: isHyperscale ? {
-    name: 'HS_Gen5'
+    name: isMemoryOptimizedHyperscale ? 'HS_MOPRMS' : 'HS_Gen5'
     tier: 'Hyperscale'
+    family: isMemoryOptimizedHyperscale ? '8IH' : 'Gen5'
+    capacity: isMemoryOptimizedHyperscale ? 16 : 8
+  } : isBusinessCritical ? {
+    name: 'BC_Gen5'
+    tier: 'BusinessCritical'
     family: 'Gen5'
-    capacity: 8
+    capacity: 16
   } : {
     name: databaseSku
     tier: 'Standard'
@@ -44,6 +51,11 @@ resource database 'Microsoft.Sql/servers/databases@2023-08-01' = {
     collation: 'SQL_Latin1_General_CP1_CI_AS'
     requestedBackupStorageRedundancy: 'Local'
     highAvailabilityReplicaCount: 1
+    readScale: 'Enabled'
+    zoneRedundant: false
+  } : isBusinessCritical ? {
+    collation: 'SQL_Latin1_General_CP1_CI_AS'
+    requestedBackupStorageRedundancy: 'Local'
     readScale: 'Enabled'
     zoneRedundant: false
   } : {

@@ -5,6 +5,7 @@ $global:PrivyInfraCalls = @()
 $global:PrivyInfraFailAzure = $false
 $global:PrivyInfraExistingServer = $false
 $global:PrivyInfraDatabaseState = "none"
+$global:PrivyInfraValidatedSku = $null
 $global:PrivyInfraWideFirewall = $false
 $global:PrivyInfraAllowAll = $false
 $tenant = "11111111-1111-1111-1111-111111111111"
@@ -51,6 +52,57 @@ function az {
                     sku=@{name="HS_Gen5"; tier="Hyperscale"; family="Gen5"; capacity=8}
                     highAvailabilityReplicaCount=1; readScale="Enabled"; zoneRedundant=$false
                 }
+                switch ($global:PrivyInfraDatabaseState) {
+                    "memoryOptimizedHyperscale" {
+                        $database.currentServiceObjectiveName = "HS_MOPRMS_16"
+                        $database.requestedServiceObjectiveName = "HS_MOPRMS_16"
+                        $database.sku = @{name="HS_MOPRMS"; tier="Hyperscale"; family="8IH"; capacity=16}
+                    }
+                    "businessCritical" {
+                        $database.currentServiceObjectiveName = "BC_Gen5_16"
+                        $database.requestedServiceObjectiveName = "BC_Gen5_16"
+                        $database.sku = @{name="BC_Gen5"; tier="BusinessCritical"; family="Gen5"; capacity=16}
+                        $database.Remove("highAvailabilityReplicaCount")
+                    }
+                    "businessCriticalMissingZone" {
+                        $database.currentServiceObjectiveName = "BC_Gen5_16"
+                        $database.requestedServiceObjectiveName = "BC_Gen5_16"
+                        $database.sku = @{name="BC_Gen5"; tier="BusinessCritical"; family="Gen5"; capacity=16}
+                        $database.Remove("highAvailabilityReplicaCount")
+                        $database.Remove("zoneRedundant")
+                    }
+                    "businessCriticalNullZone" {
+                        $database.currentServiceObjectiveName = "BC_Gen5_16"
+                        $database.requestedServiceObjectiveName = "BC_Gen5_16"
+                        $database.sku = @{name="BC_Gen5"; tier="BusinessCritical"; family="Gen5"; capacity=16}
+                        $database.Remove("highAvailabilityReplicaCount")
+                        $database.zoneRedundant = $null
+                    }
+                    "businessCriticalStringZone" {
+                        $database.currentServiceObjectiveName = "BC_Gen5_16"
+                        $database.requestedServiceObjectiveName = "BC_Gen5_16"
+                        $database.sku = @{name="BC_Gen5"; tier="BusinessCritical"; family="Gen5"; capacity=16}
+                        $database.Remove("highAvailabilityReplicaCount")
+                        $database.zoneRedundant = "false"
+                    }
+                    "businessCriticalWrongZone" {
+                        $database.currentServiceObjectiveName = "BC_Gen5_16"
+                        $database.requestedServiceObjectiveName = "BC_Gen5_16"
+                        $database.sku = @{name="BC_Gen5"; tier="BusinessCritical"; family="Gen5"; capacity=16}
+                        $database.Remove("highAvailabilityReplicaCount")
+                        $database.zoneRedundant = $true
+                    }
+                    "businessCriticalDisabledReadScale" {
+                        $database.currentServiceObjectiveName = "BC_Gen5_16"
+                        $database.requestedServiceObjectiveName = "BC_Gen5_16"
+                        $database.sku = @{name="BC_Gen5"; tier="BusinessCritical"; family="Gen5"; capacity=16}
+                        $database.Remove("highAvailabilityReplicaCount")
+                        $database.readScale = "Disabled"
+                    }
+                    "directHyperscaleToBusinessCritical" {
+                        $database.requestedServiceObjectiveName = "BC_Gen5_16"
+                    }
+                }
                 if ($global:PrivyInfraDatabaseState -eq "wrongHyperscale") {
                     $database.highAvailabilityReplicaCount = 0
                     $database.readScale = "Disabled"
@@ -66,7 +118,15 @@ function az {
                 @($database) | ConvertTo-Json -Depth 6
             }
         }
-        "deployment sub validate" { '{}' }
+        "deployment sub validate" {
+            $parameterIndex = [Array]::IndexOf($args, "--parameters")
+            $parameters = Get-Content -LiteralPath $args[$parameterIndex + 1].Substring(1) -Raw | ConvertFrom-Json
+            $global:PrivyInfraValidatedSku = $parameters.databaseSku.value
+            if ($global:PrivyInfraValidatedSku -notin @("S0", "S1", "S2", "S3", "HS_Gen5_8", "HS_MOPRMS_16", "BC_Gen5_16")) {
+                throw "Unsupported database SKU reached validation."
+            }
+            '{}'
+        }
         "deployment sub create" {
             $parameterIndex = [Array]::IndexOf($args, "--parameters")
             $parameters = Get-Content -LiteralPath $args[$parameterIndex + 1].Substring(1) -Raw | ConvertFrom-Json
@@ -107,11 +167,19 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("privy-infra-test-" + [guid]::
 $production = Join-Path $testRoot "production\appsettings.yaml"
 $mainTemplate = Get-Content -LiteralPath (Join-Path $PSScriptRoot "main.bicep") -Raw
 $sqlTemplate = Get-Content -LiteralPath (Join-Path $PSScriptRoot "sql.bicep") -Raw
-if ($mainTemplate -notmatch "@allowed\(\['S0', 'S1', 'S2', 'S3', 'HS_Gen5_8'\]\)\s*param databaseSku string = 'HS_Gen5_8'") {
-    throw "Bicep does not default to HS_Gen5_8 while preserving Standard SKUs."
+if ($mainTemplate -notmatch "@allowed\(\['S0', 'S1', 'S2', 'S3', 'HS_Gen5_8', 'HS_MOPRMS_16', 'BC_Gen5_16'\]\)\s*param databaseSku string = 'HS_Gen5_8'") {
+    throw "Bicep SKU choices/default do not preserve Standard support and the benchmark baseline."
 }
-if ($sqlTemplate -notmatch "highAvailabilityReplicaCount: 1" -or $sqlTemplate -notmatch "readScale: 'Enabled'" -or $sqlTemplate -notmatch "zoneRedundant: false") {
-    throw "Bicep is missing explicit Hyperscale HA/read-scale/zone settings."
+if ($sqlTemplate -notmatch "family: isMemoryOptimizedHyperscale \? '8IH' : 'Gen5'" -or
+    $sqlTemplate -notmatch "name: 'BC_Gen5'\s+tier: 'BusinessCritical'\s+family: 'Gen5'\s+capacity: 16" -or
+    $sqlTemplate -notmatch "(?s)properties: isHyperscale \? \{.*?zoneRedundant: false\s*\} : isBusinessCritical \? \{\s*collation: 'SQL_Latin1_General_CP1_CI_AS'\s+requestedBackupStorageRedundancy: 'Local'\s+readScale: 'Enabled'\s+zoneRedundant: false\s*\} : \{\s*collation: 'SQL_Latin1_General_CP1_CI_AS'\s+requestedBackupStorageRedundancy: 'Local'\s*\}" -or
+    $sqlTemplate -notmatch "highAvailabilityReplicaCount: 1" -or
+    $sqlTemplate -notmatch "readScale: 'Enabled'" -or
+    $sqlTemplate -notmatch "zoneRedundant: false") {
+    throw "Bicep is missing exact memory-optimized, Business Critical, or Hyperscale properties."
+}
+if ($sqlTemplate -notmatch "(?s)properties: isHyperscale \? \{.*?highAvailabilityReplicaCount: 1.*?\} : isBusinessCritical \? \{[^}]*\}") {
+    throw "Business Critical properties must not include the Hyperscale-only HA replica count."
 }
 try {
     Assert-Fails { & $deployScript -ClientIPv4Addresses "1.2.3.4" -ValidateOnly } "parameter"
@@ -120,6 +188,7 @@ try {
     Assert-Fails { & $deployScript -TestDatabaseName removed } "parameter"
     Assert-Fails { & $deployScript -TestDatabaseSku Basic } "parameter"
     Assert-Fails { & $deployScript -TestSettingsPath "C:\isolated\removed.yaml" } "parameter"
+    Assert-Fails { & $deployScript -DatabaseSku HS_MOPRMS_8 } "parameter"
     if ($global:PrivyInfraCalls.Count -ne 0) { throw "Invalid input reached Azure." }
 
     $global:PrivyInfraFailAzure = $true
@@ -148,12 +217,41 @@ try {
     }
     $global:PrivyInfraDatabaseState = "standard"
     & $deployScript -DatabaseSku S0 -ValidateOnly
+    if ($global:PrivyInfraValidatedSku -ne "S0") { throw "Standard SKU override was not passed to validation." }
     $global:PrivyInfraDatabaseState = "hyperscale"
     $global:PrivyInfraCalls = @()
     & $deployScript -ValidateOnly
     if (@($global:PrivyInfraCalls | Where-Object { $_[0] -eq "deployment" -and $_[2] -eq "validate" }).Count -ne 1) {
         throw "Matching current/requested Hyperscale metadata did not reach validation."
     }
+    if ($global:PrivyInfraValidatedSku -ne "HS_Gen5_8") { throw "Hyperscale default was not preserved." }
+    $global:PrivyInfraDatabaseState = "memoryOptimizedHyperscale"
+    $global:PrivyInfraCalls = @()
+    & $deployScript -DatabaseSku HS_MOPRMS_16 -ValidateOnly
+    if ($global:PrivyInfraValidatedSku -ne "HS_MOPRMS_16") {
+        throw "Memory-optimized Hyperscale override did not pass its exact SKU to validation."
+    }
+    $global:PrivyInfraDatabaseState = "businessCritical"
+    $global:PrivyInfraCalls = @()
+    & $deployScript -DatabaseSku BC_Gen5_16 -ValidateOnly
+    if ($global:PrivyInfraValidatedSku -ne "BC_Gen5_16") {
+        throw "Business Critical override did not pass its exact SKU to validation."
+    }
+    foreach ($state in @("businessCriticalMissingZone", "businessCriticalNullZone", "businessCriticalStringZone", "businessCriticalWrongZone", "businessCriticalDisabledReadScale")) {
+        $global:PrivyInfraDatabaseState = $state
+        $global:PrivyInfraCalls = @()
+        Assert-Fails { & $deployScript -DatabaseSku BC_Gen5_16 -ValidateOnly } "SKU/HA/read-scale/zone"
+        if (@($global:PrivyInfraCalls | Where-Object { $_[0] -eq "deployment" }).Count) {
+            throw "Unsafe Business Critical metadata reached deployment: $state"
+        }
+    }
+    $global:PrivyInfraDatabaseState = "directHyperscaleToBusinessCritical"
+    $global:PrivyInfraCalls = @()
+    Assert-Fails { & $deployScript -DatabaseSku BC_Gen5_16 -ValidateOnly } "Direct Hyperscale-to-Business Critical"
+    if (@($global:PrivyInfraCalls | Where-Object { $_[0] -eq "deployment" }).Count) {
+        throw "Unsupported direct Hyperscale-to-Business Critical change reached deployment."
+    }
+    $global:PrivyInfraDatabaseState = "hyperscale"
     $result = & $deployScript -SettingsPath $production | ConvertFrom-Json
     if ($result.provisioningState -ne "Succeeded") { throw "Incorrect deployment state." }
     if (@($result.PSObject.Properties.Name | Where-Object { $_ -like "*test*" }).Count) {

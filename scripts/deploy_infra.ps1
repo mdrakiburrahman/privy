@@ -7,7 +7,7 @@ param(
     [string] $ServerName = "privy-sql",
     [ValidatePattern('^[A-Za-z][A-Za-z0-9_]{0,127}$')]
     [string] $DatabaseName = "privy",
-    [ValidateSet("S0", "S1", "S2", "S3", "HS_Gen5_8")]
+    [ValidateSet("S0", "S1", "S2", "S3", "HS_Gen5_8", "HS_MOPRMS_16", "BC_Gen5_16")]
     [string] $DatabaseSku = "HS_Gen5_8",
     [string] $SettingsPath,
     [switch] $ValidateOnly
@@ -118,19 +118,38 @@ if ($group.Count) {
             $existingDb = @($databases | Where-Object name -EQ $target.Name)
             if (-not $existingDb.Count) { continue }
             $database = $existingDb[0]
+            $isHyperscale = $target.Sku -in @("HS_Gen5_8", "HS_MOPRMS_16")
+            $isMemoryOptimizedHyperscale = $target.Sku -eq "HS_MOPRMS_16"
+            $isBusinessCritical = $target.Sku -eq "BC_Gen5_16"
+            if ($isBusinessCritical -and $database.sku.tier -eq "Hyperscale") {
+                throw "Direct Hyperscale-to-Business Critical SKU changes are unsupported. The supported route is Hyperscale to General Purpose within 45 days of initial conversion, then Business Critical; no migration is attempted."
+            }
             $requestedObjective = $database.PSObject.Properties["requestedServiceObjectiveName"]
             if ($null -eq $requestedObjective -or $requestedObjective.Value -ne $target.Sku) {
                 throw "Existing database $($target.Name) requested SKU differs or is missing; refusing to override a pending change."
             }
-            $isHyperscale = $target.Sku -eq "HS_Gen5_8"
             $skuMismatch = if ($isHyperscale) {
                 $zoneRedundancy = $database.PSObject.Properties["zoneRedundant"]
-                $database.currentServiceObjectiveName -ne "HS_Gen5_8" -or
-                $database.sku.name -ne "HS_Gen5" -or
+                $expectedSkuName = if ($isMemoryOptimizedHyperscale) { "HS_MOPRMS" } else { "HS_Gen5" }
+                $expectedFamily = if ($isMemoryOptimizedHyperscale) { "8IH" } else { "Gen5" }
+                $expectedCapacity = if ($isMemoryOptimizedHyperscale) { 16 } else { 8 }
+                $database.currentServiceObjectiveName -ne $target.Sku -or
+                $database.sku.name -ne $expectedSkuName -or
                 $database.sku.tier -ne "Hyperscale" -or
-                $database.sku.family -ne "Gen5" -or
-                [int]$database.sku.capacity -ne 8 -or
+                $database.sku.family -ne $expectedFamily -or
+                [int]$database.sku.capacity -ne $expectedCapacity -or
                 [int]$database.highAvailabilityReplicaCount -ne 1 -or
+                $database.readScale -ne "Enabled" -or
+                $null -eq $zoneRedundancy -or
+                $zoneRedundancy.Value -isnot [bool] -or
+                $zoneRedundancy.Value -ne $false
+            } elseif ($isBusinessCritical) {
+                $zoneRedundancy = $database.PSObject.Properties["zoneRedundant"]
+                $database.currentServiceObjectiveName -ne $target.Sku -or
+                $database.sku.name -ne "BC_Gen5" -or
+                $database.sku.tier -ne "BusinessCritical" -or
+                $database.sku.family -ne "Gen5" -or
+                [int]$database.sku.capacity -ne 16 -or
                 $database.readScale -ne "Enabled" -or
                 $null -eq $zoneRedundancy -or
                 $zoneRedundancy.Value -isnot [bool] -or
