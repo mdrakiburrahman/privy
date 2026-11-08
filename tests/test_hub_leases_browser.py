@@ -348,11 +348,17 @@ def test_force_release_api_failure_remains_visible_and_preserves_lease(lease_bro
 
 def test_lookup_failure_is_advisory_and_uses_rendered_lease_warning(lease_browser):
     page, _, _, terminal, base, errors = lease_browser
-    page.route("**/v1/targets", lambda route: route.abort())
+    target_lookup_requests = []
+    page.on(
+        "request",
+        lambda request: target_lookup_requests.append(request.url) if "/v1/targets" in request.url else None,
+    )
+    page.route("**/v1/targets**", lambda route: route.abort())
     page.goto(base + "/ui/exec")
     page.locator("#exec-connect").click()
     browser_api.expect(page.locator(".lease-dialog")).to_be_visible()
     page.get_by_role("button", name="Open terminal anyway", exact=True).click()
     browser_api.expect(page.locator("#exec-state")).to_have_text("Connected")
     assert any(call["action"] == "open" for call in terminal.calls)
+    assert any(url.endswith("/v1/targets?probe=false") for url in target_lookup_requests)
     assert not errors

@@ -280,7 +280,7 @@ window.PrivyLeases = (() => {
   async function confirmTarget(target, action) {
     let lease = target.lease;
     try {
-      const data = await get("/v1/targets");
+      const data = await get("/v1/targets?probe=false");
       const fresh = data.targets.find(item => item.id === target.id);
       if (fresh) lease = fresh.lease;
       $("lease-lookup-error")?.remove();

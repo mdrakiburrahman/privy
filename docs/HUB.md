@@ -76,12 +76,12 @@ each home and its `sql-outbox.sqlite3` files until all pending deliveries have b
 Either hub can inspect/follow shared jobs and request cancellation. Cancellation is durably recorded
 in SQL and only acknowledged by the executing hub after it processes the request. Acceptance does
 not promise immediate cancellation while that owner is offline. A same-home successor fences the
-previous SQL incarnation but neither restarts its work nor clears its pins. **Stale heartbeats do not
-prove remote execution stopped.** Normal release refuses while leased jobs are pinned; the explicit
-force-release action can reconcile pins only after every owner is marked stopped, stale, or unresolved
-file import. Verify remote work has ended before using it, because reconciliation may make the box
-available while remote work continues. Unleased running jobs also keep their group unavailable for
-fresh lease admission.
+previous SQL incarnation but neither restarts its work nor clears its pins. **Stale heartbeats do
+not prove remote execution stopped.** Normal release refuses while leased jobs are pinned; the
+explicit force-release action can reconcile pins only after every owner is marked stopped, stale, or
+unresolved file import. Verify remote work has ended before using it, because reconciliation may
+make the box available while remote work continues. Unleased running jobs also keep their group
+unavailable for fresh lease admission.
 
 If a new SQL-enabled home already contains `leases-state.json`, startup imports it once under the
 same SQL lock, preserving active pins and rejecting conflicting client identities/allocations.
@@ -100,7 +100,9 @@ dashboard sidebar shows `storage Azure SQL` and pending/rejected delivery counts
 SQL and `/v1` includes detailed storage health. The isolated Basic-tier SQL benchmark (20 simulated
 devboxes, 3,360 jobs over seven days, 4 KiB output per job) measured a 200-job page at 0.63 seconds,
 seven-day statistics at 4.21 seconds, dashboard HTML at 5.35 seconds and an output page at 1.42
-seconds. This is not a production-tier or two-physical-machine measurement. Dashboard pages render cached listener statuses while stale probes continue in the background, waiting at most 0.5 seconds for a refresh. SQL-backed reports reuse the job counts already read for that page.
+seconds. This is not a production-tier or two-physical-machine measurement. Dashboard pages render
+cached listener statuses while stale probes continue in the background, waiting at most 0.5 seconds
+for a refresh. SQL-backed reports reuse the job counts already read for that page.
 
 ## Quick start
 
