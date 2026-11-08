@@ -944,16 +944,31 @@ class SqlBackend:
                         MIN(at) OVER(PARTITION BY target) AS earliest_at
                     FROM dbo.privy_records WHERE {where}
                 )
-                SELECT ranked.target,ranked.sample_count,ranked.online_count,ranked.last_online,
-                    ranked.earliest_at,ranked.at,ranked.id,ranked.probe_status,ranked.probe_latency_ms,
-                    payloads.payload
-                FROM ranked
-                JOIN dbo.privy_records payloads ON payloads.kind='probe' AND payloads.id=ranked.id
-                WHERE ranked.latest_rank=1
+                SELECT target,sample_count,online_count,last_online,earliest_at,
+                    at,id,probe_status,probe_latency_ms
+                FROM ranked WHERE latest_rank=1
                 """,
                 *params,
             )
             probe_rows = cursor.fetchall()
+            latest_ids = [str(row[6]) for row in probe_rows]
+            payloads = {}
+            if latest_ids:
+                cursor.execute(
+                    "SELECT id,payload FROM dbo.privy_records WHERE kind='probe' "
+                    "AND id IN (SELECT value FROM OPENJSON(?))",
+                    json.dumps(latest_ids, ensure_ascii=True),
+                )
+                payload_rows = cursor.fetchall()
+                decode_started = time.perf_counter()
+                payloads = {str(key): json.loads(payload) for key, payload in payload_rows}
+                if _profile_sql_enabled():
+                    log.info(
+                        "sql_profile record_decode thread=%s kind=probe_latest rows=%d duration_ms=%.1f",
+                        threading.get_ident(),
+                        len(payload_rows),
+                        (time.perf_counter() - decode_started) * 1000,
+                    )
 
             where, params = query("probe")
             cursor.execute(
@@ -1061,7 +1076,7 @@ class SqlBackend:
                 }
                 by_target[target] = stats
                 sample_count += stats["samples"]
-                latest = json.loads(row[9])
+                latest = payloads.get(str(row[6]), {})
                 latest.update(target=target, at=float(row[5]), status=row[7], latency_ms=row[8])
                 decoded["probes"].append(latest)
 

@@ -86,6 +86,47 @@ def test_gather_probes_renders_before_stale_refresh_finishes():
         release.set()
 
 
+def test_sql_history_report_reuses_its_job_counts(monkeypatch):
+    class Registry:
+        def snapshot(self):
+            return type("Snapshot", (), {"targets": []})()
+
+    class Jobs:
+        max_running = 3
+
+        def counts(self):
+            raise AssertionError("SQL history already provides the report counts")
+
+    class Backend:
+        def report_history(self, **_kwargs):
+            raise AssertionError("The metrics report owns the history read")
+
+    class Metrics:
+        backend = Backend()
+
+        def report(self, _targets, _probes, **kwargs):
+            self.kwargs = kwargs
+            return {"targets": []}
+
+    metrics = Metrics()
+    service = type(
+        "Service",
+        (),
+        {
+            "registry": Registry(),
+            "jobs": Jobs(),
+            "metrics": metrics,
+            "listener_facts_many": lambda _self, _targets, _probes: {},
+        },
+    )()
+    monkeypatch.setattr(dashboard, "gather_probes", lambda _service: {})
+
+    dashboard.build_report(service)
+
+    assert metrics.kwargs["max_running"] == 3
+    assert not {"jobs_running", "jobs_queued", "jobs_retained"} & metrics.kwargs.keys()
+
+
 def test_root_serves_the_dashboard_to_browsers_and_markdown_to_everyone_else(hub):
     page = hub.call("GET", "/", headers=BROWSER)
     text = html_of(page)

@@ -305,19 +305,28 @@ def build_report(
     phase_started = time.perf_counter()
     probes = gather_probes(service)
     probe_gather_ms = (time.perf_counter() - phase_started) * 1000
+    history_backend = getattr(getattr(service.metrics, "backend", None), "report_history", None)
+    if callable(history_backend):
+        counts = None
+        job_counts_ms = 0.0
+    else:
+        phase_started = time.perf_counter()
+        counts = service.jobs.counts()
+        job_counts_ms = (time.perf_counter() - phase_started) * 1000
     phase_started = time.perf_counter()
-    counts = service.jobs.counts()
-    job_counts_ms = (time.perf_counter() - phase_started) * 1000
-    phase_started = time.perf_counter()
+    report_kwargs = {"max_running": service.jobs.max_running}
+    if counts is not None:
+        report_kwargs.update(
+            jobs_running=counts["running"],
+            jobs_queued=counts["queued"],
+            jobs_retained=counts["retained"],
+        )
     report = service.metrics.report(
         targets,
         probes,
         range_name=range_name,
         selection=selection,
-        jobs_running=counts["running"],
-        jobs_queued=counts["queued"],
-        jobs_retained=counts["retained"],
-        max_running=service.jobs.max_running,
+        **report_kwargs,
     )
     metrics_report_ms = (time.perf_counter() - phase_started) * 1000
     phase_started = time.perf_counter()

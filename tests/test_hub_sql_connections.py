@@ -200,7 +200,8 @@ def test_report_history_aggregates_probe_and_call_data_in_one_transaction():
         [(json.dumps(job),)],
         [(json.dumps(purpose),)],
         [(json.dumps(previous),)],
-        [("box", 4, 3, 3.0, 1.0, 3.0, "probe-1", "online", 4, json.dumps(probe))],
+        [("box", 4, 3, 3.0, 1.0, 3.0, "probe-1", "online", 4)],
+        [("probe-1", json.dumps(probe))],
         [("box", 3.0, 1)],
         [("box", 4.0)],
         [(4.0, 4.0)],
@@ -237,17 +238,19 @@ def test_report_history_aggregates_probe_and_call_data_in_one_transaction():
     history = backend.report_history(after=2, before=4)
 
     assert transactions == [True]
-    assert len(cursor.executed) == 9
+    assert len(cursor.executed) == 10
     assert "ROW_NUMBER() OVER(PARTITION BY target" in cursor.executed[3][0]
-    assert "JOIN dbo.privy_records payloads" in cursor.executed[3][0]
+    assert "JOIN dbo.privy_records payloads" not in cursor.executed[3][0]
     assert "kind='probe'" in cursor.executed[3][0]
     assert cursor.executed[3][1] == (2, 4)
-    assert "LAG(probe_status)" in cursor.executed[4][0]
-    assert "ROW_NUMBER() OVER(PARTITION BY target ORDER BY probe_latency_ms,at,id)" in cursor.executed[5][0]
-    assert "ORDER BY probe_latency_ms,target,at,id" in cursor.executed[6][0]
-    assert cursor.executed[5][1] == (2, 4)
-    assert cursor.executed[6][1] == (2, 4, 2, 4, 2, 4)
-    assert "GROUP BY JSON_VALUE(payload,'$.surface')" in cursor.executed[7][0]
+    assert "OPENJSON(?)" in cursor.executed[4][0]
+    assert cursor.executed[4][1] == ('["probe-1"]',)
+    assert "LAG(probe_status)" in cursor.executed[5][0]
+    assert "ROW_NUMBER() OVER(PARTITION BY target ORDER BY probe_latency_ms,at,id)" in cursor.executed[6][0]
+    assert "ORDER BY probe_latency_ms,target,at,id" in cursor.executed[7][0]
+    assert cursor.executed[6][1] == (2, 4)
+    assert cursor.executed[7][1] == (2, 4, 2, 4, 2, 4)
+    assert "GROUP BY JSON_VALUE(payload,'$.surface')" in cursor.executed[8][0]
     assert history["jobs"] == [job]
     assert history["purposes"] == [purpose]
     assert history["latest_before"] == [previous]
