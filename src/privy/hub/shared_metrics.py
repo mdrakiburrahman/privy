@@ -172,14 +172,53 @@ class SharedMetrics(HubMetrics):
         # SQL is authoritative. No local audit file or outputs are loaded on startup.
         return 0
 
-    def entries(self, target_id=None, *, after=None, before=None):
+    def entries(
+        self,
+        target_id=None,
+        *,
+        after=None,
+        before=None,
+        lease_id=None,
+        limit=None,
+        states: set[str] | frozenset[str] | None = None,
+    ):
+        if limit is None:
+            rows = shared_records(
+                self.backend,
+                "job",
+                target=target_id,
+                after=after,
+                before=before,
+                lease_id=lease_id,
+            )
+            if states is not None:
+                rows = (row for row in rows if row.get("state") in states)
+        else:
+            rows = self.backend.list(
+                "job",
+                limit=limit,
+                target=target_id,
+                lease_id=lease_id,
+                after=after,
+                before=before,
+                states=states,
+            )
         return sorted(
-            (
-                _entry(self.backend, row)
-                for row in shared_records(self.backend, "job", target=target_id, after=after, before=before)
-            ),
+            (_entry(self.backend, row) for row in rows),
             key=lambda entry: (entry.created_at, entry.id),
         )
+
+    def count_jobs_by_target(self, *, lease_id=None):
+        count = getattr(self.backend, "count_jobs_by_target", None)
+        if count is not None:
+            return count(lease_id=lease_id)
+        return super().count_jobs_by_target(lease_id=lease_id)
+
+    def count_job_records(self, *, lease_id=None, states=None):
+        count = getattr(self.backend, "count_job_records", None)
+        if count is not None:
+            return count(lease_id=lease_id, states=states)
+        return super().count_job_records(lease_id=lease_id, states=states)
 
     def entry(self, job_id):
         record = self.backend.get("job", job_id)

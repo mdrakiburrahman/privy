@@ -87,6 +87,50 @@ def test_same_home_successor_fences_previous_incarnation_without_releasing_pins(
     assert json.loads(insert[1])["home_scope"] == "host:/home"
 
 
+def test_sql_job_pages_apply_state_filters_and_aggregate_counts():
+    class Cursor:
+        def __init__(self):
+            self.responses = [
+                [(json.dumps({"id": "job-1"}),)],
+                [("target-a", 3), ("target-b", 2)],
+                [(3,)],
+            ]
+            self.statements = []
+
+        def execute(self, query, *args):
+            self.statements.append((query, args))
+
+        def fetchall(self):
+            return self.responses.pop(0)
+
+        def fetchone(self):
+            return self.responses.pop(0)[0]
+
+    cursor = Cursor()
+
+    @contextmanager
+    def transaction(_lock=None):
+        yield cursor
+
+    backend = object.__new__(SqlBackend)
+    backend.transaction = transaction
+
+    assert backend.list(
+        "job", limit=2, target="target-a", lease_id="lease-a", states=frozenset({"failed", "error"})
+    ) == [{"id": "job-1"}]
+    assert backend.count_jobs_by_target(lease_id="lease-a") == {"target-a": 3, "target-b": 2}
+    assert backend.count_job_records(lease_id="lease-a", states=frozenset({"failed", "error"})) == 3
+
+    page_query, page_args = cursor.statements[0]
+    assert "JSON_VALUE(payload,'$.state') IN (?,?)" in page_query
+    assert page_args == (2, "job", "target-a", "lease-a", "error", "failed")
+    assert "GROUP BY target" in cursor.statements[1][0]
+    assert cursor.statements[1][1] == ("lease-a",)
+    count_query, count_args = cursor.statements[2]
+    assert "JSON_VALUE(payload,'$.state') IN (?,?)" in count_query
+    assert count_args == ("lease-a", "error", "failed")
+
+
 def test_active_incarnation_from_a_different_home_scope_blocks_startup():
     previous_payload = json.dumps(
         {"owner": "previous", "hub_id": "copied-home-id", "home_scope": "other-host:/home", "active": True}

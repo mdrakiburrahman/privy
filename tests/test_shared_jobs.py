@@ -33,6 +33,7 @@ class Backend:
         self.lock = threading.RLock()
         self.output_reads = 0
         self.query_count = 0
+        self.list_calls = []
 
     def put(self, kind, key, payload):
         with self.lock:
@@ -46,8 +47,22 @@ class Backend:
         with self.lock:
             return copy.deepcopy(self.records.get((kind, key)))
 
-    def list(self, kind, *, limit=200, before=None, after=None, target=None, lease_id=None, client_id=None):
+    def list(
+        self,
+        kind,
+        *,
+        limit=200,
+        before=None,
+        after=None,
+        target=None,
+        lease_id=None,
+        client_id=None,
+        states=None,
+    ):
         self.query_count += 1
+        self.list_calls.append(
+            {"kind": kind, "limit": limit, "target": target, "lease_id": lease_id, "states": states}
+        )
         with self.lock:
             rows = [copy.deepcopy(v) for (k, _), v in self.records.items() if k == kind]
         for name, wanted in (("target", target), ("lease_id", lease_id), ("client_id", client_id)):
@@ -58,7 +73,30 @@ class Backend:
             rows = [r for r in rows if r.get("created_at", r.get("at", 0)) < before]
         if after is not None:
             rows = [r for r in rows if r.get("created_at", r.get("at", 0)) >= after]
+        if states is not None:
+            rows = [r for r in rows if r.get("state") in states]
         return rows[:limit]
+
+    def count_jobs_by_target(self, *, lease_id=None):
+        counts = {}
+        with self.lock:
+            rows = [copy.deepcopy(v) for (kind, _), v in self.records.items() if kind == "job"]
+        for row in rows:
+            if lease_id is None or row.get("lease_id") == lease_id:
+                target = row.get("target")
+                if target is not None:
+                    counts[target] = counts.get(target, 0) + 1
+        return counts
+
+    def count_job_records(self, *, lease_id=None, states=None):
+        with self.lock:
+            rows = [copy.deepcopy(v) for (kind, _), v in self.records.items() if kind == "job"]
+        return sum(
+            1
+            for row in rows
+            if (lease_id is None or row.get("lease_id") == lease_id)
+            and (states is None or row.get("state") in states)
+        )
 
     def count_jobs(self):
         states = [r["state"] for (kind, _), r in self.records.items() if kind == "job"]
@@ -1278,3 +1316,25 @@ def test_sql_process_harness_starts_and_serves_with_fake_backend(missing_depende
         reader.join(timeout=5)
         process.stdout.close()
         shutil.rmtree(home)
+
+
+def test_shared_metrics_page_reads_are_bounded_and_filterable():
+    backend = Backend()
+    metrics = SharedMetrics(backend)
+
+    assert metrics.entries("target-a", lease_id="lease-a", limit=3, states=frozenset({"failed"})) == []
+    assert backend.list_calls == [
+        {
+            "kind": "job",
+            "limit": 3,
+            "target": "target-a",
+            "lease_id": "lease-a",
+            "states": frozenset({"failed"}),
+        }
+    ]
+
+    backend.put("job", "one", {"target": "target-a", "lease_id": "lease-a", "state": "failed"})
+    backend.put("job", "two", {"target": "target-a", "lease_id": "lease-b", "state": "succeeded"})
+    backend.put("job", "three", {"target": "target-b", "lease_id": "lease-a", "state": "failed"})
+    assert metrics.count_jobs_by_target(lease_id="lease-a") == {"target-a": 1, "target-b": 1}
+    assert metrics.count_job_records(lease_id="lease-a", states=frozenset({"failed"})) == 2

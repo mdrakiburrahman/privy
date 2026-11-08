@@ -219,6 +219,47 @@ def test_jobs_page_filters_by_state(tmp_path):
     assert 'class="term bad"' in logs and '<span class="err">boom\n</span>' in logs
 
 
+def test_jobs_and_logs_pages_bound_job_history_reads(hub, monkeypatch):
+    for target, command in ((BOX1, "one"), (BOX1, "two"), (BOX2, "three"), (BOX2, "four")):
+        run(hub, target, command)
+
+    metrics = hub.service.metrics
+    entry_calls = []
+    count_calls = []
+    totals_calls = []
+    original_entries = metrics.entries
+    original_counts = metrics.count_jobs_by_target
+    original_total = metrics.count_job_records
+
+    def entries(*args, **kwargs):
+        entry_calls.append((args, kwargs))
+        return original_entries(*args, **kwargs)
+
+    def counts(*args, **kwargs):
+        count_calls.append(kwargs)
+        return original_counts(*args, **kwargs)
+
+    def total(*args, **kwargs):
+        totals_calls.append(kwargs)
+        return original_total(*args, **kwargs)
+
+    monkeypatch.setattr(metrics, "entries", entries)
+    monkeypatch.setattr(metrics, "count_jobs_by_target", counts)
+    monkeypatch.setattr(metrics, "count_job_records", total)
+
+    jobs = html_of(hub.call("GET", "/ui/jobs?limit=1"))
+    assert len(re.findall(r'<tr data-href="/ui/logs', jobs)) == 1
+    assert "4 jobs" in jobs and "Show more (3 older jobs)" in jobs
+    assert any(kwargs.get("limit") == 2 and kwargs.get("states") is None for _, kwargs in entry_calls)
+    assert totals_calls[-1]["states"] is None
+
+    logs = html_of(hub.call("GET", f"/ui/logs?target={BOX1}&limit=1"))
+    assert len(re.findall(r'<details class="term', logs)) == 1
+    assert "2 jobs kept" in logs and "Show more (1 older job)" in logs
+    assert count_calls[-1] == {"lease_id": None}
+    assert any(args == (BOX1,) and kwargs.get("limit") == 2 for args, kwargs in entry_calls)
+
+
 def test_ui_calls_are_counted_but_not_echoed(hub, capsys):
     hub.app.log_call("GET", "/ui", b"", hub.call("GET", "/ui"), 0.01)
     hub.app.log_call("GET", "/v1", b"", hub.call("GET", "/v1"), 0.01)

@@ -940,11 +940,20 @@ def enrich_lease_report(service: Any, report: dict[str, Any]) -> None:
         row["lease_group"] = by_target.get(row["id"])
 
 
-def lease_entries(service: Any, lease_id: str) -> list[JobEntry]:
-    entries = service.metrics.entries()
-    if not lease_id:
-        return entries
-    return [entry for entry in entries if entry.view().get("lease_id") == lease_id]
+def lease_entries(
+    service: Any,
+    lease_id: str | None,
+    *,
+    limit: int | None = None,
+    target_id: str | None = None,
+    states: set[str] | frozenset[str] | None = None,
+) -> list[JobEntry]:
+    return service.metrics.entries(
+        target_id,
+        lease_id=lease_id,
+        limit=limit,
+        states=states,
+    )
 
 
 def leases_page(service: Any, query: Mapping[str, list[str]], now: float) -> str:
@@ -1393,11 +1402,9 @@ def logs_page(
 ) -> tuple[str, str]:
     rows = report["targets"]
     by_id = {row["id"]: row for row in rows}
-    lease_id = _last(query, "lease")
-    every = lease_entries(service, lease_id)
-    kept: dict[str, int] = {}
-    for entry in every:
-        kept[entry.target_id] = kept.get(entry.target_id, 0) + 1
+    lease_id = _last(query, "lease") or None
+    kept = service.metrics.count_jobs_by_target(lease_id=lease_id)
+    all_count = sum(kept.values())
     selected = _last(query, "target")
     if lease_id and not selected:
         selected = "*"
@@ -1405,9 +1412,17 @@ def logs_page(
         used = sorted((row for row in rows if row["last_used_ts"]), key=lambda row: -row["last_used_ts"])
         selected = used[0]["id"] if used else (rows[0]["id"] if rows else "*")
     limit = limit_of(query, DEFAULT_LOG_LIMIT)
+    entries = lease_entries(
+        service,
+        lease_id,
+        limit=limit + 1,
+        target_id=None if selected == "*" else selected,
+    )
+    entries = sorted(entries, key=lambda entry: entry.created_at, reverse=True)
+    entry_count = all_count if selected == "*" else kept.get(selected, 0)
     pods = [
         f'<a href="{esc(link("/ui/logs", target="*", lease=lease_id))}"{ON if selected == "*" else ""}>'
-        f"<b>All relay HYCOs</b><span>{len(every):,}</span><small>every job, newest first</small></a>"
+        f"<b>All relay HYCOs</b><span>{all_count:,}</span><small>every job, newest first</small></a>"
     ]
     for row in sorted(rows, key=lambda row: (-(row["last_used_ts"] or 0), row["label"].lower())):
         who = row["user"] and row["host"] and f"{row['user']}@{row['host']}"
@@ -1416,8 +1431,6 @@ def logs_page(
             f"<b>{status_dot(row['status'])}{esc(row['label'])}</b><span>{kept.get(row['id'], 0):,}</span>"
             f"<small>{esc(who or row['status'])} · {esc(fmt_ago(row['last_used_ts'], now))}</small></a>"
         )
-    entries = every if selected == "*" else [entry for entry in every if entry.target_id == selected]
-    entries = sorted(entries, key=lambda entry: entry.created_at, reverse=True)
     shown = entries[:limit]
     terms = "".join(
         safe_terminal(
@@ -1433,10 +1446,10 @@ def logs_page(
         terms = (
             '<div class="empty">No jobs have run here since the hub started (and none in audit.jsonl).</div>'
         )
-    elif len(entries) > limit:
+    elif entry_count > limit:
         terms += (
             f'<a class="more" href="{esc(link("/ui/logs", target=selected, lease=lease_id, limit=str(min(MAX_LIMIT, limit * 4))))}">'
-            f"Show more ({len(entries) - limit:,} older jobs)</a>"
+            f"Show more ({plural(entry_count - limit, 'older job')})</a>"
         )
     toolbar = (
         '<div class="toolbar"><input type="search" id="grep" placeholder="grep commands and output…" '
@@ -1447,12 +1460,12 @@ def logs_page(
     )
     row = by_id.get(selected)
     if row is None:
-        heading, chips = "All relay HYCOs", f'<span class="chip">{plural(len(entries), "job")}</span>'
+        heading, chips = "All relay HYCOs", f'<span class="chip">{plural(entry_count, "job")}</span>'
     else:
         heading = row["label"]
         chips = (
             f'<span class="chip mono">{esc(row["id"])}</span>{_status_chip(row)}'
-            f'<span class="chip">{plural(len(entries), "job")} kept</span>'
+            f'<span class="chip">{plural(entry_count, "job")} kept</span>'
         )
         if row["os"]:
             chips += f'<span class="chip">{esc(row["os"])}</span>'
@@ -1482,14 +1495,12 @@ def _status_chip(row: dict[str, Any]) -> str:
 
 def jobs_page(service: Any, report: dict[str, Any], query: Mapping[str, list[str]], now: float) -> str:
     wanted = _last(query, "state").strip().lower()
-    lease_id = _last(query, "lease")
-    entries = sorted(lease_entries(service, lease_id), key=lambda entry: entry.created_at, reverse=True)
-    views = [entry.view() for entry in entries]
-    if wanted == "failed":
-        views = [view for view in views if view["state"] in BAD_STATES]
-    elif wanted:
-        views = [view for view in views if view["state"] == wanted]
+    lease_id = _last(query, "lease") or None
     limit = limit_of(query, DEFAULT_JOB_LIMIT)
+    states = BAD_STATES if wanted == "failed" else frozenset({wanted}) if wanted else None
+    entries = lease_entries(service, lease_id, limit=limit + 1, states=states)
+    views = [entry.view() for entry in entries]
+    total_count = service.metrics.count_job_records(lease_id=lease_id, states=states)
     names = {row["id"]: row["label"] for row in report["targets"]}
     head = (
         "<tr>"
@@ -1530,12 +1541,12 @@ def jobs_page(service: Any, report: dict[str, Any], query: Mapping[str, list[str
         if views
         else '<div class="empty">No jobs match.</div>'
     )
-    if len(views) > limit:
+    if total_count > limit:
         table += (
             f'<a class="more" href="{esc(link("/ui/jobs", state=wanted or None, lease=lease_id, limit=str(min(MAX_LIMIT, limit * 4))))}">'
-            f"Show more ({len(views) - limit:,} older jobs)</a>"
+            f"Show more ({plural(total_count - limit, 'older job')})</a>"
         )
-    chips = f'<span class="seg">{filters}</span><span class="chip">{plural(len(views), "job")}</span>'
+    chips = f'<span class="seg">{filters}</span><span class="chip">{plural(total_count, "job")}</span>'
     if lease_id:
         chips += f'<span class="chip">lease {esc(lease_id)}</span><a href="/ui/jobs">Clear lease filter</a>'
     return hero("EVERY JOB THE HUB REMEMBERS", "Jobs", chips) + section(

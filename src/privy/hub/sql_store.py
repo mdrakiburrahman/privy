@@ -590,9 +590,12 @@ class SqlBackend:
         target: str | None = None,
         lease_id: str | None = None,
         client_id: str | None = None,
+        states: set[str] | frozenset[str] | None = None,
     ) -> list[dict]:
         if not 1 <= limit <= 100_000:
             raise StorageError("SQL page size must be between 1 and 100000")
+        if states is not None and not states:
+            return []
         clauses, params = ["kind=?"], [kind]
         for column, value in (("target", target), ("lease_id", lease_id), ("client_id", client_id)):
             if value is not None:
@@ -604,6 +607,10 @@ class SqlBackend:
         if after is not None:
             clauses.append("at>=?")
             params.append(after)
+        if states is not None:
+            state_values = tuple(sorted(states))
+            clauses.append("JSON_VALUE(payload,'$.state') IN (" + ",".join("?" for _ in state_values) + ")")
+            params.extend(state_values)
         with self.transaction() as cursor:
             cursor.execute(
                 f"SELECT TOP (?) payload FROM dbo.privy_records WHERE {' AND '.join(clauses)} ORDER BY at DESC,id DESC",
@@ -611,6 +618,44 @@ class SqlBackend:
                 *params,
             )
             return [json.loads(row[0]) for row in cursor.fetchall()]
+
+    def count_jobs_by_target(self, *, lease_id: str | None = None) -> dict[str, int]:
+        clauses = ["kind='job'", "target IS NOT NULL"]
+        params = []
+        if lease_id is not None:
+            clauses.append("lease_id=?")
+            params.append(lease_id)
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT target,COUNT_BIG(*) FROM dbo.privy_records WHERE "
+                + " AND ".join(clauses)
+                + " GROUP BY target",
+                *params,
+            )
+            return {str(row[0]): int(row[1]) for row in cursor.fetchall() if row[0] is not None}
+
+    def count_job_records(
+        self,
+        *,
+        lease_id: str | None = None,
+        states: set[str] | frozenset[str] | None = None,
+    ) -> int:
+        if states is not None and not states:
+            return 0
+        clauses, params = ["kind='job'"], []
+        if lease_id is not None:
+            clauses.append("lease_id=?")
+            params.append(lease_id)
+        if states is not None:
+            state_values = tuple(sorted(states))
+            clauses.append("JSON_VALUE(payload,'$.state') IN (" + ",".join("?" for _ in state_values) + ")")
+            params.extend(state_values)
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT COUNT_BIG(*) FROM dbo.privy_records WHERE " + " AND ".join(clauses),
+                *params,
+            )
+            return int(cursor.fetchone()[0])
 
     def count_jobs(self) -> dict:
         with self.transaction() as cursor:

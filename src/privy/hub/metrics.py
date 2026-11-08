@@ -408,12 +408,38 @@ class HubMetrics:
 
     # ---- reading --------------------------------------------------------------
 
-    def entries(self, target_id: str | None = None) -> list[JobEntry]:
+    def entries(
+        self,
+        target_id: str | None = None,
+        *,
+        lease_id: str | None = None,
+        limit: int | None = None,
+        states: set[str] | frozenset[str] | None = None,
+    ) -> list[JobEntry]:
         with self._lock:
             entries = list(self._entries)
         if target_id is not None:
             entries = [entry for entry in entries if entry.target_id == target_id]
+        if lease_id is not None:
+            entries = [entry for entry in entries if entry.lease_id == lease_id]
+        if states is not None:
+            entries = [entry for entry in entries if entry.view()["state"] in states]
+        if limit is not None:
+            entries.sort(key=lambda entry: (entry.created_at, entry.id), reverse=True)
+            entries = entries[:limit]
         return entries
+
+    def count_jobs_by_target(self, *, lease_id: str | None = None) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for entry in self.entries():
+            if lease_id is None or entry.lease_id == lease_id:
+                counts[entry.target_id] = counts.get(entry.target_id, 0) + 1
+        return counts
+
+    def count_job_records(
+        self, *, lease_id: str | None = None, states: set[str] | frozenset[str] | None = None
+    ) -> int:
+        return len(self.entries(lease_id=lease_id, states=states))
 
     def entry(self, job_id: str) -> JobEntry | None:
         with self._lock:
