@@ -238,34 +238,41 @@ def test_report_history_aggregates_probe_and_call_data_in_one_transaction():
     previous = {"job_id": "old", "target": "box", "created_at": 1, "purpose": "earlier"}
     probe = {"target": "box", "at": 3, "status": "online", "latency_ms": 4, "info": {"os": "test"}}
     results = [
-        [(json.dumps(job),)],
-        [(json.dumps(purpose),)],
-        [(json.dumps(previous),)],
-        [("box", 4, 3, 3.0, 1.0, 3.0, "probe-1", "online", 4)],
-        [("probe-1", json.dumps(probe))],
-        [("box", 3.0, 1)],
-        [("box", 4.0)],
-        [(4.0, 4.0)],
-        [("ui", 1, 0, 3.0)],
-        [("queued", 1), ("running", 2)],
+        [[(json.dumps(job),)], [(json.dumps(purpose),)], [(json.dumps(previous),)]],
+        [[("box", 4, 3, 3.0, 1.0, 3.0, json.dumps(probe), "online", 4)]],
+        [
+            [("box", 3.0, 1)],
+            [("box", 4.0)],
+            [(4.0, 4.0)],
+            [("ui", 1, 0, 3.0)],
+            [("queued", 1), ("running", 2)],
+        ],
     ]
 
     class Cursor:
         def __init__(self):
             self.executed = []
-            self.index = -1
+            self.exec_index = -1
+            self.result_index = 0
+            self.nextset_calls = []
 
         def execute(self, query, *params):
             self.executed.append((query, params))
-            self.index += 1
+            self.exec_index += 1
+            self.result_index = 0
             return self
 
         def fetchall(self):
-            return results[self.index]
+            return results[self.exec_index][self.result_index]
 
         def fetchone(self):
-            rows = results[self.index]
+            rows = results[self.exec_index][self.result_index]
             return rows[0] if rows else None
+
+        def nextset(self):
+            self.nextset_calls.append(self.exec_index)
+            self.result_index += 1
+            return self.result_index < len(results[self.exec_index])
 
     cursor = Cursor()
     transactions = []
@@ -279,26 +286,52 @@ def test_report_history_aggregates_probe_and_call_data_in_one_transaction():
     history = backend.report_history(after=2, before=4)
 
     assert transactions == [True]
-    assert len(cursor.executed) == 10
-    assert "GROUP BY target" in cursor.executed[3][0]
-    assert "CROSS APPLY" in cursor.executed[3][0]
-    assert "COUNT_BIG(*) OVER" not in cursor.executed[3][0]
-    assert "kind='probe'" in cursor.executed[3][0]
-    assert cursor.executed[3][1] == (2, 4, 2, 4)
-    assert "OPENJSON(?)" in cursor.executed[4][0]
-    assert cursor.executed[4][1] == ('["probe-1"]',)
-    assert "LAG(probe_status)" in cursor.executed[5][0]
-    target_p50_query = cursor.executed[6][0]
+    assert len(cursor.executed) == 3
+    initial_queries = cursor.executed[0][0].split(";\n")
+    assert len(initial_queries) == 3
+    assert "kind=?" in initial_queries[0]
+    assert "kind=?" in initial_queries[1]
+    assert "kind IN('job','purpose')" in initial_queries[2]
+    assert cursor.executed[0][1] == ("job", 2, 4, "purpose", 2, 4, 2)
+    probe_query = cursor.executed[1][0]
+    assert "GROUP BY target" in probe_query
+    assert "CROSS APPLY" in probe_query
+    assert "COUNT_BIG(*) OVER" not in probe_query
+    assert "kind='probe'" in probe_query
+    assert "latest.payload" in probe_query
+    assert "OPENJSON(?)" not in probe_query
+    assert cursor.executed[1][1] == (2, 4, 2, 4)
+    summary_queries = cursor.executed[2][0].split(";\n")
+    assert len(summary_queries) == 5
+    assert "LAG(probe_status)" in summary_queries[0]
+    target_p50_query = summary_queries[1]
     assert (
         "ROW_NUMBER() OVER(PARTITION BY p.target ORDER BY p.probe_latency_ms,p.at,p.id)" in target_p50_query
     )
     assert "GROUP BY target" in target_p50_query
     assert "COUNT_BIG(*) OVER" not in target_p50_query
     assert "THEN 1 ELSE 0 END + 1" in target_p50_query
-    assert "ORDER BY probe_latency_ms,target,at,id" in cursor.executed[7][0]
-    assert cursor.executed[6][1] == (2, 4, 2, 4)
-    assert cursor.executed[7][1] == (2, 4, 2, 4, 2, 4)
-    assert "GROUP BY JSON_VALUE(payload,'$.surface')" in cursor.executed[8][0]
+    assert "ORDER BY probe_latency_ms,target,at,id" in summary_queries[2]
+    assert "GROUP BY JSON_VALUE(payload,'$.surface')" in summary_queries[3]
+    assert "GROUP BY JSON_VALUE(payload,'$.state')" in summary_queries[4]
+    assert cursor.executed[2][1] == (
+        2,
+        4,
+        2,
+        4,
+        2,
+        4,
+        2,
+        4,
+        2,
+        4,
+        2,
+        4,
+        "call",
+        2,
+        4,
+    )
+    assert cursor.nextset_calls == [0, 0, 0, 2, 2, 2, 2, 2]
     assert history["jobs"] == [job]
     assert history["purposes"] == [purpose]
     assert history["latest_before"] == [previous]

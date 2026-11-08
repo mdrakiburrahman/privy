@@ -922,10 +922,39 @@ class SqlBackend:
 
         decoded = {}
         with self.transaction() as cursor:
-            for name, kind in (("jobs", "job"), ("purposes", "purpose")):
-                where, params = query(kind)
-                cursor.execute(f"SELECT payload FROM dbo.privy_records WHERE {where}", *params)
-                rows = cursor.fetchall()
+
+            def execute_batch(statements, params):
+                cursor.execute(";\n".join(statements), *params)
+                result_sets = []
+                for index in range(len(statements)):
+                    result_sets.append(cursor.fetchall())
+                    has_next = bool(cursor.nextset())
+                    if has_next != (index + 1 < len(statements)):
+                        raise StorageError("Azure SQL report history returned an unexpected result-set count")
+                return result_sets
+
+            job_where, job_params = query("job")
+            purpose_where, purpose_params = query("purpose")
+            latest_before_sql = (
+                "WITH ranked AS (SELECT payload,ROW_NUMBER() OVER(PARTITION BY kind,target "
+                "ORDER BY at DESC,id DESC) AS n FROM dbo.privy_records "
+                "WHERE kind IN('job','purpose') AND at<?) SELECT payload FROM ranked WHERE n=1"
+            )
+            latest_before_params = [after] if after is not None else []
+            if after is None:
+                latest_before_sql = "SELECT payload FROM dbo.privy_records WHERE 1=0"
+            job_rows, purpose_rows, latest_before_rows = execute_batch(
+                [
+                    f"SELECT payload FROM dbo.privy_records WHERE {job_where}",
+                    f"SELECT payload FROM dbo.privy_records WHERE {purpose_where}",
+                    latest_before_sql,
+                ],
+                [*job_params, *purpose_params, *latest_before_params],
+            )
+            for name, kind, rows in (
+                ("jobs", "job", job_rows),
+                ("purposes", "purpose", purpose_rows),
+            ):
                 decode_started = time.perf_counter()
                 decoded[name] = [json.loads(row[0]) for row in rows]
                 if _profile_sql_enabled():
@@ -936,17 +965,7 @@ class SqlBackend:
                         len(rows),
                         (time.perf_counter() - decode_started) * 1000,
                     )
-
-            if after is not None:
-                cursor.execute(
-                    "WITH ranked AS (SELECT payload,ROW_NUMBER() OVER(PARTITION BY kind,target "
-                    "ORDER BY at DESC,id DESC) AS n FROM dbo.privy_records "
-                    "WHERE kind IN('job','purpose') AND at<?) SELECT payload FROM ranked WHERE n=1",
-                    after,
-                )
-                decoded["latest_before"] = [json.loads(row[0]) for row in cursor.fetchall()]
-            else:
-                decoded["latest_before"] = []
+            decoded["latest_before"] = [json.loads(row[0]) for row in latest_before_rows]
 
             where, params = query("probe")
             cursor.execute(
@@ -960,11 +979,11 @@ class SqlBackend:
                     GROUP BY target
                 )
                 SELECT summary.target,summary.sample_count,summary.online_count,
-                    summary.last_online,summary.earliest_at,latest.at,latest.id,
+                    summary.last_online,summary.earliest_at,latest.at,latest.payload,
                     latest.probe_status,latest.probe_latency_ms
                 FROM summary
                 CROSS APPLY (
-                    SELECT TOP(1) p.at,p.id,p.probe_status,p.probe_latency_ms
+                    SELECT TOP(1) p.at,p.payload,p.probe_status,p.probe_latency_ms
                     FROM dbo.privy_records p
                     WHERE {where} AND p.target=summary.target
                     ORDER BY p.at DESC,p.id DESC
@@ -974,33 +993,13 @@ class SqlBackend:
                 *params,
             )
             probe_rows = cursor.fetchall()
-            latest_ids = [str(row[6]) for row in probe_rows]
-            payloads = {}
-            if latest_ids:
-                cursor.execute(
-                    "SELECT id,payload FROM dbo.privy_records WHERE kind='probe' "
-                    "AND id IN (SELECT value FROM OPENJSON(?))",
-                    json.dumps(latest_ids, ensure_ascii=True),
-                )
-                payload_rows = cursor.fetchall()
-                decode_started = time.perf_counter()
-                payloads = {str(key): json.loads(payload) for key, payload in payload_rows}
-                if _profile_sql_enabled():
-                    log.info(
-                        "sql_profile record_decode thread=%s kind=probe_latest rows=%d duration_ms=%.1f",
-                        threading.get_ident(),
-                        len(payload_rows),
-                        (time.perf_counter() - decode_started) * 1000,
-                    )
-
-            where, params = query("probe")
-            cursor.execute(
-                f"""
+            status_where, status_params = query("probe")
+            status_sql = f"""
                 WITH ordered AS (
                     SELECT target,at,id,probe_status,
                         ROW_NUMBER() OVER(PARTITION BY target ORDER BY at,id) AS sample_rank,
                         LAG(probe_status) OVER(PARTITION BY target ORDER BY at,id) AS previous_status
-                    FROM dbo.privy_records WHERE {where}
+                    FROM dbo.privy_records WHERE {status_where}
                 ), changed AS (
                     SELECT *,CASE WHEN sample_rank=1
                         OR (previous_status IS NULL AND probe_status IS NOT NULL)
@@ -1010,20 +1009,13 @@ class SqlBackend:
                 )
                 SELECT target,MAX(at),MAX(CASE WHEN sample_rank=1 THEN 1 ELSE 0 END)
                 FROM changed WHERE status_changed=1 GROUP BY target
-                """,
-                *params,
-            )
-            status_rows = {
-                str(target): (float(since), bool(first)) for target, since, first in cursor.fetchall()
-            }
-
-            where, params = query("probe")
-            where += " AND probe_status='online' AND probe_latency_ms IS NOT NULL"
-            cursor.execute(
-                f"""
+            """
+            target_where, target_params = query("probe")
+            target_where += " AND probe_status='online' AND probe_latency_ms IS NOT NULL"
+            target_p50_sql = f"""
                 WITH counts AS (
                     SELECT target,COUNT_BIG(*) AS sample_count
-                    FROM dbo.privy_records WHERE {where}
+                    FROM dbo.privy_records WHERE {target_where}
                     GROUP BY target
                 ), ranked AS (
                     SELECT p.target,p.probe_latency_ms,
@@ -1031,7 +1023,7 @@ class SqlBackend:
                         counts.sample_count
                     FROM dbo.privy_records p
                     JOIN counts ON counts.target=p.target
-                    WHERE {where}
+                    WHERE {target_where}
                 )
                 SELECT target,MAX(probe_latency_ms)
                 FROM ranked
@@ -1039,28 +1031,20 @@ class SqlBackend:
                     CASE WHEN (sample_count-1)%2=1
                         AND ((sample_count-1)/2)%2=1 THEN 1 ELSE 0 END + 1
                 GROUP BY target
-                """,
-                *params,
-                *params,
-            )
-            latency_by_target = {
-                str(target): float(p50) if p50 is not None else None for target, p50 in cursor.fetchall()
-            }
-
-            where, params = query("probe")
-            where += " AND probe_status='online' AND probe_latency_ms IS NOT NULL"
-            cursor.execute(
-                f"""
+            """
+            overall_where, overall_params = query("probe")
+            overall_where += " AND probe_status='online' AND probe_latency_ms IS NOT NULL"
+            overall_sql = f"""
                 WITH counts AS (
                     SELECT COUNT_BIG(*) AS sample_count
-                    FROM dbo.privy_records WHERE {where}
+                    FROM dbo.privy_records WHERE {overall_where}
                     HAVING COUNT_BIG(*) > 0
                 )
                 SELECT p50.probe_latency_ms,p95.probe_latency_ms
                 FROM counts
                 CROSS APPLY (
                     SELECT probe_latency_ms FROM dbo.privy_records
-                    WHERE {where}
+                    WHERE {overall_where}
                         AND probe_status='online' AND probe_latency_ms IS NOT NULL
                     ORDER BY probe_latency_ms,target,at,id
                     OFFSET (counts.sample_count-1)/2 +
@@ -1070,7 +1054,7 @@ class SqlBackend:
                 ) p50
                 CROSS APPLY (
                     SELECT probe_latency_ms FROM dbo.privy_records
-                    WHERE {where}
+                    WHERE {overall_where}
                         AND probe_status='online' AND probe_latency_ms IS NOT NULL
                     ORDER BY probe_latency_ms,target,at,id
                     OFFSET ((counts.sample_count-1)*19)/20 +
@@ -1080,15 +1064,45 @@ class SqlBackend:
                             THEN 1 ELSE 0 END ROWS
                     FETCH NEXT 1 ROWS ONLY
                 ) p95
-                """,
-                *params,
-                *params,
-                *params,
+            """
+            call_where, call_params = query("call")
+            calls_sql = (
+                "SELECT JSON_VALUE(payload,'$.surface'),COUNT_BIG(*),"
+                "SUM(CASE WHEN TRY_CONVERT(int,JSON_VALUE(payload,'$.status'))>=400 THEN 1 ELSE 0 END),"
+                f"MIN(at) FROM dbo.privy_records WHERE {call_where} "
+                "GROUP BY JSON_VALUE(payload,'$.surface')"
             )
-            overall_row = cursor.fetchone()
+            job_counts_sql = (
+                "SELECT JSON_VALUE(payload,'$.state'),COUNT_BIG(*) "
+                "FROM dbo.privy_records WHERE kind='job' GROUP BY JSON_VALUE(payload,'$.state')"
+            )
+            (
+                status_result,
+                target_p50_result,
+                overall_result,
+                call_rows,
+                job_count_rows,
+            ) = execute_batch(
+                [status_sql, target_p50_sql, overall_sql, calls_sql, job_counts_sql],
+                [
+                    *status_params,
+                    *target_params,
+                    *target_params,
+                    *overall_params,
+                    *overall_params,
+                    *overall_params,
+                    *call_params,
+                ],
+            )
+            status_rows = {str(target): (float(since), bool(first)) for target, since, first in status_result}
+            latency_by_target = {
+                str(target): float(p50) if p50 is not None else None for target, p50 in target_p50_result
+            }
+            overall_row = overall_result[0] if overall_result else None
             overall_p50, overall_p95 = overall_row if overall_row is not None else (None, None)
             overall_p50 = float(overall_p50) if overall_p50 is not None else None
             overall_p95 = float(overall_p95) if overall_p95 is not None else None
+            counts = {row[0]: int(row[1]) for row in job_count_rows}
 
             by_target = {}
             decoded["probes"] = []
@@ -1106,7 +1120,7 @@ class SqlBackend:
                 }
                 by_target[target] = stats
                 sample_count += stats["samples"]
-                latest = payloads.get(str(row[6]), {})
+                latest = json.loads(row[6])
                 latest.update(target=target, at=float(row[5]), status=row[7], latency_ms=row[8])
                 decoded["probes"].append(latest)
 
@@ -1116,15 +1130,6 @@ class SqlBackend:
                 "latency_p50_ms": overall_p50,
                 "latency_p95_ms": overall_p95,
             }
-            where, params = query("call")
-            cursor.execute(
-                f"SELECT JSON_VALUE(payload,'$.surface'),COUNT_BIG(*),"
-                "SUM(CASE WHEN TRY_CONVERT(int,JSON_VALUE(payload,'$.status'))>=400 THEN 1 ELSE 0 END),"
-                f"MIN(at) FROM dbo.privy_records WHERE {where} "
-                "GROUP BY JSON_VALUE(payload,'$.surface')",
-                *params,
-            )
-            call_rows = cursor.fetchall()
             call_stats = {"total": 0, "by_surface": {}, "errors": 0, "earliest_at": None}
             for surface, count, errors, earliest_at in call_rows:
                 count, errors = int(count), int(errors or 0)
@@ -1138,11 +1143,6 @@ class SqlBackend:
             decoded["call_stats"] = call_stats
             decoded["calls"] = []
 
-            cursor.execute(
-                "SELECT JSON_VALUE(payload,'$.state'),COUNT_BIG(*) "
-                "FROM dbo.privy_records WHERE kind='job' GROUP BY JSON_VALUE(payload,'$.state')"
-            )
-            counts = {row[0]: int(row[1]) for row in cursor.fetchall()}
             decoded["job_counts"] = {
                 "queued": counts.get("queued", 0),
                 "running": counts.get("running", 0),
