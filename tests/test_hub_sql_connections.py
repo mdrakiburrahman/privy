@@ -105,10 +105,10 @@ def test_report_history_reads_all_kinds_in_one_transaction():
     results = [
         [(json.dumps(job),)],
         [(json.dumps(purpose),)],
+        [(json.dumps(call),)],
         [(json.dumps(previous),)],
         [("box", 3, "probe-1", "online", 4)],
         [("probe-1", json.dumps(probe))],
-        [(json.dumps(call),)],
         [("queued", 1), ("running", 2)],
     ]
 
