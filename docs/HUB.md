@@ -107,12 +107,13 @@ error. Once a snapshot is available, dashboard reads can serve it while backgrou
 continue; its age can grow during an outage. A cold read that cannot hydrate in time returns 503
 with `Retry-After`. Shared record deletions are reconciled periodically, so they can remain visible
 for up to the reconciliation interval plus a refresh. Lease mutations and output cursor claims
-remain SQL-authoritative. `/v1` includes detailed storage health. The isolated Basic-tier SQL benchmark (20 simulated
-devboxes, 3,360 jobs over seven days, 4 KiB output per job) measured a 200-job page at 0.63 seconds,
-seven-day statistics at 4.21 seconds, dashboard HTML at 5.35 seconds and an output page at 1.42
-seconds. This is not a production-tier or two-physical-machine measurement. Dashboard pages render
-cached listener statuses while stale probes continue in the background, waiting at most 0.5 seconds
-for a refresh. SQL-backed reports reuse the job counts already read for that page.
+remain SQL-authoritative. `/v1` includes detailed storage health. The isolated Basic-tier SQL
+benchmark (20 simulated devboxes, 3,360 jobs over seven days, 4 KiB output per job) measured a
+200-job page at 0.63 seconds, seven-day statistics at 4.21 seconds, dashboard HTML at 5.35 seconds
+and an output page at 1.42 seconds. This is not a production-tier or two-physical-machine
+measurement. Dashboard pages render cached listener statuses while stale probes continue in the
+background, waiting at most 0.5 seconds for a refresh. SQL-backed reports reuse the job counts
+already read for that page.
 
 Probe history reads use a covering SQL index over computed status and latency fields, while fetching
 full payloads only for each target's latest probe; the additive schema bootstrap is serialized and
@@ -581,11 +582,11 @@ On **Relay HYCOs**, the **Status** column is color-coded: green for `online`, or
 The line under it says how long the HYCO has had that status, such as "for 2h 15m", plus the reason
 when it is not online. "For at least" means the status has not changed since the hub first checked
 that HYCO. **Last seen online** shows "now" for online HYCOs, the last time the hub saw the others
-online, or "not since hub start". Both come from listener probes, which run when a page or tool
-asks about a HYCO, so they are approximate. In file mode they are kept in memory and reset on
-restart; in SQL mode retained probe history is shared and can be recovered after restart.
-`GET /v1/stats` reports them per HYCO as `status_since`, `status_since_first_check`,
-and `last_online`; each is `null` when unknown.
+online, or "not since hub start". Both come from listener probes, which run when a page or tool asks
+about a HYCO, so they are approximate. In file mode they are kept in memory and reset on restart; in
+SQL mode retained probe history is shared and can be recovered after restart. `GET /v1/stats`
+reports them per HYCO as `status_since`, `status_since_first_check`, and `last_online`; each is
+`null` when unknown.
 
 **Relay HYCOs** also shows **OS**, **Env**, **Privy**, and **Python** columns, with **Arch** and
 **Shell** available from **Columns**; the column choice is remembered in the browser. The filter
@@ -619,12 +620,12 @@ resolutions return HTTP 400. Responses expose `requested_resolution`, `bucket_s`
 resolution), and `resolution_adjusted`. Omitting the new parameters preserves the existing 24-hour
 view and preset bucket widths.
 
-In file mode, jobs, request samples, and probe measurements are kept in RAM without age-based
-expiry during the process lifetime; request/probe history and buffered job output are lost on
-restart. Recent job summaries can be restored from `audit.jsonl`. In SQL mode, job summaries,
-output, request samples, and probes are shared and retained according to the configured SQL
-retention period, with active work protected from cleanup. Process-bound workers and terminals
-do not restart on another hub.
+In file mode, jobs, request samples, and probe measurements are kept in RAM without age-based expiry
+during the process lifetime; request/probe history and buffered job output are lost on restart.
+Recent job summaries can be restored from `audit.jsonl`. In SQL mode, job summaries, output, request
+samples, and probes are shared and retained according to the configured SQL retention period, with
+active work protected from cleanup. Process-bound workers and terminals do not restart on another
+hub.
 
 ### Export Relay credentials
 
