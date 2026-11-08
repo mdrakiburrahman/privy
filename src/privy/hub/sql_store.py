@@ -264,6 +264,10 @@ class DurableOutbox:
                 "SELECT seq,kind,key,payload,owner FROM pending ORDER BY seq LIMIT ?", (limit,)
             ).fetchall()
 
+    def pending_keys(self) -> set[tuple[str, str]]:
+        with self._lock:
+            return set(self._db.execute("SELECT DISTINCT kind,key FROM pending").fetchall())
+
     def ack(self, seq: int) -> None:
         with self._lock:
             self._db.execute("DELETE FROM pending WHERE seq=?", (seq,))
@@ -494,6 +498,15 @@ FROM @latest n WHERE n.kind='output' AND NOT EXISTS(
       AND p.chunk_index=CAST(JSON_VALUE(n.payload,'$.index') AS bigint));
 """
 
+_READ_SCHEMA = """
+IF COL_LENGTH('dbo.privy_records','change_version') IS NULL
+    ALTER TABLE dbo.privy_records ADD change_version rowversion;
+IF NOT EXISTS(SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.privy_records')
+    AND name='IX_privy_read_changes')
+    EXEC('CREATE INDEX IX_privy_read_changes ON dbo.privy_records(change_version)
+        INCLUDE(kind,id) WHERE kind<>''probe'' AND kind<>''call''');
+"""
+
 
 class SqlBackend:
     def __init__(self, settings: SqlSettings, home: Path, *, connect=None, start_worker: bool = True) -> None:
@@ -655,6 +668,7 @@ class SqlBackend:
     def bootstrap(self) -> None:
         with self.transaction("privy.schema.v1") as cursor:
             cursor.execute(_SCHEMA)
+            cursor.execute(_READ_SCHEMA)
             cursor.execute("SELECT version FROM dbo.privy_schema")
             versions = [row[0] for row in cursor.fetchall()]
             if versions != [1]:
@@ -760,6 +774,9 @@ class SqlBackend:
         if not kind or len(kind) > 32 or not key or len(key) > 400:
             raise StorageError("SQL record identity is invalid")
         result = self.outbox.append(kind, key, payload, self.owner)
+        read_model = getattr(self, "read_model", None)
+        if read_model is not None:
+            read_model.apply(kind, key, payload)
         self._wake.set()
         return result
 
@@ -802,6 +819,58 @@ class SqlBackend:
                 cursor.execute(_FLUSH_BATCH, json.dumps(batch, ensure_ascii=True))
             self.outbox.ack_batch([row[0] for row in rows])
             self._last_error = None
+
+    def read_changes(self, version: bytes, *, limit: int = 2000):
+        with self.transaction() as cursor:
+            # MIN_ACTIVE_ROWVERSION excludes uncommitted writes; advancing to
+            # @@DBTS could permanently miss an older transaction committing later.
+            cursor.execute("SELECT MIN_ACTIVE_ROWVERSION()")
+            upper = bytes(cursor.fetchone()[0])
+            cursor.execute(
+                "SELECT TOP (?) change_version,kind,id,payload FROM dbo.privy_records "
+                "WHERE kind<>'probe' AND kind<>'call' AND change_version>? AND change_version<? "
+                "ORDER BY change_version",
+                limit,
+                version,
+                upper,
+            )
+            rows = cursor.fetchall()
+        complete = len(rows) < limit
+        # The exclusive bound is the next possible committed version.
+        watermark = (int.from_bytes(upper, "big") - 1).to_bytes(8, "big") if complete else bytes(rows[-1][0])
+        return (
+            watermark,
+            [(str(kind), str(key), json.loads(payload)) for _, kind, key, payload in rows],
+            complete,
+        )
+
+    def read_record_keys(self):
+        with self.transaction() as cursor:
+            cursor.execute("SELECT kind,id FROM dbo.privy_records WHERE kind<>'probe' AND kind<>'call'")
+            return {(str(kind), str(key)) for kind, key in cursor.fetchall()}
+
+    def read_latest_probes(self):
+        with self.transaction() as cursor:
+            cursor.execute(
+                "WITH ranked AS (SELECT target,payload,ROW_NUMBER() OVER("
+                "PARTITION BY target ORDER BY at DESC,id DESC) AS n FROM dbo.privy_records WHERE kind='probe') "
+                "SELECT target,payload FROM ranked WHERE n=1"
+            )
+            return {str(target): json.loads(payload) for target, payload in cursor.fetchall()}
+
+    def read_output_snapshot(self, job_id: str):
+        with self.transaction() as cursor:
+            cursor.execute(
+                "WITH tail AS (SELECT TOP (4096) chunk_index,payload FROM dbo.privy_output "
+                "WHERE job_id=? ORDER BY chunk_index DESC), bounded AS ("
+                "SELECT chunk_index,payload,SUM(CONVERT(bigint,DATALENGTH(payload))) OVER("
+                "ORDER BY chunk_index DESC ROWS UNBOUNDED PRECEDING) AS bytes,"
+                "ROW_NUMBER() OVER(ORDER BY chunk_index DESC) AS n FROM tail) "
+                "SELECT payload FROM bounded WHERE bytes<=8388608 OR n=1 ORDER BY chunk_index",
+                job_id,
+            )
+            rows = [json.loads(row[0]) for row in cursor.fetchall()]
+        return sorted(rows, key=lambda row: row["index"])
 
     def get(self, kind: str, key: str) -> dict | None:
         with self.transaction() as cursor:
@@ -1676,6 +1745,9 @@ class SqlBackend:
     def close(self) -> None:
         self._stop.set()
         self._wake.set()
+        read_model = getattr(self, "read_model", None)
+        if read_model is not None:
+            read_model.close()
         if self._thread is not None:
             self._thread.join(timeout=35)
             if self._thread.is_alive():
@@ -1771,11 +1843,22 @@ class SqlLeaseLock:
             }
         )
 
-    @contextmanager
-    def read_snapshot(self):
-        """Return a fresh detached SQL-time view without taking either lease lock."""
+    def _load_read_snapshot(self):
         with self.backend.transaction(isolation_level="SERIALIZABLE") as cursor:
             snapshot = self._read_snapshot(cursor)
+        snapshot["_read_at"] = time.monotonic()
+        return snapshot
+
+    @contextmanager
+    def read_snapshot(self):
+        """Return a detached SQL-time view; mutations never use this cache."""
+        model = getattr(self.backend, "read_model", None)
+        snapshot = (
+            model.reads.get(("coordination",), self._load_read_snapshot)
+            if model is not None
+            else self._load_read_snapshot()
+        )
+        snapshot["now"] += max(0, time.monotonic() - snapshot.pop("_read_at"))
         yield snapshot
 
     def __enter__(self):
@@ -1836,7 +1919,21 @@ class SqlLeaseLock:
                                 kind,
                                 key,
                             )
-            return self._local.transaction.__exit__(typ, value, trace)
+            result = self._local.transaction.__exit__(typ, value, trace)
+            model = getattr(self.backend, "read_model", None)
+            if typ is None and model is not None:
+                model.reads.publish(
+                    ("coordination",),
+                    {
+                        "clients": self.store._clients,
+                        "leases": self.store._leases,
+                        "uses": self.store._uses,
+                        "now": self._local.now,
+                        "_read_at": time.monotonic(),
+                    },
+                    self._load_read_snapshot,
+                )
+            return result
         except BaseException as exc:
             if typ is None:
                 self._local.transaction.__exit__(type(exc), exc, exc.__traceback__)

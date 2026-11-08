@@ -795,15 +795,17 @@ class SharedJobManager(JobManager):
                 self._finish_locked(job, ERROR, error="shared worker could not persist its state")
 
     def get(self, job_id: str) -> SharedJob:
-        record = self.backend.get("job", job_id.strip())
+        reader = getattr(self.backend, "read_model", self.backend)
+        record = reader.get("job", job_id.strip())
         if record is None:
             raise JobLookupError(f"unknown job {job_id!r}")
-        return SharedJob(self.backend, record)
+        return SharedJob(reader, record)
 
     def list(self, *, target_id=None, limit=20, lease_id=None, client_id=None):
+        reader = getattr(self.backend, "read_model", self.backend)
         return [
-            SharedJob(self.backend, row, snapshot=True)
-            for row in self.backend.list(
+            SharedJob(reader, row, snapshot=True)
+            for row in reader.list(
                 "job",
                 limit=limit,
                 target=target_id,
@@ -813,7 +815,7 @@ class SharedJobManager(JobManager):
         ]
 
     def counts(self):
-        return self.backend.count_jobs()
+        return getattr(self.backend, "read_model", self.backend).count_jobs()
 
     def start_broadcast(self, *args, **kwargs):
         broadcast, jobs = super().start_broadcast(*args, **kwargs)
