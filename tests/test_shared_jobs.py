@@ -1196,10 +1196,26 @@ class ProcessCursor:
     def __init__(self, backend):
         self.backend = backend
         self.rows = []
+        self.result_sets = []
+        self.result_set_index = 0
 
     def execute(self, sql, *args):
         self.rows = []
-        if "DATEDIFF_BIG" in sql:
+        self.result_sets = []
+        self.result_set_index = 0
+        if "SELECT CASE WHEN EXISTS" in sql:
+            self.result_sets = [
+                [(1,)],
+                [(time.time(),)],
+                [(self.backend.coordination["config", "targets"],)],
+                [
+                    (kind, key, raw)
+                    for (kind, key), raw in self.backend.coordination.items()
+                    if kind in ("client", "lease", "use")
+                ],
+            ]
+            self.rows = self.result_sets[0]
+        elif "DATEDIFF_BIG" in sql:
             self.rows = [(time.time(),)]
         elif "SELECT payload" in sql and "id='targets'" in sql:
             self.rows = [(self.backend.coordination["config", "targets"],)]
@@ -1226,6 +1242,13 @@ class ProcessCursor:
 
     def fetchall(self):
         return self.rows
+
+    def nextset(self):
+        if self.result_set_index + 1 >= len(self.result_sets):
+            return False
+        self.result_set_index += 1
+        self.rows = self.result_sets[self.result_set_index]
+        return True
 
 
 @pytest.mark.parametrize("missing_dependency", ["sql_modules", "odbc_driver"])
