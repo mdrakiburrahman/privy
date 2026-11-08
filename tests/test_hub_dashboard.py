@@ -260,6 +260,20 @@ def test_jobs_and_logs_pages_bound_job_history_reads(hub, monkeypatch):
     assert any(args == (BOX1,) and kwargs.get("limit") == 2 for args, kwargs in entry_calls)
 
 
+def test_jobs_and_leases_pages_skip_full_dashboard_history_report(hub, monkeypatch):
+    run(hub, BOX1, "one")
+
+    def unexpected_report(*args, **kwargs):
+        pytest.fail("jobs and leases pages must not load the full dashboard report")
+
+    monkeypatch.setattr(dashboard, "build_report", unexpected_report)
+
+    jobs = html_of(hub.call("GET", "/ui/jobs"))
+    leases = html_of(hub.call("GET", "/ui/leases"))
+    assert "1 job" in jobs
+    assert "<title>Leases · privy hub</title>" in leases
+
+
 def test_ui_calls_are_counted_but_not_echoed(hub, capsys):
     hub.app.log_call("GET", "/ui", b"", hub.call("GET", "/ui"), 0.01)
     hub.app.log_call("GET", "/v1", b"", hub.call("GET", "/v1"), 0.01)

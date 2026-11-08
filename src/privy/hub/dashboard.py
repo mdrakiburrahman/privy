@@ -314,6 +314,39 @@ def build_report(
     return report
 
 
+def build_shell_report(service: Any, selection: ReportSelection) -> dict[str, Any]:
+    """Build only the current counts needed by the jobs and leases page shell."""
+    targets = list(service.registry.snapshot().targets)
+    now = time.time()
+    start, end, _, _ = selection.window(now, service.started_at)
+    jobs = service.jobs.counts()
+    path_counts: dict[str, int] = {}
+    for target in targets:
+        key = target.path.lower()
+        path_counts[key] = path_counts.get(key, 0) + 1
+    return {
+        "range": selection.range_name,
+        "kept_jobs": service.metrics.count_job_records(),
+        "jobs": {
+            "total": service.metrics.count_job_records(
+                after=None if selection.range_name == "all" else start, before=end
+            ),
+            "running": jobs["running"],
+            "queued": jobs["queued"],
+        },
+        "targets_total": len(targets),
+        "targets_online": sum(
+            1
+            for target in targets
+            if (probe := service.registry.cached(target)) is not None and probe.status == ONLINE
+        ),
+        "targets": [
+            {"id": target.id, "label": target.id if path_counts[target.path.lower()] > 1 else target.path}
+            for target in targets
+        ],
+    }
+
+
 def _last(query: Mapping[str, list[str]], name: str, default: str = "") -> str:
     values = query.get(name)
     return values[-1] if values else default
@@ -971,11 +1004,7 @@ def leases_page(service: Any, query: Mapping[str, list[str]], now: float) -> str
     by_lease = {lease["lease_id"]: lease for lease in all_leases}
     groups = store.groups()
     clients = store.list_clients(active=False)
-    job_counts: dict[str, int] = {}
-    for entry in service.metrics.entries():
-        lease_id = entry.view().get("lease_id")
-        if lease_id:
-            job_counts[lease_id] = job_counts.get(lease_id, 0) + 1
+    job_counts = service.metrics.count_jobs_by_lease()
     chips = (
         f'<span class="chip">{plural(len(store.list_leases()), "active lease")}</span>'
         f'<span class="chip">{sum(bool(client.get("leases")) for client in clients)} clients holding</span>'
@@ -1564,8 +1593,11 @@ def render(service: Any, page: str, query: Mapping[str, list[str]], base_url: st
         selection = ReportSelection.parse(query) if page == "overview" else ReportSelection(range_name=rng)
     except ValueError as exc:
         return error_response(400, "invalid_argument", str(exc))
-    report = build_report(service, selection=selection)
-    enrich_lease_report(service, report)
+    if page in ("leases", "jobs"):
+        report = build_shell_report(service, selection)
+    else:
+        report = build_report(service, selection=selection)
+        enrich_lease_report(service, report)
     now = time.time()
     nonce = secrets.token_urlsafe(18)
     params: dict[str, str | None] = {}

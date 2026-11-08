@@ -436,10 +436,26 @@ class HubMetrics:
                 counts[entry.target_id] = counts.get(entry.target_id, 0) + 1
         return counts
 
+    def count_jobs_by_lease(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for entry in self.entries():
+            if entry.lease_id:
+                counts[entry.lease_id] = counts.get(entry.lease_id, 0) + 1
+        return counts
+
     def count_job_records(
-        self, *, lease_id: str | None = None, states: set[str] | frozenset[str] | None = None
+        self,
+        *,
+        lease_id: str | None = None,
+        states: set[str] | frozenset[str] | None = None,
+        after: float | None = None,
+        before: float | None = None,
     ) -> int:
-        return len(self.entries(lease_id=lease_id, states=states))
+        return sum(
+            1
+            for entry in self.entries(lease_id=lease_id, states=states)
+            if (after is None or entry.created_at >= after) and (before is None or entry.created_at < before)
+        )
 
     def entry(self, job_id: str) -> JobEntry | None:
         with self._lock:

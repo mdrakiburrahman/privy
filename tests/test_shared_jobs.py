@@ -88,7 +88,7 @@ class Backend:
                     counts[target] = counts.get(target, 0) + 1
         return counts
 
-    def count_job_records(self, *, lease_id=None, states=None):
+    def count_job_records(self, *, lease_id=None, states=None, after=None, before=None):
         with self.lock:
             rows = [copy.deepcopy(v) for (kind, _), v in self.records.items() if kind == "job"]
         return sum(
@@ -96,6 +96,8 @@ class Backend:
             for row in rows
             if (lease_id is None or row.get("lease_id") == lease_id)
             and (states is None or row.get("state") in states)
+            and (after is None or row.get("created_at", row.get("at", 0)) >= after)
+            and (before is None or row.get("created_at", row.get("at", 0)) < before)
         )
 
     def count_jobs(self):

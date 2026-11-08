@@ -93,6 +93,7 @@ def test_sql_job_pages_apply_state_filters_and_aggregate_counts():
             self.responses = [
                 [(json.dumps({"id": "job-1"}),)],
                 [("target-a", 3), ("target-b", 2)],
+                [("lease-a", 4)],
                 [(3,)],
             ]
             self.statements = []
@@ -119,16 +120,49 @@ def test_sql_job_pages_apply_state_filters_and_aggregate_counts():
         "job", limit=2, target="target-a", lease_id="lease-a", states=frozenset({"failed", "error"})
     ) == [{"id": "job-1"}]
     assert backend.count_jobs_by_target(lease_id="lease-a") == {"target-a": 3, "target-b": 2}
-    assert backend.count_job_records(lease_id="lease-a", states=frozenset({"failed", "error"})) == 3
+    assert backend.count_jobs_by_lease() == {"lease-a": 4}
+    assert backend.count_job_records(
+        lease_id="lease-a", states=frozenset({"failed", "error"}), after=10, before=20
+    ) == 3
 
     page_query, page_args = cursor.statements[0]
     assert "JSON_VALUE(payload,'$.state') IN (?,?)" in page_query
     assert page_args == (2, "job", "target-a", "lease-a", "error", "failed")
     assert "GROUP BY target" in cursor.statements[1][0]
     assert cursor.statements[1][1] == ("lease-a",)
-    count_query, count_args = cursor.statements[2]
+    assert "GROUP BY lease_id" in cursor.statements[2][0]
+    assert "lease_id<>''" in cursor.statements[2][0]
+    count_query, count_args = cursor.statements[3]
+    assert "at>=?" in count_query and "at<?" in count_query
     assert "JSON_VALUE(payload,'$.state') IN (?,?)" in count_query
-    assert count_args == ("lease-a", "error", "failed")
+    assert count_args == ("lease-a", 10, 20, "error", "failed")
+
+
+def test_sql_history_scan_uses_larger_bounded_keyset_pages():
+    class Cursor:
+        def __init__(self):
+            self.statement = None
+
+        def execute(self, query, *args):
+            self.statement = (query, args)
+
+        def fetchall(self):
+            return [(100.0, "record-1", json.dumps({"created_at": 100.0}))]
+
+    cursor = Cursor()
+
+    @contextmanager
+    def transaction(_lock=None):
+        yield cursor
+
+    backend = object.__new__(SqlBackend)
+    backend.transaction = transaction
+
+    assert list(backend.scan("probe", after=0)) == [{"created_at": 100.0}]
+    query, args = cursor.statement
+    assert "SELECT TOP (5000)" in query
+    assert "ORDER BY at DESC,id DESC" in query
+    assert args == ("probe", 0)
 
 
 def test_active_incarnation_from_a_different_home_scope_blocks_startup():

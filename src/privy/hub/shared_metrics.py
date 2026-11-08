@@ -214,11 +214,17 @@ class SharedMetrics(HubMetrics):
             return count(lease_id=lease_id)
         return super().count_jobs_by_target(lease_id=lease_id)
 
-    def count_job_records(self, *, lease_id=None, states=None):
+    def count_jobs_by_lease(self):
+        count = getattr(self.backend, "count_jobs_by_lease", None)
+        if count is not None:
+            return count()
+        return super().count_jobs_by_lease()
+
+    def count_job_records(self, *, lease_id=None, states=None, after=None, before=None):
         count = getattr(self.backend, "count_job_records", None)
         if count is not None:
-            return count(lease_id=lease_id, states=states)
-        return super().count_job_records(lease_id=lease_id, states=states)
+            return count(lease_id=lease_id, states=states, after=after, before=before)
+        return super().count_job_records(lease_id=lease_id, states=states, after=after, before=before)
 
     def entry(self, job_id):
         record = self.backend.get("job", job_id)

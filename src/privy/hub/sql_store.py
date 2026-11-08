@@ -634,11 +634,21 @@ class SqlBackend:
             )
             return {str(row[0]): int(row[1]) for row in cursor.fetchall() if row[0] is not None}
 
+    def count_jobs_by_lease(self) -> dict[str, int]:
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT lease_id,COUNT_BIG(*) FROM dbo.privy_records "
+                "WHERE kind='job' AND lease_id IS NOT NULL AND lease_id<>'' GROUP BY lease_id"
+            )
+            return {str(row[0]): int(row[1]) for row in cursor.fetchall() if row[0] is not None}
+
     def count_job_records(
         self,
         *,
         lease_id: str | None = None,
         states: set[str] | frozenset[str] | None = None,
+        after: float | None = None,
+        before: float | None = None,
     ) -> int:
         if states is not None and not states:
             return 0
@@ -646,6 +656,12 @@ class SqlBackend:
         if lease_id is not None:
             clauses.append("lease_id=?")
             params.append(lease_id)
+        if after is not None:
+            clauses.append("at>=?")
+            params.append(after)
+        if before is not None:
+            clauses.append("at<?")
+            params.append(before)
         if states is not None:
             state_values = tuple(sorted(states))
             clauses.append("JSON_VALUE(payload,'$.state') IN (" + ",".join("?" for _ in state_values) + ")")
@@ -670,6 +686,7 @@ class SqlBackend:
             }
 
     def scan(self, kind: str, *, before=None, after=None, target=None, lease_id=None, client_id=None):
+        page_size = 5000
         clauses, params = ["kind=?"], [kind]
         for column, value in (("target", target), ("lease_id", lease_id), ("client_id", client_id)):
             if value is not None:
@@ -690,13 +707,13 @@ class SqlBackend:
                 page_params.extend((at, at, key))
             with self.transaction() as cursor:
                 cursor.execute(
-                    f"SELECT TOP (1000) at,id,payload FROM dbo.privy_records "
+                    f"SELECT TOP ({page_size}) at,id,payload FROM dbo.privy_records "
                     f"WHERE {' AND '.join(page_clauses)} ORDER BY at DESC,id DESC",
                     *page_params,
                 )
                 page = cursor.fetchall()
             yield from (json.loads(row[2]) for row in page)
-            if len(page) < 1000:
+            if len(page) < page_size:
                 return
             boundary = page[-1][0], page[-1][1]
 
