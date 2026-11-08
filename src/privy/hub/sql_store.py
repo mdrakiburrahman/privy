@@ -515,6 +515,15 @@ class SqlBackend:
                 (time.perf_counter() - connection_started) * 1000,
             )
         cursor = None
+
+        def close_cursor() -> None:
+            nonlocal cursor
+            if cursor is None:
+                return
+            current, cursor = cursor, None
+            current.close()
+
+        cursor_close_error = None
         try:
             raw_cursor = connection.cursor()
             cursor = _ProfileCursor(raw_cursor) if profile else raw_cursor
@@ -528,28 +537,37 @@ class SqlBackend:
                 if cursor.fetchone()[0] < 0:
                     raise StorageError("SQL coordination lock timed out")
             yield cursor
+            try:
+                close_cursor()
+            except Exception as close_error:
+                cursor_close_error = close_error
+                raise
             connection.commit()
         except BaseException as exc:
             if type(exc).__module__ == "pyodbc" and hasattr(connection, "invalidate"):
                 connection.invalidate()
+            if cursor_close_error is exc and hasattr(connection, "invalidate"):
+                connection.invalidate()
             try:
-                connection.rollback()
-            except Exception as rollback_error:
-                log.error("Azure SQL rollback failed; connection discarded, no file fallback")
-                raise StorageError("Authoritative SQL transaction rollback failed") from rollback_error
-            if type(exc).__module__ == "pyodbc":
-                raise StorageError("Authoritative Azure SQL transaction failed; no file fallback") from exc
-            raise
-        finally:
-            try:
-                if cursor is not None:
-                    cursor.close()
+                close_cursor()
             except Exception:
                 if hasattr(connection, "invalidate"):
                     connection.invalidate()
                 log.exception("Azure SQL cursor close failed; connection discarded")
-            finally:
-                connection.close()
+            try:
+                connection.rollback()
+            except Exception as rollback_error:
+                if hasattr(connection, "invalidate"):
+                    connection.invalidate()
+                log.exception("Azure SQL rollback failed; connection discarded, no file fallback")
+                raise StorageError("Authoritative SQL transaction rollback failed") from rollback_error
+            if cursor_close_error is exc:
+                raise StorageError("Authoritative SQL cursor cleanup failed; no file fallback") from exc
+            if type(exc).__module__ == "pyodbc":
+                raise StorageError("Authoritative Azure SQL transaction failed; no file fallback") from exc
+            raise
+        finally:
+            connection.close()
 
     def bootstrap(self) -> None:
         with self.transaction("privy.schema.v1") as cursor:

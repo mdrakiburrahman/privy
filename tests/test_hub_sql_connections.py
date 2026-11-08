@@ -123,13 +123,54 @@ def test_transaction_closes_cursor_before_returning_connection():
 
     with backend.transaction():
         pass
-    assert events == ["execute", "commit", "cursor.close", "connection.close"]
+    assert events == ["execute", "cursor.close", "commit", "connection.close"]
 
     events.clear()
     with pytest.raises(ValueError, match="test failure"):
         with backend.transaction():
             raise ValueError("test failure")
-    assert events == ["execute", "rollback", "cursor.close", "connection.close"]
+    assert events == ["execute", "cursor.close", "rollback", "connection.close"]
+
+
+def test_cursor_close_failure_rolls_back_and_discards_connection():
+    events = []
+
+    class Cursor:
+        def execute(self, *_args):
+            events.append("execute")
+
+        def close(self):
+            events.append("cursor.close")
+            raise RuntimeError("cursor still has pending results")
+
+    class Connection:
+        invalidated = False
+
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            events.append("commit")
+
+        def rollback(self):
+            events.append("rollback")
+
+        def invalidate(self):
+            self.invalidated = True
+
+        def close(self):
+            events.append("connection.close")
+
+    connection = Connection()
+    backend = object.__new__(SqlBackend)
+    backend._connect = lambda: connection
+
+    with pytest.raises(StorageError, match="cursor cleanup failed"):
+        with backend.transaction():
+            pass
+
+    assert connection.invalidated
+    assert events == ["execute", "cursor.close", "rollback", "connection.close"]
 
 
 def test_pooled_transactions_close_cursors_under_concurrent_reads_and_flushes():
