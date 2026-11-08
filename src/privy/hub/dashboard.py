@@ -42,7 +42,7 @@ from privy.hub.terminals import terminal_languages
 log = logging.getLogger(__name__)
 
 #: How long a page waits for listeners whose status is stale before rendering what it has.
-PROBE_WAIT_S = 3.0
+PROBE_WAIT_S = 0.5
 #: Output shown inline per terminal; the rest is one click away at ``/ui/jobs/{id}/log``.
 TERMINAL_BYTES = 64 * 1024
 #: Terminals per page on the Logs tab, and rows on the Jobs tab, unless ``?limit=`` says otherwise.
@@ -304,6 +304,7 @@ def build_report(
         selection=selection,
         jobs_running=counts["running"],
         jobs_queued=counts["queued"],
+        jobs_retained=counts["retained"],
         max_running=service.jobs.max_running,
     )
     for row in report["targets"]:

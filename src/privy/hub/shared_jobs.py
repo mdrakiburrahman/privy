@@ -484,6 +484,8 @@ class SharedJobManager(JobManager):
         super().__init__(registry, **kwargs)
         self._cancel_poll_s = max(0.01, cancel_poll_s)
         self._stop = threading.Event()
+        self._audit_import_stop = threading.Event()
+        self._audit_import_thread: threading.Thread | None = None
         self._pending_lock = threading.Lock()
         self._pending_finishes: dict[str, HubJob] = {}
         self._cancel_thread = threading.Thread(
@@ -491,7 +493,41 @@ class SharedJobManager(JobManager):
         )
         self._cancel_thread.start()
 
-    def import_audit(self, path: Path, *, now: float | None = None, timeout: float = 10) -> int:
+    def _set_migration_status(self, status: dict[str, Any]) -> None:
+        setter = getattr(self.backend, "set_migration_status", None)
+        if setter is not None:
+            setter(status)
+
+    def start_audit_import(self, path: Path) -> None:
+        if self._audit_import_thread is not None:
+            return
+        self._set_migration_status({"state": "running", "source": "audit.jsonl"})
+
+        def run() -> None:
+            try:
+                imported = self.import_audit(path, timeout=300, cancel_event=self._audit_import_stop)
+                self._set_migration_status(
+                    {"state": "complete", "imported_jobs": imported, "source": "audit.jsonl"}
+                )
+                log.info("Azure SQL audit import completed; imported %s jobs", imported)
+            except Exception as exc:
+                if self._audit_import_stop.is_set():
+                    self._set_migration_status({"state": "stopped", "source": "audit.jsonl"})
+                    return
+                self._set_migration_status({"state": "failed", "error": str(exc), "source": "audit.jsonl"})
+                log.exception("Azure SQL audit import failed; it can be retried on restart")
+
+        self._audit_import_thread = threading.Thread(target=run, name="privy-sql-audit-import", daemon=True)
+        self._audit_import_thread.start()
+
+    def import_audit(
+        self,
+        path: Path,
+        *,
+        now: float | None = None,
+        timeout: float = 300,
+        cancel_event: threading.Event | None = None,
+    ) -> int:
         """Import a supplied migration home's bounded, last-week audit once.
 
         No worker or lease callback is invoked. Flush both before resuming a
@@ -514,6 +550,8 @@ class SharedJobManager(JobManager):
             content = hashlib.sha256()
             remaining = size
             while remaining:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise StorageError("audit import stopped before completion")
                 data = stream.read(min(remaining, IMPORT_LINE_BYTES))
                 if not data:
                     raise StorageError("migration audit changed during hashing")
@@ -523,8 +561,6 @@ class SharedJobManager(JobManager):
             transaction = getattr(self.backend, "transaction", None)
             guard = transaction("privy.audit.import") if transaction else contextlib.nullcontext()
             with guard:
-                if not self.backend.flush(timeout=timeout):
-                    raise StorageError("cannot drain durable spool before audit import")
                 marker_key = f"audit:{digest}"
                 if self.backend.get("import", marker_key) is not None:
                     return 0
@@ -535,6 +571,8 @@ class SharedJobManager(JobManager):
                 starts, finishes, local_paths = {}, {}, {}
                 cutoff = now - IMPORT_HISTORY_S
                 for line_hash, at, raw in _audit_lines(stream):
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise StorageError("audit import stopped before completion")
                     if not cutoff <= at <= now or raw["event"] not in ("job.start", "job.finish"):
                         continue
                     job_id = raw.get("job_id")
@@ -550,8 +588,15 @@ class SharedJobManager(JobManager):
                         previous = finishes.get(job_id)
                         if previous is None or at >= previous[0]:
                             finishes[job_id] = (at, safe)
+                existing_jobs = (
+                    self.backend.existing("job", list(starts))
+                    if hasattr(self.backend, "existing")
+                    else {job_id for job_id in starts if self.backend.get("job", job_id) is not None}
+                )
                 imported = 0
-                for job_id, (line_hash, at, start) in starts.items():
+                for index, (job_id, (line_hash, at, start)) in enumerate(starts.items(), 1):
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise StorageError("audit import stopped before completion")
                     finish = finishes.get(job_id)
                     finish = finish if finish is not None and finish[0] >= at else None
                     if finish is not None:
@@ -559,7 +604,7 @@ class SharedJobManager(JobManager):
                     record = _import_job(start, finish, line_hash, at, digest)
                     if record is None:
                         continue
-                    if self.backend.get("job", job_id) is None:
+                    if job_id not in existing_jobs:
                         self.backend.enqueue("job", job_id, record)
                         imported += 1
                     self.backend.enqueue(
@@ -572,12 +617,24 @@ class SharedJobManager(JobManager):
                             "imported": True,
                         },
                     )
+                    if index % 1000 == 0 and hasattr(self.backend, "set_migration_status"):
+                        self._set_migration_status(
+                            {
+                                "state": "running",
+                                "phase": "writing",
+                                "jobs_found": len(starts),
+                                "jobs_processed": index,
+                                "source": "audit.jsonl",
+                            }
+                        )
                 # Read again for deterministic finish audit keys, without keeping
                 # all raw audit lines or loading any shared output.
                 stream.seek(begin)
                 if begin:
                     stream.readline(IMPORT_LINE_BYTES + 1)
                 for line_hash, at, raw in _audit_lines(stream):
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise StorageError("audit import stopped before completion")
                     if (
                         cutoff <= at <= now
                         and raw["event"] == "job.finish"
@@ -785,11 +842,21 @@ class SharedJobManager(JobManager):
 
     def close(self, timeout: float = 10) -> bool:
         self._stop.set()
+        self._audit_import_stop.set()
+        if self._audit_import_thread is not None:
+            self._audit_import_thread.join(timeout)
+            if self._audit_import_thread.is_alive():
+                log.error("Azure SQL audit import did not stop; storage must remain open")
+                return False
         self._cancel_thread.join(timeout)
         self._retry_finishes()
         flushed = self.backend.flush(timeout=timeout)
         with self._pending_lock:
             return flushed and not self._pending_finishes
+
+    @property
+    def audit_import_running(self) -> bool:
+        return bool(self._audit_import_thread and self._audit_import_thread.is_alive())
 
 
 def shared_records(backend: Any, kind: str, *, before=None, **filters):

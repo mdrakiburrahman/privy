@@ -57,6 +57,35 @@ def html_of(response):
 # ---- negotiation and pages ---------------------------------------------------------
 
 
+def test_gather_probes_renders_before_stale_refresh_finishes():
+    started = threading.Event()
+    release = threading.Event()
+    target = type("Target", (), {"id": "dev/test_windows"})()
+
+    class Registry:
+        probe_ttl_s = 30
+
+        def snapshot(self):
+            return type("Snapshot", (), {"targets": [target]})()
+
+        def cached(self, _target):
+            return None
+
+        def probe_many(self, _targets):
+            started.set()
+            release.wait(5)
+
+    registry = Registry()
+    service = type("Service", (), {"registry": registry})()
+    begin = time.monotonic()
+    try:
+        assert dashboard.gather_probes(service) == {target.id: None}
+        assert started.wait(1)
+        assert time.monotonic() - begin < 2
+    finally:
+        release.set()
+
+
 def test_root_serves_the_dashboard_to_browsers_and_markdown_to_everyone_else(hub):
     page = hub.call("GET", "/", headers=BROWSER)
     text = html_of(page)

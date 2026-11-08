@@ -242,11 +242,13 @@ class SharedMetrics(HubMetrics):
         earliest.extend(r["at"] for r in calls)
         snapshot.started_at = min([self.started_at, *earliest])
         snapshot.restored_jobs = sum(entry.job.owner != self.backend.owner for entry in snapshot._entries)
-        counts = self.backend.count_jobs()
-        kwargs.update(jobs_running=counts["running"], jobs_queued=counts["queued"])
+        if any(name not in kwargs for name in ("jobs_running", "jobs_queued", "jobs_retained")):
+            counts = self.backend.count_jobs()
+            kwargs.setdefault("jobs_running", counts["running"])
+            kwargs.setdefault("jobs_queued", counts["queued"])
+            kwargs.setdefault("jobs_retained", counts["retained"])
         result = snapshot.report(targets, shared_probes, **kwargs)
         result["hub_started_at"] = utc_iso(self.started_at)
-        result["kept_jobs"] = counts["retained"]
         return result
 
 

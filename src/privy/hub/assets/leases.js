@@ -239,7 +239,9 @@ window.PrivyLeases = (() => {
     const labels = element("p", "");
     for (const [key, value] of Object.entries(lease.labels || {})) labels.append(element("span", `${key}=${value}`, "lease-tag"));
     panel.append(labels, element("p", `Purpose: ${lease.purpose || "not provided"}`));
-    panel.append(element("p", force || own
+    panel.append(element("p", force
+      ? "This releases the whole group and skips cooldown. Reconciliation may free pins only when their hub owner is stopped or unresolved; remote work may still be running. Verify it has stopped before continuing."
+      : own
       ? "This releases the whole group and skips cooldown. Running jobs keep running; their output remains available."
       : "Your command will still run, but it may disturb their work. It does not renew or take over their lease. It does count as recent use for this group's cooldown.",
     "lease-warning"));
@@ -278,7 +280,7 @@ window.PrivyLeases = (() => {
   async function confirmTarget(target, action) {
     let lease = target.lease;
     try {
-      const data = await get("/v1/targets");
+      const data = await get("/v1/targets?probe=false");
       const fresh = data.targets.find(item => item.id === target.id);
       if (fresh) lease = fresh.lease;
       $("lease-lookup-error")?.remove();

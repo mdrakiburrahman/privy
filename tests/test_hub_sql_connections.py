@@ -31,7 +31,7 @@ def connections(monkeypatch):
         return SimpleNamespace(token="test-token", expires_on=now[0] + 1000)
 
     monkeypatch.setattr(pyodbc, "connect", create)
-    pool = AzureSqlConnections(SqlSettings("test.database.windows.net", "privy_test"))
+    pool = AzureSqlConnections(SqlSettings("sqltest.database.windows.net", "isolated_test"))
     pool._credential = SimpleNamespace(get_token=token)
     yield pool, now, created, tokens
     pool.close()
