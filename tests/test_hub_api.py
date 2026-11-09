@@ -162,6 +162,47 @@ def test_runtime_drain_does_not_abandon_active_local_jobs(hub):
     assert hub.call("POST", "/v1/admin/drain").status == 409
 
 
+@pytest.mark.parametrize("failure", [None, "disconnect", "send", "flush"])
+@pytest.mark.parametrize("drained", [True, False])
+def test_successful_drain_shuts_server_even_when_response_delivery_fails(failure, drained):
+    handler = object.__new__(_Handler)
+    response = HttpResponse(
+        200 if drained else 503,
+        {"status": "drained" if drained else "pending"},
+        note="drained" if drained else "drain_pending",
+    )
+    shutdown = threading.Event()
+    handler.command = "POST"
+    handler.path = "/v1/admin/drain"
+    handler.server = SimpleNamespace(
+        app=SimpleNamespace(log_call=lambda *_args: None),
+        shutdown=shutdown.set,
+    )
+    handler._read_and_handle = lambda: (b"", response)
+
+    def send(_response):
+        if failure == "disconnect":
+            raise ConnectionResetError("caller disconnected")
+        if failure == "send":
+            raise OSError("response write failed")
+
+    def flush():
+        if failure == "flush":
+            raise OSError("response flush failed")
+
+    handler._send = send
+    handler.wfile = SimpleNamespace(flush=flush)
+    parent_token = REQUEST_ID.set("drain-parent")
+    try:
+        handler._dispatch_registered()
+        assert REQUEST_ID.get() == "drain-parent"
+        assert shutdown.wait(1 if drained else 0.05) is drained
+        if drained:
+            assert handler.close_connection is True
+    finally:
+        REQUEST_ID.reset(parent_token)
+
+
 @pytest.mark.parametrize(
     ("path", "method"), [("/ui", "report"), ("/ui/jobs", "entries"), ("/v1/stats", "report")]
 )

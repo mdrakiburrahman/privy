@@ -141,7 +141,9 @@ serving stops and normal shutdown completes. Allow up to five minutes for the re
 shutdown and SQL flush have bounded waits. HTTP 503 `drain_pending` with `Retry-After: 1` leaves the
 hub draining; retry after jobs finish or SQL recovers. Health remains available and reports
 `draining: true`; other requests return 503 `hub_draining`. A response timeout is not proof of
-success: preserve the home until success and process exit are confirmed.
+success: preserve the home until success and process exit are confirmed. After a successful drain,
+HTTP server shutdown still proceeds if the caller disconnects or the response cannot be flushed. A
+failed or pending drain never schedules shutdown.
 
 Older binaries without this endpoint require a first **in-place, same-home bridge upgrade**:
 preserve the complete home/outbox, stop the exact old process, then start the new binary against
