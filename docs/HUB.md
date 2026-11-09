@@ -116,6 +116,8 @@ shared; files and interactive resources still belong to the machine hosting them
 A new home with regenerated `relays.json` and SQL `appsettings.yaml` reads the same shared clients,
 leases, jobs/output/history, listener facts and dashboard telemetry. Its newly generated `.sql-hub-id`
 does not partition shared reads or transfer ownership of another hub's running work.
+SQL `restored_jobs` counts SQL-loaded report entries consistently across hubs; process uptime and
+owner-local execution/terminal capabilities still describe the current process.
 
 | Home file | SQL-mode recovery role |
 |---|---|

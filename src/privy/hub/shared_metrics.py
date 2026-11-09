@@ -357,7 +357,7 @@ class SharedMetrics(HubMetrics):
         if call_stats is not None and call_stats["earliest_at"] is not None:
             earliest.append(call_stats["earliest_at"])
         snapshot.started_at = min([self.started_at, *earliest])
-        snapshot.restored_jobs = sum(entry.job.owner != self.backend.owner for entry in snapshot._entries)
+        snapshot.restored_jobs = len(snapshot._entries)
         history_read_ms = (time.perf_counter() - history_read_started) * 1000
         if any(name not in kwargs for name in ("jobs_running", "jobs_queued", "jobs_retained")):
             counts = report_counts if report_counts is not None else self.backend.count_jobs()

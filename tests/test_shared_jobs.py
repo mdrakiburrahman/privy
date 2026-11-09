@@ -1286,6 +1286,7 @@ def test_shared_window_report_uses_sql_lower_bound_and_reuses_purpose_snapshot(t
         backend.list = track
         report = SharedMetrics(backend, clock=lambda: now).report([target], {}, range_name="1h")
         assert report["jobs"]["total"] == 1 and report["kept_jobs"] == 2
+        assert report["restored_jobs"] == 1
         assert report["targets"][0]["purpose"]["latest"] == "same work"
         job_pages = [kwargs for kind, kwargs in observed if kind == "job" and kwargs["limit"] == 200]
         assert len(job_pages) == 1 and job_pages[0]["after"] is not None
