@@ -1145,6 +1145,9 @@ def leases_page(service: Any, query: Mapping[str, list[str]], now: float) -> str
         jobs = job_counts.get(lease_id, 0)
         last_used = lease_time(lease.get("last_used_at"))
         acquired = lease_time(lease.get("acquired_at"))
+        running_jobs = lease.get("running_jobs")
+        job_owners = lease.get("job_owners")
+        bulk_safe = not running_jobs and not job_owners
         selection = (
             f'<input type="checkbox" data-select-lease="{esc(lease_id)}" aria-label="Select {esc(lease_id)}">'
             if lease["state"] == "active"
@@ -1167,7 +1170,7 @@ def leases_page(service: Any, query: Mapping[str, list[str]], now: float) -> str
             for layer, target in lease.get("members", {}).items()
         )
         body.append(
-            f'<tr data-lease-row data-last-used="{last_used or 0}" data-use-known="{str(lease.get("last_use_known", False)).lower()}" data-acquired="{acquired or 0}" '
+            f'<tr data-lease-row data-lease-id="{esc(lease_id)}" data-bulk-safe="{str(bulk_safe).lower()}" data-last-used="{last_used or 0}" data-use-known="{str(lease.get("last_use_known", False)).lower()}" data-acquired="{acquired or 0}" '
             f'data-q="{esc(search)}" data-labels="{esc(json.dumps(lease.get("labels") or {}))}">'
             f"<td>{selection}</td>"
             f'<td><b>{esc(lease["group"])}</b><span class="sub">{esc(lease_id)}</span>{lease_state(lease["state"])}</td>'
