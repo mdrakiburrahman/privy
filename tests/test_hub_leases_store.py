@@ -396,6 +396,91 @@ def test_force_release_keeps_running_job_and_prevents_old_token(leasing):
     hub.jobs.wait(job, 5)
 
 
+@pytest.mark.parametrize("pins", [["new-job"], {"unknown-job": True}, None, "invalid", 0])
+def test_guarded_release_rejects_running_or_unknown_pins(leasing, pins):
+    _, store, _ = leasing
+    lease = acquire(store, client(store))
+    record = store._leases[lease["lease_id"]]
+    record["running_jobs"] = pins
+    with pytest.raises(LeaseError) as error:
+        store.release(lease["lease_id"], force=True, require_unpinned=True)
+    assert error.value.code == "lease_pinned"
+    assert record["state"] == "active"
+    assert record["running_jobs"] == pins
+
+
+def test_guarded_release_and_job_start_are_serialized(leasing):
+    hub, store, _ = leasing
+    lease = acquire(store, client(store))
+    target = hub.registry.resolve("dev/raki-windows-big_windows")
+    job = SimpleNamespace(
+        id="new-job", target=target, lease_id=lease["lease_id"], origin="rest", purpose=None
+    )
+    barrier = threading.Barrier(2)
+
+    def start():
+        barrier.wait()
+        try:
+            store.job_started(job)
+            return "started"
+        except LeaseError as error:
+            assert error.code == "lease_released"
+            return "rejected"
+
+    def release():
+        barrier.wait()
+        try:
+            store.release(lease["lease_id"], force=True, require_unpinned=True)
+            return "released"
+        except LeaseError as error:
+            assert error.code == "lease_pinned"
+            return "blocked"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        started = pool.submit(start)
+        released = pool.submit(release)
+        outcomes = started.result(), released.result()
+    assert outcomes in (("started", "blocked"), ("rejected", "released"))
+
+
+def test_last_use_tracks_job_completion_and_persists_beyond_event_retention(leasing, tmp_path):
+    hub, store, now = leasing
+    owner = client(store)
+    lease_id = acquire(store, owner)["lease_id"]
+    target = hub.registry.resolve("dev/raki-windows-big_windows")
+    job = SimpleNamespace(
+        id="completed-job", target=target, lease_id=lease_id, origin="rest", purpose=None, state="succeeded"
+    )
+    store.job_started(job)
+    started = store.get_lease(lease_id)["last_used_at"]
+    now[0] += 60
+    store.job_finished(job)
+    finished = store.get_lease(lease_id)["last_used_at"]
+    assert finished != started
+    now[0] += 60
+    store.use(target.id)
+    for _ in range(1001):
+        store._event(store._leases[lease_id], "renewed")
+    store.renew(lease_id, owner)
+    restored = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
+    assert restored.get_lease(lease_id)["last_used_at"] == finished
+    assert restored.get_lease(lease_id)["last_use_known"] is True
+    restored.release(lease_id, force=True, require_unpinned=True)
+    next_lease = acquire(restored, owner)
+    assert next_lease["last_used_at"] is None and next_lease["last_use_known"] is True
+
+
+@pytest.mark.parametrize("value", [-1, "invalid", None, float("inf")])
+def test_invalid_last_use_refuses_start(leasing, tmp_path, value):
+    hub, store, now = leasing
+    lease = acquire(store, client(store))
+    state = json.loads(store.state_path.read_text())
+    state["leases"][lease["lease_id"]]["last_used_ts"] = value
+    store.state_path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(ValueError, match="last-use timestamp"):
+        LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
+
+
 def test_client_idle_ageout_and_unregister_release(leasing):
     _, store, now = leasing
     owner = client(store)
