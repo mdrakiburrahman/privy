@@ -510,7 +510,14 @@ FROM dbo.privy_records p WITH(UPDLOCK,HOLDLOCK)
 JOIN @latest n ON p.kind=n.kind AND p.id=n.id
 WHERE n.kind<>'output' AND (
     (p.owner=n.owner AND p.revision<n.revision) OR
-    (n.kind<>'job' AND p.owner<>n.owner AND p.at<n.at));
+    (n.kind<>'job' AND p.owner<>n.owner AND p.at<n.at))
+    AND (n.kind<>'job' OR JSON_VALUE(p.payload,'$.reconciled_at') IS NULL);
+-- A recovered job is terminal by listener evidence; an old local journal may
+-- still contain a newer sequence number, but must never overwrite that result.
+-- Keep replaying its immutable output/audit rows while suppressing only the job record.
+"""
+
+_FLUSH_BATCH += """
 INSERT dbo.privy_records(kind,id,payload,owner,revision,at,target,lease_id,client_id)
 SELECT n.kind,n.id,n.payload,n.owner,n.revision,n.at,n.target,n.lease_id,n.client_id
 FROM @latest n WHERE n.kind<>'output' AND NOT EXISTS(
@@ -1777,6 +1784,195 @@ class SqlBackend:
             )
             row = cursor.fetchone()
             return bool(row and row[0])
+
+    def owner_is_inactive(self, owner: str) -> bool:
+        """Return true only for an explicitly inactive controller incarnation."""
+        if not owner or owner == "unresolved-file-import" or len(owner) > 64:
+            return False
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT CASE WHEN JSON_VALUE(payload,'$.active')='false' THEN 1 ELSE 0 END "
+                "FROM dbo.privy_coordination WHERE kind='hub' AND id=?",
+                owner,
+            )
+            row = cursor.fetchone()
+            return bool(row and row[0])
+
+    def reconciliation_candidate(self, job_id: str) -> dict[str, Any] | None:
+        if not job_id or len(job_id) > 80:
+            return None
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT payload,owner,revision FROM dbo.privy_records WHERE kind='job' AND id=?",
+                job_id,
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                "payload": json.loads(row[0]),
+                "owner": str(row[1]),
+                "revision": int(row[2]),
+            }
+
+    def reconcile_job(
+        self,
+        *,
+        job_id: str,
+        expected_owner: str,
+        expected_revision: int,
+        lease_id: str,
+        client_id: str,
+        target: str,
+        remote_job_id: str,
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically persist terminal listener evidence, clear its exact pin, and ack its cancel."""
+        if (
+            not job_id
+            or len(job_id) > 80
+            or not expected_owner
+            or len(expected_owner) > 64
+            or type(expected_revision) is not int
+            or not remote_job_id
+            or len(remote_job_id) > 128
+        ):
+            raise StorageError("job reconciliation identity is invalid")
+        committed_record = None
+        with self.transaction("privy.leases") as cursor:
+            from privy.hub.jobs import utc_iso
+
+            self.assert_owner_active(cursor)
+            cursor.execute(
+                "SELECT payload FROM dbo.privy_coordination WITH (UPDLOCK,HOLDLOCK) "
+                "WHERE kind='hub' AND id=?",
+                expected_owner,
+            )
+            owner_row = cursor.fetchone()
+            if owner_row is None or json.loads(owner_row[0]).get("active") is not False:
+                raise StorageError("job controller is not explicitly inactive")
+
+            cursor.execute(
+                "SELECT payload,owner,revision FROM dbo.privy_records WITH (UPDLOCK,HOLDLOCK) "
+                "WHERE kind='job' AND id=?",
+                job_id,
+            )
+            job_row = cursor.fetchone()
+            if job_row is None:
+                raise StorageError("shared job disappeared during reconciliation")
+            current = json.loads(job_row[0])
+            row_owner, revision = str(job_row[1]), int(job_row[2])
+            if (
+                row_owner != expected_owner
+                or current.get("owner") != expected_owner
+                or revision < expected_revision
+                or current.get("job_id") != job_id
+                or current.get("state") != "running"
+                or current.get("remote_job_id") != remote_job_id
+                or current.get("lease_id") != lease_id
+                or current.get("client_id") != client_id
+                or current.get("target") != target
+                or current.get("reconciled_at") is not None
+            ):
+                raise StorageError("shared job changed during reconciliation; refresh and retry")
+
+            cursor.execute(
+                "SELECT payload FROM dbo.privy_coordination WITH (UPDLOCK,HOLDLOCK) "
+                "WHERE kind='lease' AND id=?",
+                lease_id,
+            )
+            lease_row = cursor.fetchone()
+            if lease_row is None:
+                raise StorageError("active lease disappeared during reconciliation")
+            lease = json.loads(lease_row[0])
+            running_jobs = lease.get("running_jobs")
+            job_owners = lease.get("job_owners")
+            if (
+                lease.get("lease_id") != lease_id
+                or lease.get("client_id") != client_id
+                or lease.get("state") != "active"
+                or target not in (lease.get("members") or {}).values()
+                or not isinstance(running_jobs, list)
+                or job_id not in running_jobs
+                or not isinstance(job_owners, dict)
+                or job_owners.get(job_id) != expected_owner
+            ):
+                raise StorageError("the exact active lease pin changed during reconciliation")
+
+            cursor.execute(
+                "SELECT owner,acknowledged FROM dbo.privy_cancels WITH (UPDLOCK,HOLDLOCK) WHERE job_id=?",
+                job_id,
+            )
+            cancel_row = cursor.fetchone()
+            if cancel_row is not None and cancel_row[0] == expected_owner:
+                record = {**record, "cancel_requested": True}
+                if cancel_row[1] is None:
+                    cursor.execute(
+                        "UPDATE dbo.privy_cancels SET acknowledged=SYSUTCDATETIME() "
+                        "WHERE job_id=? AND owner=? AND acknowledged IS NULL",
+                        job_id,
+                        expected_owner,
+                    )
+
+            cursor.execute("SELECT DATEDIFF_BIG(millisecond,'1970-01-01',SYSUTCDATETIME())/1000.0")
+            time_row = cursor.fetchone()
+            if time_row is None:
+                raise StorageError("SQL reconciliation clock is unavailable")
+            now = float(time_row[0])
+            running_jobs.remove(job_id)
+            del job_owners[job_id]
+            lease["last_used_ts"] = now
+            lease.setdefault("events", []).append(
+                {
+                    "at": utc_iso(now),
+                    "event": "job_reconciled",
+                    "job_id": job_id,
+                    "owner": expected_owner,
+                    "remote_job_id": remote_job_id,
+                    "state": record["state"],
+                }
+            )
+            del lease["events"][:-1000]
+            if lease["state"] == "active" and not running_jobs:
+                lease["renewed_ts"] = now
+                lease["expires_ts"] = now + float(lease["ttl_s"])
+            terminal_fields = (
+                "state",
+                "exit_code",
+                "error",
+                "finished_at",
+                "duration_ms",
+                "reconciled_at",
+                "reconciliation",
+                "cancel_requested",
+            )
+            committed_record = {
+                **current,
+                **{name: record[name] for name in terminal_fields if name in record},
+                "owner": expected_owner,
+            }
+            cursor.execute(
+                "UPDATE dbo.privy_records SET payload=?,updated=SYSUTCDATETIME() "
+                "WHERE kind='job' AND id=? AND owner=? AND JSON_VALUE(payload,'$.state')='running' "
+                "AND JSON_VALUE(payload,'$.remote_job_id')=? "
+                "AND JSON_VALUE(payload,'$.reconciled_at') IS NULL",
+                json.dumps(committed_record, ensure_ascii=True),
+                job_id,
+                expected_owner,
+                remote_job_id,
+            )
+            cursor.execute(
+                "UPDATE dbo.privy_coordination SET payload=?,updated=SYSUTCDATETIME() "
+                "WHERE kind='lease' AND id=?",
+                json.dumps(lease, ensure_ascii=True),
+                lease_id,
+            )
+
+        model = getattr(self, "read_model", None)
+        if model is not None:
+            model.apply("job", job_id, committed_record)
+            model.reads.invalidate(lambda key: key == ("coordination",))
+        return committed_record
 
     def existing(self, kind: str, keys: list[str], *, batch_size: int = 10000) -> set[str]:
         existing = set()

@@ -1086,6 +1086,43 @@ class LeaseStore:
                 self._save()
             return self._view(lease)
 
+    def validate_job_reconciliation(
+        self, *, lease_id: str, client_id: str, target: str, job_id: str, owner: str
+    ) -> None:
+        """Validate a pinned job against its current SQL lease without changing it."""
+        if self.sql_backend is None:
+            raise LeaseError(
+                "job reconciliation requires Azure SQL shared storage",
+                status=409,
+                code="sql_reconciliation_required",
+            )
+        with self._lock:
+            self._sweep()
+            lease = self._lease(lease_id)
+            self._client(client_id)
+            if lease["state"] != "active" or lease["client_id"] != client_id:
+                raise LeaseError(
+                    "the supplied client does not hold this active lease",
+                    status=409,
+                    code="job_identity_mismatch",
+                )
+            members = lease.get("members")
+            running_jobs = lease.get("running_jobs")
+            job_owners = lease.get("job_owners")
+            if (
+                not isinstance(members, dict)
+                or target not in members.values()
+                or not isinstance(running_jobs, list)
+                or not isinstance(job_owners, dict)
+                or job_id not in running_jobs
+                or job_owners.get(job_id) != owner
+            ):
+                raise LeaseError(
+                    "the active lease does not contain this exact job pin and owner",
+                    status=409,
+                    code="job_identity_mismatch",
+                )
+
     def validate_targets(self, lease_id: str, targets: Sequence[str]) -> None:
         with self._lock:
             self._sweep()

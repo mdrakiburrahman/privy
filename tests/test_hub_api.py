@@ -266,6 +266,16 @@ def test_capabilities_and_openapi_describe_every_operation(hub):
         spec["operationId"] for methods in document["paths"].values() for spec in methods.values()
     }
     assert set(names) | {STREAM_JOB, RELAYS_OPERATION, "quickstart", "llms_txt"} <= operation_ids
+    reconcile = document["paths"]["/v1/jobs/{job_id}/reconcile"]["post"]
+    assert reconcile["operationId"] == "reconcile_job"
+    assert {parameter["name"] for parameter in reconcile["parameters"]} >= {
+        "job_id",
+        "remote_job_id",
+        "lease_id",
+        "client_id",
+        "target",
+    }
+    assert "reconcile_job" not in capabilities["mcp"]["tools"]
     assert capabilities["relay_credentials"]["endpoint"] == "http://127.0.0.1:7748/v1/relays"
     assert RELAYS_OPERATION not in capabilities["mcp"]["tools"]
     credentials = document["paths"]["/v1/relays"]["get"]

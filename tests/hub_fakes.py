@@ -95,6 +95,7 @@ class FakeListener:
         transfer: Callable[..., TransferResult] | None = None,
         hostname: str = "box",
         terminal: Callable[..., dict[str, Any]] | None = None,
+        poll: Callable[..., tuple[str | None, ExecResult]] | None = None,
     ) -> None:
         if info is None and not legacy:
             info = {
@@ -117,6 +118,8 @@ class FakeListener:
         self.cancel_event = threading.Event()
         self.started = threading.Event()
         self.terminal = terminal
+        self.poll = poll
+        self.poll_requests: list[tuple[Any, str, float]] = []
         self.terminal_requests: list[dict[str, Any]] = []
 
 
@@ -133,6 +136,12 @@ class FakeRelayClient:
     def send(self, request, *, async_job=None, on_output=None, on_submit=None) -> ExecResult:
         self.listener.requests.append(request)
         return self.listener.run(request, on_output, on_submit, self.listener)
+
+    def poll(self, request, job_id: str, *, wait_s: float = 0):
+        self.listener.poll_requests.append((request, job_id, wait_s))
+        if self.listener.poll is None:
+            raise AssertionError("job poll was not configured for this fake listener")
+        return self.listener.poll(request, job_id, wait_s=wait_s)
 
     def terminal(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.listener.terminal_requests.append(payload)

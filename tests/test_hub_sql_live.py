@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import threading
 import time
@@ -14,8 +15,12 @@ from types import SimpleNamespace
 import pytest
 from hub_fakes import Hub, relays_document, write_relays
 
+from privy.client import ExecResult
+from privy.hub.jobs import RUNNING
 from privy.hub.leases import LeaseError, LeaseStore
+from privy.hub.service import HubService
 from privy.hub.settings import load_settings
+from privy.hub.shared_jobs import SharedJobManager
 from privy.hub.sql_store import AzureSqlConnections, SqlBackend, StorageError
 
 pytestmark = pytest.mark.skipif(
@@ -273,3 +278,123 @@ def test_real_sql_summary_scan_has_no_gaps_at_equal_timestamp_boundaries(stores)
         for _ in range(4):
             with one.transaction() as cursor:
                 cursor.execute("DELETE TOP(300) dbo.privy_records WHERE kind='audit' AND target=?", key)
+
+
+def test_real_sql_reconcile_requires_inactive_owner_and_blocks_delayed_job_replay(stores):
+    a, b, one, two = stores
+    target = a.registry.resolve("sqltest/testbox00_windows")
+    client_id = a.register_client("reconcile-test")["client_id"]
+    lease = a.acquire(client_id, target="sqltest/testbox00")
+    job_id = uuid.uuid4().hex
+    remote_job_id = uuid.uuid4().hex
+    job = SimpleNamespace(
+        id=job_id,
+        target=target,
+        lease_id=lease["lease_id"],
+        origin="test",
+        purpose="isolated SQL reconciliation test",
+        state=RUNNING,
+    )
+    a.job_started(job)
+    record = {
+        "job_id": job_id,
+        "owner": one.owner,
+        "target": target.id,
+        "type": "exec",
+        "spec": {
+            "language": "powershell",
+            "code": "Get-Date",
+            "mode": "subprocess",
+            "timeout_s": 600,
+        },
+        "origin": "test",
+        "purpose": job.purpose,
+        "lease_id": lease["lease_id"],
+        "client_id": client_id,
+        "state": RUNNING,
+        "remote_job_id": remote_job_id,
+        "cancel_requested": False,
+        "created_at": time.time(),
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "chunk_count": 0,
+    }
+    one.put("job", job_id, record)
+    assert one.flush(timeout=30)
+    assert two.request_cancel(job_id)["acknowledged"] is False
+
+    listener = a.registry.client(target).listener
+
+    def poll(_request, requested_id, *, wait_s):
+        assert wait_s == 0
+        # Simulate newer shared output counters arriving while the status request is in flight.
+        with two.transaction() as cursor:
+            cursor.execute(
+                "SELECT payload,revision FROM dbo.privy_records WHERE kind='job' AND id=?",
+                job_id,
+            )
+            latest_payload, revision = cursor.fetchone()
+            latest_payload = json.loads(latest_payload)
+            latest_payload.update(stdout_bytes=41, stderr_bytes=9, chunk_count=3)
+            cursor.execute(
+                "UPDATE dbo.privy_records SET payload=?,revision=? WHERE kind='job' AND id=?",
+                json.dumps(latest_payload),
+                revision + 1,
+                job_id,
+            )
+        return "done", ExecResult(
+            exit_code=0,
+            stdout="",
+            stderr="",
+            stdout_bytes=b"",
+            stderr_bytes=b"",
+            duration_ms=25,
+            job_id=requested_id,
+        )
+
+    listener.poll = poll
+    jobs = SharedJobManager(a.registry, backend=two, cancel_poll_s=60)
+    service = HubService(registry=a.registry, jobs=jobs, leases=b, version="test")
+    try:
+        one.mark_stopped()
+        assert two.owner_is_inactive(one.owner)
+        result = service.reconcile_job(
+            job_id=job_id,
+            remote_job_id=remote_job_id,
+            lease_id=lease["lease_id"],
+            client_id=client_id,
+            target=target.id,
+        )
+        assert result["job"]["state"] == "succeeded"
+        assert result["job"]["reconciliation"]["remote_job_id"] == remote_job_id
+        assert b.get_lease(lease["lease_id"])["running_jobs"] == []
+        assert two.request_cancel(job_id)["acknowledged"] is True
+
+        # A delayed pre-recovery journal record cannot replace the verified terminal result.
+        two.outbox.append("job", job_id, record, one.owner)
+        assert two.flush(timeout=30)
+        persisted = two.get("job", job_id)
+        assert persisted["state"] == "succeeded"
+        assert persisted["reconciled_at"] == result["job"]["reconciled_at"]
+        assert (persisted["stdout_bytes"], persisted["stderr_bytes"], persisted["chunk_count"]) == (41, 9, 3)
+        assert b.get_lease(lease["lease_id"])["running_jobs"] == []
+    finally:
+        jobs.close()
+        with one.transaction() as cursor:
+            cursor.execute(
+                "SELECT payload FROM dbo.privy_coordination WHERE kind='hub' AND id=?",
+                one.owner,
+            )
+            owner_payload = json.loads(cursor.fetchone()[0])
+            owner_payload["active"] = True
+            cursor.execute(
+                "UPDATE dbo.privy_coordination SET payload=?,updated=SYSUTCDATETIME() "
+                "WHERE kind='hub' AND id=?",
+                json.dumps(owner_payload),
+                one.owner,
+            )
+        if not b.get_lease(lease["lease_id"])["running_jobs"]:
+            b.release(lease["lease_id"], client_id)
+            two.delete("job", job_id)
+            with two.transaction() as cursor:
+                cursor.execute("DELETE dbo.privy_cancels WHERE job_id=?", job_id)

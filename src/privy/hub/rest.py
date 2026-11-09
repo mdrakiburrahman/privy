@@ -35,6 +35,7 @@ from privy.hub.service import (
     OPERATIONS,
     OPERATIONS_BY_NAME,
     PURPOSE_PARAM,
+    RECONCILE_JOB_OPERATION,
     SYNC_OPERATION,
     HubError,
     HubService,
@@ -54,6 +55,7 @@ REST_OPERATIONS = {
     **OPERATIONS_BY_NAME,
     SYNC_OPERATION.name: SYNC_OPERATION,
     FORCE_RELEASE_OPERATION.name: FORCE_RELEASE_OPERATION,
+    RECONCILE_JOB_OPERATION.name: RECONCILE_JOB_OPERATION,
 }
 
 _PATH_PARAM_RE = re.compile(r"\{(\w+)\}")
@@ -112,6 +114,7 @@ ROUTES: tuple[Route, ...] = (
     Route("GET", "/v1/jobs/{job_id}/stream", STREAM_JOB),
     Route("GET", "/v1/jobs/{job_id}/output", "read_job_output"),
     Route("POST", "/v1/jobs/{job_id}/cancel", "cancel_job"),
+    Route("POST", "/v1/jobs/{job_id}/reconcile", RECONCILE_JOB_OPERATION.name),
     Route("POST", "/v1/broadcasts", "broadcast", raw_anchor="targets"),
     Route("GET", "/v1/broadcasts/{broadcast_id}", "get_broadcast"),
     Route("POST", "/v1/files/upload", "upload_file"),
@@ -430,6 +433,10 @@ class RestApi:
                         200,
                         text=render.render(route.operation, result, transport="rest"),
                     )
+                return HttpResponse(200, result)
+            if route.operation == RECONCILE_JOB_OPERATION.name:
+                args = RECONCILE_JOB_OPERATION.parse(args)
+                result = self.service.reconcile_job(**args)
                 return HttpResponse(200, result)
             if route.operation == "list_jobs" and route.method == "GET":
                 header_lease = headers.get("X-Privy-Lease")

@@ -349,6 +349,8 @@ class SharedJob(HubJob):
             "cancel_requested",
             "transfer",
             "sync_progress",
+            "reconciled_at",
+            "reconciliation",
         ):
             setattr(self, name, record.get(name))
         progress = record.get("progress")
@@ -385,6 +387,9 @@ class SharedJob(HubJob):
             self.refresh()
         result = super().summary(include_created=include_created)
         result["owner"] = self.owner
+        if self.reconciliation:
+            result["reconciled_at"] = self.reconciled_at
+            result["reconciliation"] = self.reconciliation
         return result
 
     def _bytes(self, stream: str, offset: int, limit: int, *, chunks=None) -> tuple[int, bytes]:

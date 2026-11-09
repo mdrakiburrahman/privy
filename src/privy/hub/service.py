@@ -8,6 +8,7 @@ document, so the interfaces cannot drift apart.
 from __future__ import annotations
 
 import contextlib
+import logging
 import math
 import time
 from collections import Counter
@@ -16,11 +17,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from privy.client import ExecRequest
 from privy.hub.config import Relay, RelaysSnapshot, Target
 from privy.hub.jobs import (
+    CANCELLED,
+    FAILED,
+    RUNNING,
     STREAMS,
+    SUCCEEDED,
     TERMINAL_STATES,
     TICK_S,
+    TIMED_OUT,
     Broadcast,
     HubBusyError,
     HubJob,
@@ -60,6 +67,7 @@ MAX_CODE_CHARS = 1024 * 1024
 CANCEL_SETTLE_S = 10.0
 HEARTBEAT_S = 10.0
 PROGRESS_MESSAGE_CHARS = 300
+log = logging.getLogger("privy.hub")
 
 #: ``progress(message, done=None, total=None)`` reports activity while a call waits.
 Progress = Callable[..., None]
@@ -339,6 +347,13 @@ _REQUIRED_LEASE_ID = Param(
 )
 _CLIENT_ID = Param("client_id", "string", "Registered lease client id.")
 _REQUIRED_CLIENT_ID = Param("client_id", "string", "Registered lease client id.", required=True)
+_REMOTE_JOB_ID = Param(
+    "remote_job_id",
+    "string",
+    "Exact listener job id returned when the hub submitted this job.",
+    required=True,
+    max_length=128,
+)
 _LABELS = Param("labels", "object", "Free-form string labels.")
 _TTL = Param("ttl", "string", "Lease duration, for example 30m or 2h.", max_length=32)
 PURPOSE_PARAM = Param(
@@ -776,6 +791,23 @@ FORCE_RELEASE_OPERATION = Operation(
     read_only=False,
     destructive=True,
 )
+RECONCILE_JOB_OPERATION = Operation(
+    "reconcile_job",
+    "Reconcile a stopped hub job (REST only)",
+    "Poll the existing listener job id without resubmitting code or cancellation. Reconcile only when the "
+    "recorded hub owner is explicitly inactive, the exact active lease/client/target/pin identities match, "
+    "and the listener returns a terminal result for that exact remote job id. Missing or unreachable jobs "
+    "remain unresolved and keep their lease pin.",
+    (
+        _JOB_ID,
+        _REMOTE_JOB_ID,
+        _REQUIRED_LEASE_ID,
+        _REQUIRED_CLIENT_ID,
+        _TARGET,
+    ),
+    read_only=False,
+    idempotent=True,
+)
 #: Operations that wait for jobs and can report progress while they do.
 PROGRESS_OPERATIONS = frozenset(
     {"run", "get_job", "broadcast", "get_broadcast", "upload_file", "download_file"}
@@ -961,6 +993,168 @@ class HubService:
             use = self.leases.read_use if read_only else self.leases.use
             usage = use(job.target.id, lease_id if job.lease_id == lease_id else None, origin=origin)
             return job, usage
+
+    def reconcile_job(
+        self,
+        *,
+        job_id: str,
+        remote_job_id: str,
+        lease_id: str,
+        client_id: str,
+        target: str,
+    ) -> dict[str, Any]:
+        backend = getattr(self.jobs, "backend", None)
+        candidate_reader = getattr(backend, "reconciliation_candidate", None)
+        inactive_check = getattr(backend, "owner_is_inactive", None)
+        reconcile = getattr(backend, "reconcile_job", None)
+        if not (callable(candidate_reader) and callable(inactive_check) and callable(reconcile)):
+            raise HubError(
+                "job reconciliation requires Azure SQL shared storage",
+                status=409,
+                code="sql_reconciliation_required",
+            )
+        with _translated_errors():
+            candidate = candidate_reader(job_id)
+        if candidate is None:
+            raise HubError(f"unknown shared job {job_id!r}", status=404, code="not_found")
+        record = candidate.get("payload")
+        owner = candidate.get("owner")
+        expected = {
+            "job_id": job_id,
+            "remote_job_id": remote_job_id,
+            "lease_id": lease_id,
+            "client_id": client_id,
+            "target": target,
+        }
+        if (
+            not isinstance(record, dict)
+            or any(record.get(name) != value for name, value in expected.items())
+            or owner != record.get("owner")
+        ):
+            raise HubError(
+                "the supplied identifiers do not match this exact shared job",
+                status=409,
+                code="job_identity_mismatch",
+            )
+        if record.get("reconciled_at") and record.get("state") in TERMINAL_STATES:
+            return {
+                "reconciled": True,
+                "already_reconciled": True,
+                "job": SharedJob(backend, record, snapshot=True).summary(refresh=False),
+            }
+        if (
+            record.get("state") != RUNNING
+            or record.get("type") != "exec"
+            or not isinstance(record.get("spec"), dict)
+            or not isinstance(record["spec"].get("code"), str)
+            or not isinstance(record["spec"].get("language"), str)
+            or not isinstance(record["spec"].get("mode"), str)
+            or type(record["spec"].get("timeout_s")) not in (int, float)
+        ):
+            raise HubError(
+                "only a running exec job with a complete persisted request can be reconciled",
+                status=409,
+                code="job_not_reconcilable",
+            )
+        with _translated_errors():
+            owner_inactive = isinstance(owner, str) and bool(owner) and inactive_check(owner)
+        if not owner_inactive:
+            raise HubError(
+                "the recorded job controller is active or its inactive state is unverified",
+                status=409,
+                code="job_owner_active",
+            )
+        with _translated_errors():
+            self.leases.validate_job_reconciliation(
+                lease_id=lease_id,
+                client_id=client_id,
+                target=target,
+                job_id=job_id,
+                owner=owner,
+            )
+            resolved_target = self.registry.resolve(target)
+        if resolved_target.id != target:
+            raise HubError(
+                "target must be the exact canonical target recorded for this job",
+                status=409,
+                code="job_identity_mismatch",
+            )
+        request = ExecRequest(
+            kind=record["spec"]["language"],
+            code=record["spec"]["code"],
+            mode=record["spec"]["mode"],
+            timeout_s=float(record["spec"]["timeout_s"]),
+        )
+        try:
+            listener_state, result = self.registry.client(resolved_target).poll(
+                request, remote_job_id, wait_s=0
+            )
+        except Exception as exc:  # noqa: BLE001 - listener reachability is an explicit recovery outcome
+            log.warning("listener status poll failed for shared job %s (%s)", job_id, type(exc).__name__)
+            raise HubError(
+                "listener status could not be verified; the shared job and lease pin were not changed",
+                status=502,
+                code="listener_status_unavailable",
+            ) from None
+        if (
+            listener_state not in ("done", "cancelled")
+            or result.error == "unknown_job"
+            or result.job_id != remote_job_id
+            or type(result.exit_code) is not int
+        ):
+            raise HubError(
+                "the listener did not confirm a terminal result for this exact remote job; "
+                "the shared job and lease pin were not changed",
+                status=409,
+                code="job_reconciliation_unconfirmed",
+                details={"listener_state": listener_state, "remote_job_id": remote_job_id},
+            )
+        if listener_state == "cancelled":
+            state = CANCELLED
+        elif result.timed_out:
+            state = TIMED_OUT
+        elif result.error or result.exit_code != 0:
+            state = FAILED
+        else:
+            state = SUCCEEDED
+        finished_at = time.time()
+        recovered = dict(record)
+        recovered.update(
+            state=state,
+            exit_code=result.exit_code,
+            error=result.error if state != SUCCEEDED else None,
+            finished_at=finished_at,
+            duration_ms=result.duration_ms,
+            reconciled_at=utc_iso(finished_at),
+            reconciliation={
+                "by": backend.owner,
+                "owner": owner,
+                "lease_id": lease_id,
+                "client_id": client_id,
+                "target": target,
+                "remote_job_id": remote_job_id,
+                "listener_state": listener_state,
+                "exit_code": result.exit_code,
+                "timed_out": bool(result.timed_out),
+                "checked_at": utc_iso(finished_at),
+            },
+        )
+        with _translated_errors():
+            stored = reconcile(
+                job_id=job_id,
+                expected_owner=owner,
+                expected_revision=candidate["revision"],
+                lease_id=lease_id,
+                client_id=client_id,
+                target=target,
+                remote_job_id=remote_job_id,
+                record=recovered,
+            )
+        return {
+            "reconciled": True,
+            "already_reconciled": False,
+            "job": SharedJob(backend, stored, snapshot=True).summary(refresh=False),
+        }
 
     def summary(self) -> dict[str, Any]:
         snapshot = self.registry.snapshot()

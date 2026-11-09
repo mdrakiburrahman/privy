@@ -96,6 +96,25 @@ unresolved file import. Verify remote work has ended before using it, because re
 make the box available while remote work continues. Unleased running jobs also keep their group
 unavailable for fresh lease admission.
 
+For a pinned job whose recorded SQL controller is explicitly inactive, an operator can request a
+fenced status reconciliation without resubmitting its command or cancellation:
+
+```powershell
+Invoke-RestMethod -Method Post `
+  'http://127.0.0.1:7748/v1/jobs/JOB_ID/reconcile?remote_job_id=LISTENER_JOB_ID&lease_id=LEASE_ID&client_id=CLIENT_ID&target=dev/BOX_windows'
+```
+
+The endpoint polls only the already-recorded listener job ID with a zero-second wait. It requires
+the exact job, remote ID, active lease, holder client, canonical target, and job pin to still match,
+and rechecks those identities plus the explicitly inactive old controller in the fenced SQL
+transaction before persisting a terminal listener result. Only then does it clear that job's pin and
+acknowledge a cancellation belonging to the old controller. Missing/unknown listener jobs,
+running status, mismatched IDs, or an unreachable listener remain unresolved and keep the pin;
+none is treated as proof of exit. This REST-only operation requires deploying a hub version that
+supports `/v1/jobs/{job_id}/reconcile`, Azure SQL mode, and local Relay connectivity to the target.
+It does not require a schema migration. Job summaries retain the reconciliation evidence. It is not
+a process-kill or listener-restart mechanism.
+
 SQL is authoritative for lease policy. A missing `leases.yaml` is hydrated from the shared policy;
 an existing local policy does not override SQL. Target configuration comparisons ignore ordering,
 but still reject different target identities, namespaces or paths.
@@ -613,6 +632,7 @@ complete OpenAPI 3.1 description with examples.
 | `GET /v1/jobs/{job_id}/stream`      | The job's output from the start, then live until it finishes                    |
 | `GET /v1/jobs/{job_id}/output`      | `read_job_output` (`stream`, `offset`, `limit`)                                 |
 | `POST /v1/jobs/{job_id}/cancel`     | `cancel_job`                                                                    |
+| `POST /v1/jobs/{job_id}/reconcile`  | SQL-only reconciliation of an exact listener job from an explicitly inactive owner |
 | `POST /v1/broadcasts`               | `broadcast`                                                                     |
 | `GET /v1/broadcasts/{broadcast_id}` | `get_broadcast`                                                                 |
 | `POST /v1/files/upload`             | `upload_file`                                                                   |
