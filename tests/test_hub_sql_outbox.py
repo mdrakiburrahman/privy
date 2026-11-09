@@ -144,9 +144,11 @@ class _FakeSqlDatabase:
             existing = self.connection.execute(
                 "SELECT owner,revision,at FROM records WHERE kind=? AND id=?", (kind, key)
             ).fetchone()
-            should_update = not existing or (
-                existing[0] == row["owner"] and existing[1] < row["revision"]
-            ) or (kind != "job" and existing[0] != row["owner"] and existing[2] < row["at"])
+            should_update = (
+                not existing
+                or (existing[0] == row["owner"] and existing[1] < row["revision"])
+                or (kind != "job" and existing[0] != row["owner"] and existing[2] < row["at"])
+            )
             if should_update:
                 self.connection.execute(
                     "INSERT OR REPLACE INTO records VALUES(?,?,?,?,?,?,?,?,?)",
@@ -198,9 +200,7 @@ def test_previous_owner_outbox_replays_idempotently_without_relaunch_or_unpin(tm
         "running_jobs": [job_id],
         "job_owners": {job_id: "owner-a"},
     }
-    database.connection.execute(
-        "INSERT INTO coordination VALUES('lease',?,?)", (lease_id, json.dumps(pin))
-    )
+    database.connection.execute("INSERT INTO coordination VALUES('lease',?,?)", (lease_id, json.dumps(pin)))
     database.connection.commit()
 
     journal_path = tmp_path / "home" / "sql-outbox.sqlite3"
@@ -254,12 +254,20 @@ def test_previous_owner_outbox_replays_idempotently_without_relaunch_or_unpin(tm
     assert database.record("job", job_id)[0]["state"] == "queued"
     assert database.record("job", finished_id)[0]["state"] == "succeeded"
     assert database.connection.execute("SELECT COUNT(*) FROM output").fetchone()[0] == 1
-    assert database.connection.execute(
-        "SELECT COUNT(*) FROM records WHERE kind='audit' AND id='finish-1'"
-    ).fetchone()[0] == 1
-    assert json.loads(database.connection.execute(
-        "SELECT payload FROM coordination WHERE kind='lease' AND id=?", (lease_id,)
-    ).fetchone()[0]) == pin
+    assert (
+        database.connection.execute(
+            "SELECT COUNT(*) FROM records WHERE kind='audit' AND id='finish-1'"
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        json.loads(
+            database.connection.execute(
+                "SELECT payload FROM coordination WHERE kind='lease' AND id=?", (lease_id,)
+            ).fetchone()[0]
+        )
+        == pin
+    )
 
     replayed_outbox.close()
     database.close()
@@ -281,7 +289,17 @@ def test_fenced_old_owner_and_51001_batch_keep_pending_rows(tmp_path):
     poison_outbox.append("audit", "same-batch", {"event": "job.finish"}, "owner-a")
     database.connection.execute(
         "INSERT INTO records VALUES(?,?,?,?,?,?,?,?,?)",
-        ("job", "job-conflict", json.dumps({"job_id": "job-conflict", "state": "running"}), "owner-c", 1, 1, None, None, None),
+        (
+            "job",
+            "job-conflict",
+            json.dumps({"job_id": "job-conflict", "state": "running"}),
+            "owner-c",
+            1,
+            1,
+            None,
+            None,
+            None,
+        ),
     )
     database.connection.commit()
     successor = _fake_backend(database, "owner-b", poison_outbox)
