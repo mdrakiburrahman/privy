@@ -523,7 +523,20 @@ class LeaseStore:
             for k, v in lease.items()
             if not k.endswith("_ts") and k != "client_record" and (events or k != "events")
         }
+        uses = snapshot["uses"] if snapshot is not None else self._uses
+        use = uses.get(lease["group"], {})
+        last_used = lease.get("last_used_ts", 0)
+        if use.get("by", {}).get("lease_id") == lease["lease_id"]:
+            last_used = max(last_used, use.get("at", 0))
+        if "last_used_ts" not in lease:
+            for event in lease.get("events", []):
+                if event["event"] in ("pinned", "unpinned"):
+                    last_used = max(
+                        last_used, dt.datetime.fromisoformat(event["at"].replace("Z", "+00:00")).timestamp()
+                    )
         view.update(
+            last_use_known="last_used_ts" in lease or last_used > 0,
+            last_used_at=utc_iso(last_used) if last_used >= lease["acquired_ts"] else None,
             acquired_at=utc_iso(lease["acquired_ts"]),
             expires_at=utc_iso(lease["expires_ts"]),
             renewed_at=utc_iso(lease["renewed_ts"]),
@@ -856,6 +869,7 @@ class LeaseStore:
                         "ttl_s": seconds,
                         "manual": manual,
                         "acquired_ts": now,
+                        "last_used_ts": 0,
                         "renewed_ts": now,
                         "expires_ts": now + seconds,
                         "running_jobs": [],
@@ -1075,6 +1089,7 @@ class LeaseStore:
             if lease_id:
                 self.validate_targets(lease_id, [target])
                 lease = self._lease(lease_id)
+                lease["last_used_ts"] = self._clock()
             self._uses[key] = {
                 **self._uses.get(key, {}),
                 "at": self._clock(),
@@ -1183,6 +1198,7 @@ class LeaseStore:
                         code="job_owner_mismatch",
                         status=409,
                     )
+                lease["last_used_ts"] = self._clock()
                 if job.id in lease["running_jobs"]:
                     lease["running_jobs"].remove(job.id)
                     if self.sql_backend is not None:

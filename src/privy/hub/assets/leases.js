@@ -1,6 +1,8 @@
 window.PrivyLeases = (() => {
   "use strict";
   let dialog = null;
+  let bulkBusy = false;
+  const selected = new Set();
   const $ = id => document.getElementById(id);
   const operatorKey = "privy.manual-operator";
 
@@ -58,8 +60,80 @@ window.PrivyLeases = (() => {
       }
       anchor.href = next.pathname + next.search;
     });
+    document.querySelectorAll("[data-select-lease]").forEach(input => {
+      input.checked = selected.has(input.dataset.selectLease);
+    });
+    updateSelection();
   }
 
+  function visibleSelections() {
+    return [...document.querySelectorAll("[data-select-lease]")].filter(input => !input.closest("tr").hidden);
+  }
+  function updateSelection() {
+    const inputs = visibleSelections(), count = inputs.filter(input => input.checked).length;
+    const button = $("force-release-selected"), all = $("select-all-leases");
+    if (button) { button.disabled = count === 0 || bulkBusy; button.textContent = `Force release selected (${count})`; }
+    if (all) {
+      all.checked = inputs.length > 0 && count === inputs.length;
+      all.indeterminate = count > 0 && count < inputs.length;
+    }
+  }
+  async function releaseSelected() {
+    if (dialog || bulkBusy) return;
+    const inputs = visibleSelections().filter(input => input.checked);
+    if (!inputs.length) return;
+    const button = $("force-release-selected"); bulkBusy = true; button.disabled = true;
+    try {
+      const leases = await Promise.all(inputs.map(input => get(`/v1/leases/${encodeURIComponent(input.dataset.selectLease)}`)));
+      const panel = element("dialog", "", "lease-dialog"); dialog = panel;
+      const heading = element("h2", `Force release ${leases.length} selected leases?`);
+      heading.id = "lease-bulk-title"; panel.setAttribute("aria-labelledby", heading.id);
+      panel.append(heading, element("p",
+        "This releases whole groups and skips cooldown. Existing pin reconciliation rules still apply; remote work may still be running. Verify it has stopped before continuing.",
+        "lease-warning"));
+      const list = element("ul", "");
+      for (const lease of leases) {
+        const pins = Object.keys(lease.job_owners || {});
+        const running = [...new Set([...(lease.running_jobs || []), ...pins])];
+        list.append(element("li", `${lease.lease_id} · ${lease.group} · ${lease.holder?.name || lease.client_id}` +
+          (running.length ? ` — PINNED / RUNNING: ${running.join(", ")}` : " — no running jobs or pins"),
+        running.length ? "lease-warning" : ""));
+      }
+      const results = element("div", ""); results.setAttribute("role", "status");
+      const actions = element("div", "", "lease-dialog-actions");
+      const cancel = element("button", "Cancel", "lease-button");
+      const proceed = element("button", "Force release selected", "lease-button danger");
+      cancel.type = proceed.type = "button"; actions.append(cancel, proceed);
+      panel.append(list, results, actions); document.body.append(panel);
+      let submitting = false, completed = false;
+      const close = () => {
+        if (submitting) return;
+        panel.close(); panel.remove(); dialog = null; bulkBusy = false;
+        if (completed) location.reload(); else { updateSelection(); button.focus(); }
+      };
+      cancel.onclick = close;
+      panel.addEventListener("cancel", event => { event.preventDefault(); close(); });
+      proceed.onclick = async () => {
+        if (submitting || completed) return;
+        submitting = true; proceed.disabled = true; cancel.disabled = true;
+        for (const lease of leases) {
+          const result = element("p", `${lease.lease_id}: releasing…`); results.append(result);
+          try {
+            await mutate(`/v1/leases/${encodeURIComponent(lease.lease_id)}/force-release`, "POST", {});
+            selected.delete(lease.lease_id);
+            result.textContent = `${lease.lease_id}: released`;
+          } catch (error) {
+            result.textContent = `${lease.lease_id}: ${error.name === "AbortError"
+              ? "Timed out; outcome unknown. Check the refreshed list before retrying." : error.message}`;
+            result.className = "lease-action-error";
+          }
+        }
+        submitting = false; completed = true; cancel.disabled = false;
+        cancel.textContent = "Close and refresh";
+      };
+      panel.showModal(); cancel.focus();
+    } catch (error) { bulkBusy = false; notice(error.message); updateSelection(); }
+  }
   function element(tag, text, className = "") {
     const node = document.createElement(tag);
     node.textContent = text;
@@ -299,7 +373,30 @@ window.PrivyLeases = (() => {
   document.addEventListener("input", event => {
     if (event.target.matches("#leaseq, #leaselabel")) filter();
   });
+  document.addEventListener("change", event => {
+    if (event.target.matches("#select-all-leases")) {
+      visibleSelections().forEach(input => { input.checked = event.target.checked; });
+    }
+    if (event.target.matches("#select-all-leases, [data-select-lease]")) {
+      document.querySelectorAll("[data-select-lease]").forEach(input => {
+        if (input.checked) selected.add(input.dataset.selectLease); else selected.delete(input.dataset.selectLease);
+      });
+      updateSelection();
+    }
+  });
   document.addEventListener("click", async event => {
+    const quick = event.target.closest("#select-never-used, #select-idle");
+    if (quick) {
+      const cutoff = Date.now() / 1000 - Number($("lease-idle-threshold").value);
+      visibleSelections().forEach(input => {
+        const row = input.closest("tr"), last = Number(row.dataset.lastUsed);
+        input.checked = row.dataset.useKnown === "true" && (quick.id === "select-never-used" ? last === 0
+          : (last || Number(row.dataset.acquired)) < cutoff);
+        if (input.checked) selected.add(input.dataset.selectLease); else selected.delete(input.dataset.selectLease);
+      });
+      updateSelection(); return;
+    }
+    if (event.target.closest("#force-release-selected")) { await releaseSelected(); return; }
     const take = event.target.closest("#take-lease");
     if (take) { await takeLease(take); return; }
     const button = event.target.closest("[data-force-release], [data-owner-release]");

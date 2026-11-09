@@ -1129,6 +1129,13 @@ def leases_page(service: Any, query: Mapping[str, list[str]], now: float) -> str
         f'<input type="search" id="leaselabel" aria-label="Filter lease labels" value="{esc(_last(query, "label"))}" '
         'placeholder="labels: repo=owner/repo task=leasing" autocomplete="off">'
         f'<span class="seg">{filters}</span><span class="chip" id="leasecount"></span></div>'
+        '<div class="toolbar">'
+        '<button type="button" class="lease-button" id="select-never-used">Select never used</button>'
+        '<button type="button" class="lease-button" id="select-idle">Select idle &gt;</button>'
+        '<select id="lease-idle-threshold" aria-label="Idle threshold">'
+        '<option value="1800">30m</option><option value="3600">1h</option><option value="14400">4h</option></select>'
+        '<button type="button" class="lease-button danger" id="force-release-selected" disabled>'
+        "Force release selected (0)</button></div>"
     )
     body = []
     for lease in leases:
@@ -1136,6 +1143,13 @@ def leases_page(service: Any, query: Mapping[str, list[str]], now: float) -> str
         holder = lease.get("holder") or {}
         search = json.dumps(lease, ensure_ascii=False).lower()
         jobs = job_counts.get(lease_id, 0)
+        last_used = lease_time(lease.get("last_used_at"))
+        acquired = lease_time(lease.get("acquired_at"))
+        selection = (
+            f'<input type="checkbox" data-select-lease="{esc(lease_id)}" aria-label="Select {esc(lease_id)}">'
+            if lease["state"] == "active"
+            else ""
+        )
         actions = (
             f'<a class="lease-button" href="{esc(link("/ui/leases", state=state, peek=lease_id))}#s-lease-peek">Peek</a>'
             f'<a class="lease-button" href="{esc(link("/ui/logs", target="*", lease=lease_id))}">Peek logs</a>'
@@ -1153,19 +1167,34 @@ def leases_page(service: Any, query: Mapping[str, list[str]], now: float) -> str
             for layer, target in lease.get("members", {}).items()
         )
         body.append(
-            f'<tr data-lease-row data-q="{esc(search)}" data-labels="{esc(json.dumps(lease.get("labels") or {}))}">'
+            f'<tr data-lease-row data-last-used="{last_used or 0}" data-use-known="{str(lease.get("last_use_known", False)).lower()}" data-acquired="{acquired or 0}" '
+            f'data-q="{esc(search)}" data-labels="{esc(json.dumps(lease.get("labels") or {}))}">'
+            f"<td>{selection}</td>"
             f'<td><b>{esc(lease["group"])}</b><span class="sub">{esc(lease_id)}</span>{lease_state(lease["state"])}</td>'
             f"<td>{members}</td><td><b>{esc(str(holder.get('name') or lease.get('client_id') or '—'))}</b>"
             f'<span class="sub">{esc(str(holder.get("kind") or ""))} · {esc(str(holder.get("session_id") or ""))}</span></td>'
             f"<td>{lease_labels(lease.get('labels') or {})}</td><td>{esc(lease.get('purpose') or '')}</td>"
             f'<td class="nw">{lease_at(lease.get("acquired_at"))}</td><td>{lease_timer(lease, now)}</td>'
+            f'<td class="nw" data-v="{last_used or 0}"{title_attr(utc_time(last_used) if last_used else None)}>'
+            f"{esc((fmt_ago(last_used, now) if last_used is not None else 'never') if lease.get('last_use_known') else 'unknown')}</td>"
             f'<td class="r">{jobs} ({len(lease.get("running_jobs") or [])} running)</td><td class="lease-actions">{actions}</td></tr>'
         )
     lease_table = (
         '<div class="table"><table id="leases"><thead><tr>'
+        '<th><input type="checkbox" id="select-all-leases" aria-label="Select all visible active leases"></th>'
         + "".join(
             sort_th(name)
-            for name in ("Group", "Members", "Holder", "Labels", "Purpose", "Acquired", "Expires", "Jobs")
+            for name in (
+                "Group",
+                "Members",
+                "Holder",
+                "Labels",
+                "Purpose",
+                "Acquired",
+                "Expires",
+                "Last used",
+                "Jobs",
+            )
         )
         + f"<th>Actions</th></tr></thead><tbody>{''.join(body)}</tbody></table></div>"
         '<div class="empty" id="leasenone" hidden>No leases match.</div>'

@@ -289,6 +289,66 @@ def test_force_release_requires_confirmation_and_keeps_running_terminal(lease_br
     assert not errors
 
 
+def test_bulk_release_selection_refresh_confirmation_and_partial_failure(lease_browser):
+    page, hub, lease, _, base, errors = lease_browser
+    store = hub.service.leases
+    client = store.register_client("Second holder")
+    second = store.acquire(client["client_id"], target="dev/box2_windows")
+    store._leases[lease["lease_id"]]["running_jobs"] = ["test-pin"]
+    page.goto(base + "/ui/leases")
+    page.locator("#select-never-used").click()
+    browser_api.expect(page.locator("[data-select-lease]:checked")).to_have_count(2)
+    assert all(item["state"] == "active" for item in store.list_leases())
+    with page.expect_response(lambda response: "/ui/leases" in response.url, timeout=15000):
+        page.wait_for_timeout(11000)
+    browser_api.expect(page.locator("[data-select-lease]:checked")).to_have_count(2)
+    page.locator("#force-release-selected").click()
+    modal = page.locator(".lease-dialog")
+    browser_api.expect(modal).to_contain_text(lease["lease_id"])
+    browser_api.expect(modal).to_contain_text(second["lease_id"])
+    browser_api.expect(modal).to_contain_text("PINNED / RUNNING: test-pin")
+    modal.get_by_role("button", name="Cancel", exact=True).click()
+    assert store.get_lease(lease["lease_id"])["state"] == "active"
+    page.route(
+        f"**/v1/leases/{second['lease_id']}/force-release",
+        lambda route: route.fulfill(
+            status=409, content_type="application/json", body='{"error":{"message":"Owner still running"}}'
+        ),
+    )
+    page.locator("#force-release-selected").click()
+    modal.get_by_role("button", name="Force release selected", exact=True).click()
+    browser_api.expect(modal).to_contain_text(f"{lease['lease_id']}: released")
+    browser_api.expect(modal).to_contain_text(f"{second['lease_id']}: Owner still running")
+    assert store.get_lease(second["lease_id"])["state"] == "active"
+    assert not any(listener.terminal_requests for listener in hub.listeners.values())
+    modal.get_by_role("button", name="Close and refresh", exact=True).click()
+    browser_api.expect(page.locator("[data-select-lease]")).to_have_count(1)
+    assert not errors
+
+
+def test_quick_selection_excludes_unknown_history_and_hidden_rows(lease_browser):
+    page, hub, lease, _, base, errors = lease_browser
+    store = hub.service.leases
+    client = store.register_client("Unknown holder")
+    unknown = store.acquire(client["client_id"], target="dev/box2_windows")
+    store._leases[unknown["lease_id"]].pop("last_used_ts")
+    store._leases[lease["lease_id"]]["acquired_ts"] = time.time() - 7200
+    store._leases[lease["lease_id"]]["last_used_ts"] = time.time() - 3700
+    page.goto(base + "/ui/leases")
+    page.locator("#select-never-used").click()
+    browser_api.expect(page.locator("[data-select-lease]:checked")).to_have_count(0)
+    page.locator("#lease-idle-threshold").select_option("3600")
+    page.locator("#select-idle").click()
+    browser_api.expect(page.locator("[data-select-lease]:checked")).to_have_count(1)
+    page.locator(f'[data-select-lease="{lease["lease_id"]}"]').uncheck()
+    page.locator("#leaseq").fill("Unknown holder")
+    page.locator("#select-all-leases").check()
+    browser_api.expect(page.locator("[data-select-lease]:checked")).to_have_count(1)
+    browser_api.expect(page.locator(f'[data-select-lease="{unknown["lease_id"]}"]')).to_be_checked()
+    assert all(item["state"] == "active" for item in store.list_leases())
+    assert not errors
+
+
 def test_human_open_and_run_warn_but_stay_unleased_and_cancel_preserves_draft(lease_browser):
     page, hub, lease, terminal, base, errors = lease_browser
     before = hub.service.leases.get_lease(lease["lease_id"])["expires_at"]
