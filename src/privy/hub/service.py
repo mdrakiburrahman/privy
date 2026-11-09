@@ -19,7 +19,6 @@ from typing import Any
 from privy.hub.config import Relay, RelaysSnapshot, Target
 from privy.hub.jobs import (
     STREAMS,
-    TERMINAL_STATES,
     TICK_S,
     Broadcast,
     HubBusyError,
@@ -29,7 +28,7 @@ from privy.hub.jobs import (
     utc_iso,
 )
 from privy.hub.leases import LeaseError, LeaseStore
-from privy.hub.listener_facts import FACETS, ListenerInfoStore, facts_for, facts_for_many, matches
+from privy.hub.listener_facts import FACETS, ListenerInfoStore, facts_for, matches
 from privy.hub.metrics import HubMetrics
 from privy.hub.purpose import MAX_PURPOSE_CHARS, WINDOWS, normalize_purpose
 from privy.hub.registry import (
@@ -41,8 +40,6 @@ from privy.hub.registry import (
     language_from,
     machine_name,
 )
-from privy.hub.shared_jobs import SharedJob
-from privy.hub.sql_store import StorageError
 from privy.hub.sync import validate_source
 from privy.transfer import TransferError
 
@@ -88,8 +85,8 @@ reading leases or filtering job history does not renew them.
 5. Use purpose on work submissions, e.g. "privy: Implementing HYCO purpose history." Reuse the
    same short sentence across related commands and transfers. A lease supplies its purpose when
    omitted; otherwise omission creates an unknown gap.
-   Purpose history resets on restart in file mode; SQL mode shares and persists it. A lease's
-   default purpose persists with its lease. Never include secrets.
+   Purpose history is hub-only and resets on restart; a lease's default purpose persists with
+   its lease. Never include secrets.
 The same API is plain HTTP at this server's / (a quickstart) and /openapi.json. Commands run with the
 listener user's privileges: prefer read-only commands unless the user asked for changes."""
 
@@ -136,10 +133,6 @@ def _translated_errors() -> Iterator[None]:
         raise HubError(str(exc), status=404, code="not_found") from None
     except HubBusyError as exc:
         raise HubError(str(exc), status=429, code="busy") from None
-    except StorageError as exc:
-        raise HubError(
-            "shared storage is unavailable; retry later", status=503, code="storage_unavailable"
-        ) from exc
 
 
 def _require_text(name: str, value: str) -> str:
@@ -383,8 +376,7 @@ OPERATIONS: tuple[Operation, ...] = (
         "languages; os_family, os_version, arch, privy_version, python_version, environment, and "
         "shells are also shown for offline machines from their last report (info_stale, "
         "info_seen_at). Filter on those with os, os_version, environment, arch, privy_version, "
-        "python_version, and shell. Status is cached briefly; SQL mode refreshes it in the background. "
-        "Start here.",
+        "python_version, and shell. Status is probed live and cached briefly. Start here.",
         (
             Param(
                 "refresh",
@@ -397,8 +389,7 @@ OPERATIONS: tuple[Operation, ...] = (
             Param(
                 "probe",
                 "boolean",
-                "Probe machines without a fresh cached status. SQL mode refreshes in the background; "
-                "false returns cached status only. Use refresh=true to wait for fresh probes.",
+                "Probe machines without a fresh cached status. false returns cached status only (fast).",
                 default=True,
             ),
             *(
@@ -762,17 +753,8 @@ FORCE_RELEASE_OPERATION = Operation(
     "force_release_lease",
     "Force-release a lease (REST dashboard only)",
     "Force-release a lease without holder credentials. Restricted to same-origin dashboard requests carrying "
-    "X-Privy-UI: 1; not exposed over MCP. Running jobs are not stopped. Bulk callers may require an "
-    "unpinned lease to prevent releasing a lease that acquired a job pin after confirmation.",
-    (
-        _REQUIRED_LEASE_ID,
-        Param(
-            "require_unpinned",
-            "boolean",
-            "Reject the release if running_jobs or job_owners contains any pin; stale and unknown pins also block.",
-            default=False,
-        ),
-    ),
+    "X-Privy-UI: 1; not exposed over MCP. Running jobs are not stopped.",
+    (_REQUIRED_LEASE_ID,),
     read_only=False,
     destructive=True,
 )
@@ -818,8 +800,7 @@ class _ProgressReporter:
         self._marks: dict[str, dict[str, int]] = {}
         for job in jobs:
             with job.cond:
-                shared_cursor = getattr(job, "read_cursor", None)
-                self._marks[job.id] = shared_cursor() if shared_cursor is not None else dict(job.cursor)
+                self._marks[job.id] = dict(job.cursor)
         self._started = time.monotonic()
         #: When a message was last sent; the first output goes out immediately.
         self._last = float("-inf")
@@ -894,11 +875,6 @@ class HubService:
         """OS and version facts, live or last known (see :mod:`privy.hub.listener_facts`)."""
         return facts_for(self.listener_infos, target_id, path, probe)
 
-    def listener_facts_many(
-        self, targets: Sequence[Target], probes: Mapping[str, ProbeResult | None]
-    ) -> dict[str, dict[str, Any]]:
-        return facts_for_many(self.listener_infos, targets, probes)
-
     def _job_added(self, job: HubJob) -> None:
         self.leases.job_started(job)
         self.metrics.job_added(job)
@@ -954,17 +930,18 @@ class HubService:
         return self.job_usage(job_id, lease_id=lease_id, origin=origin)[0]
 
     def job_usage(
-        self, job_id: str, *, lease_id: str | None = None, origin: str = "rest", read_only: bool = False
+        self, job_id: str, *, lease_id: str | None = None, origin: str = "rest"
     ) -> tuple[HubJob, dict[str, Any]]:
         with _translated_errors():
             job = self.jobs.get(job_id)
-            use = self.leases.read_use if read_only else self.leases.use
-            usage = use(job.target.id, lease_id if job.lease_id == lease_id else None, origin=origin)
+            usage = self.leases.use(
+                job.target.id, lease_id if job.lease_id == lease_id else None, origin=origin
+            )
             return job, usage
 
     def summary(self) -> dict[str, Any]:
         snapshot = self.registry.snapshot()
-        result = {
+        return {
             "version": self.version,
             "uptime_s": int(time.time() - self.started_at),
             "relays_file": self._relays_file_view(snapshot),
@@ -972,10 +949,6 @@ class HubService:
             "targets": len(snapshot.targets),
             "jobs": self.jobs.counts(),
         }
-        backend = getattr(self.jobs, "backend", None)
-        if backend is not None:
-            result["storage"] = backend.status()
-        return result
 
     # ---- views --------------------------------------------------------------
 
@@ -1007,7 +980,6 @@ class HubService:
         *,
         full: bool = False,
         facts: dict[str, Any] | None = None,
-        lease_summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         view: dict[str, Any] = {
             "id": target.id,
@@ -1015,7 +987,7 @@ class HubService:
             "status": probe.status if probe else UNKNOWN,
         }
         view.update(_listener_summary(probe))
-        view.update(lease_summary if lease_summary is not None else self.leases.target_summary(target.id))
+        view.update(self.leases.target_summary(target.id))
         if probe is not None and probe.status == ONLINE:
             language = language_from(probe.info, target.path)
             if language:
@@ -1050,12 +1022,8 @@ class HubService:
         max_output_bytes: int,
         *,
         offsets: Mapping[str, int | None] | None = None,
-        refresh: bool = True,
     ) -> dict[str, Any]:
-        if isinstance(job, SharedJob):
-            view = job.view(max_output_bytes=max_output_bytes, offsets=offsets, refresh=refresh)
-        else:
-            view = job.view(max_output_bytes=max_output_bytes, offsets=offsets)
+        view = job.view(max_output_bytes=max_output_bytes, offsets=offsets)
         if not view["done"]:
             view["next_step"] = (
                 f"Still running. Call get_job with job_id '{job.id}' (REST: GET /v1/jobs/{job.id}) for "
@@ -1163,21 +1131,16 @@ class HubService:
                     details={"relays": [item.name for item in snapshot.relays]},
                 )
         targets = [target for item in relays for target in item.targets]
-        background_probes = getattr(self, "background_warmup", None) is not None
-        if probe and (refresh or not background_probes):
+        if probe:
             probes = self.registry.probe_many(targets, refresh=refresh)
         else:
             probes = {target.id: self.registry.cached(target) for target in targets}
-        facts = self.listener_facts_many(targets, probes)
-        lease_summaries = self.leases.target_summaries([target.id for target in targets])
-        views = [
-            self._target_view(
-                target,
-                probes.get(target.id),
-                facts=facts[target.id],
-                lease_summary=lease_summaries[target.id],
-            )
+        facts = {
+            target.id: self.listener_facts(target.id, target.path, probes.get(target.id))
             for target in targets
+        }
+        views = [
+            self._target_view(target, probes.get(target.id), facts=facts[target.id]) for target in targets
         ]
         counts = Counter(view["status"] for view in views)
         if online_only:
@@ -1242,17 +1205,15 @@ class HubService:
         progress: Progress | None,
         lease_id: str | None = None,
     ) -> dict[str, Any]:
-        job, usage = self.job_usage(job_id, lease_id=lease_id, origin=origin, read_only=True)
+        job, usage = self.job_usage(job_id, lease_id=lease_id, origin=origin)
         self._wait([job], wait_s, progress, prefix=False)
-        if isinstance(job, SharedJob) and wait_s > 0 and job.state not in TERMINAL_STATES:
-            job.refresh()
         offsets = None
         if stdout_offset is not None or stderr_offset is not None:
             offsets = {"stdout": stdout_offset, "stderr": stderr_offset}
         return {
             **{
                 k: v
-                for k, v in self._job_view(job, max_output_bytes, offsets=offsets, refresh=False).items()
+                for k, v in self._job_view(job, max_output_bytes, offsets=offsets).items()
                 if k != "lease_warning"
             },
             **{k: v for k, v in usage.items() if k == "lease_warning"},
@@ -1261,30 +1222,22 @@ class HubService:
     def _op_read_job_output(
         self, *, origin: str, job_id: str, stream: str, offset: int, limit: int, lease_id: str | None = None
     ) -> dict[str, Any]:
-        job, usage = self.job_usage(job_id, lease_id=lease_id, origin=origin, read_only=True)
+        job, usage = self.job_usage(job_id, lease_id=lease_id, origin=origin)
         if job.type != "exec":
             raise _invalid(f"job {job_id!r} is a file transfer and has no output streams")
         return {
-            **(
-                job.read_output(stream, offset, limit, refresh=False)
-                if isinstance(job, SharedJob)
-                else job.read_output(stream, offset, limit)
-            ),
+            **job.read_output(stream, offset, limit),
             **{k: v for k, v in usage.items() if k == "lease_warning"},
         }
 
     def _op_cancel_job(self, *, origin: str, job_id: str, lease_id: str | None = None) -> dict[str, Any]:
         current = self.jobs.get(job_id)
         usage = self.leases.use(current.target.id, lease_id, origin=origin)
-        job = self.jobs.cancel(job_id, current=current)
+        job = self.jobs.cancel(job_id)
         self.jobs.wait(job, CANCEL_SETTLE_S)
-        if isinstance(job, SharedJob) and job.state not in TERMINAL_STATES:
-            job.refresh()
         return {
             **{
-                k: v
-                for k, v in self._job_view(job, DEFAULT_MAX_OUTPUT_BYTES, refresh=False).items()
-                if k != "lease_warning"
+                k: v for k, v in self._job_view(job, DEFAULT_MAX_OUTPUT_BYTES).items() if k != "lease_warning"
             },
             **{k: v for k, v in usage.items() if k == "lease_warning"},
         }
@@ -1559,10 +1512,8 @@ class HubService:
         with _translated_errors():
             return self.leases.release(lease_id, client_id=client_id)
 
-    def _op_force_release_lease(
-        self, *, origin: str, lease_id: str, require_unpinned: bool = False
-    ) -> dict[str, Any]:
+    def _op_force_release_lease(self, *, origin: str, lease_id: str) -> dict[str, Any]:
         if origin != "rest":
             raise HubError("force-release is REST dashboard only", status=403, code="forbidden")
         with _translated_errors():
-            return self.leases.release(lease_id, force=True, require_unpinned=require_unpinned)
+            return self.leases.release(lease_id, force=True)

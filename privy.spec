@@ -1,14 +1,11 @@
 # PyInstaller spec for the self-contained `privy` binary.
 # Build with: ./scripts/build_binary.sh
 
-import importlib
 import sys
 
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files
 
 terminal_data = collect_data_files("winpty", includes=["*.exe"]) if sys.platform == "win32" else []
-for module in ("azure.identity", "pyodbc"):
-    importlib.import_module(module)
 
 a = Analysis(
     ["src/privy/__main__.py"],
@@ -28,12 +25,6 @@ a = Analysis(
         "privy.hub.home",
         "privy.hub.jobs",
         "privy.hub.leases",
-        "privy.hub.settings",
-        "privy.hub.sql_store",
-        "privy.hub.shared_jobs",
-        "privy.hub.shared_metrics",
-        "pyodbc",
-        *collect_submodules("azure.identity"),
         "yaml",
         "privy.hub.mcp",
         "privy.hub.registry",

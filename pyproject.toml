@@ -17,10 +17,6 @@ dependencies = [
 privy = "privy.cli:main"
 
 [project.optional-dependencies]
-sql = [
-    "azure-identity>=1.19",
-    "pyodbc>=5.2",
-]
 dev = [
     "pytest>=8",
     "build>=1.2",
@@ -69,7 +65,7 @@ markers = [
 [tool.ruff]
 line-length = 110
 target-version = "py39"
-extend-exclude = [".temp", ".venv", "dist", "build", "*.md"]
+extend-exclude = [".temp", ".venv", "dist", "build"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]

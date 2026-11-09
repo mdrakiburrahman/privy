@@ -17,171 +17,7 @@ flowchart LR
 ```
 
 The hub never calls Azure Resource Manager. It signs a one-hour SAS token from the hydrated key for
-every Relay request. The default file-backed mode works without an Azure login; optional Azure SQL
-mode uses Azure CLI authentication for its shared backing store.
-
-## Shared Azure SQL backing store
-
-Install `privy[sql]`, Microsoft **ODBC Driver 18 for SQL Server**, and Azure CLI on each hub
-machine. Sign in with `az login` as an identity authorized in the database. The application uses
-`azure.identity.AzureCliCredential` explicitly, caches its access token and refreshes it five
-minutes before expiry. Connections require encryption and validate the server certificate. The
-driver and Azure CLI remain machine prerequisites, not components bundled into `privy.exe`.
-
-Copy `appsettings.template.yaml` to a **local, gitignored** `appsettings.yaml`, set `storage.server`
-and `storage.database`, and hydrate identical target names/namespaces and `leases.yaml` rules in
-each hub home. Relay keys remain local and need not be committed or sent to SQL.
-
-```yaml
-version: 1
-storage:
-  mode: azure_sql
-  server: YOUR-SERVER.database.windows.net
-  database: privy
-  driver: ODBC Driver 18 for SQL Server
-  retention_days: 7
-  outbox_max_bytes: 268435456
-```
-
-Start each hub explicitly with its own home, for example:
-
-```powershell
-privy hub serve --home C:\privy-shared-home --settings C:\privy-local\appsettings.yaml --port 17749
-```
-
-Settings resolution is `--settings`, then `PRIVY_HUB_SETTINGS`, then `<home>\appsettings.yaml`, then
-the current directory's `appsettings.yaml`. Without any settings, existing file behavior is
-unchanged. Explicitly selected missing files, invalid settings, SQL authentication/connection
-failures and conflicting shared configurations are errors: **they never fall back to independent
-file leasing**. To deliberately choose file mode, use `version: 1` and `storage: {mode: file}`.
-
-Startup bootstraps versioned SQL tables under a transaction-owned SQL application lock. Concurrent
-starts are safe. SQL is authoritative for clients, leases, use/cooldown records and job pins: each
-operation reads current keyed records inside a database transaction, uses database time and commits
-only changed records. Admission, session registration, holder checks, renewal, client limits and
-release therefore coordinate across hubs. A differing target topology or lease/storage configuration
-is rejected; hydrate the complete intended topology before the first SQL start. Legacy lease rows
-are compared using the current duration/default rules and accepted only when their effective values
-match exactly. They are left in their original representation so an older running hub remains
-compatible; a real policy difference still blocks startup.
-
-The deployed `privy-sql.database.windows.net` permits all client IPs through the single
-`privy-allow-all` rule. No per-machine firewall setup is needed. This makes the SQL endpoint
-internet-reachable; Entra-only authentication and TLS 1.2 remain required.
-
-Job workers stay on their originating hub. Shared job summaries, output pages, broadcasts, audit,
-listener facts, purposes and dashboard telemetry are journaled locally before asynchronous delivery
-to SQL. The bounded SQLite delivery journal uses full durability, ordered replay and SQL
-owner/revision checks. It is **not** a second leasing authority. Outages retain pending deliveries;
-full journals reject new writes and report errors/backpressure rather than dropping old data. Keep
-each home and its `sql-outbox.sqlite3` files until all pending deliveries have been flushed.
-
-Legacy `audit.jsonl` cutover runs in a background thread, scanning at most its last 64 MiB and seven
-days of job starts/finishes. It checks existing job and deterministic audit keys in bulk, then
-commits missing records in insert-only SQL batches of at most 500, without flooding the live
-delivery journal or replacing shared jobs. Interrupted imports resume from already committed keys.
-The file's SHA-256 completion marker is committed only after every import batch is durable and the
-source is verified unchanged; an unchanged completed file needs only hashing and one marker lookup
-on restart. An existing journal must drain before migration begins. Failures remain visible in
-storage health and can be retried on restart. Successfully imported or already-completed, unchanged
-files are renamed to `audit.jsonl.imported-snapshot`; existing snapshots are preserved.
-
-Either hub can inspect/follow shared jobs and request cancellation. Cancellation is durably recorded
-in SQL and only acknowledged by the executing hub after it processes the request. Acceptance does
-not promise immediate cancellation while that owner is offline. A same-home successor fences the
-previous SQL incarnation but neither restarts its work nor clears its pins. **Stale heartbeats do
-not prove remote execution stopped.** Normal release refuses while leased jobs are pinned; the
-explicit force-release action can reconcile pins only after every owner is marked stopped, stale, or
-unresolved file import. Verify remote work has ended before using it, because reconciliation may
-make the box available while remote work continues. Unleased running jobs also keep their group
-unavailable for fresh lease admission.
-
-SQL is authoritative for lease policy. A missing `leases.yaml` is hydrated from the shared policy;
-an existing local policy does not override SQL. Target configuration comparisons ignore ordering,
-but still reject different target identities, namespaces or paths.
-
-If a SQL-enabled home contains `leases-state.json`, startup imports missing records under the same
-SQL lock and keeps existing SQL identities, allocations and pins unchanged. Historical local clients
-with a matching shared session use the canonical SQL client ID. An active or pinned local allocation
-that would require changing its owner is rejected rather than silently reassigned. Equivalent/newer
-shared records do not block restart. Successful imports are retired to
-`leases-state.json.imported-snapshot`, preserving prior snapshots. Imports never access another
-home. Newly imported released/expired pinned work is rejected until that unresolved work has been
-checked. Local PID discovery files, Relay secrets, sockets, interactive terminal sessions and
-hub-local transfer paths do not migrate through SQL. Metadata is shared; files and interactive
-resources still belong to the machine hosting them.
-
-### Fresh-home recovery and planned cutovers
-
-A new home with regenerated `relays.json` and SQL `appsettings.yaml` reads the same shared clients,
-leases, jobs/output/history, listener facts and dashboard telemetry. Its newly generated
-`.sql-hub-id` does not partition shared reads or transfer ownership of another hub's running work.
-SQL `restored_jobs` counts SQL-loaded report entries consistently across hubs; process uptime and
-owner-local execution/terminal capabilities still describe the current process.
-
-| Home file                                    | SQL-mode recovery role                                                                |
-| -------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `relays.json`, `appsettings.yaml`            | Local connection/secret configuration; regenerate securely, not stored in SQL.        |
-| `leases.yaml`                                | SQL policy is authoritative; missing file is hydrated.                                |
-| `leases-state.json`, `audit.jsonl`           | Optional legacy migration inputs, retired after successful durable import.            |
-| `listener-info-state.json`                   | File-mode only; SQL listener facts are read from shared storage.                      |
-| `.sql-hub-id`, `sql-home.lock`               | Local incarnation/fencing and exclusive-home coordination, regenerated on a new home. |
-| `hub-state.json`, legacy `hub-token`         | Local PID/URL discovery and obsolete authentication, not shared authority.            |
-| `sql-outbox.sqlite3` and its SQLite sidecars | Pending asynchronous writes; preserve the entire home until drained.                  |
-
-**Deleting an undrained home or losing its machine can lose acknowledged asynchronous writes that
-have not reached SQL.** A fresh home restores SQL-committed state, not a lost local journal or live
-terminal/socket/worker process. Planned cutovers must use `POST /v1/admin/drain` first.
-
-Drain is available only on a loopback-bound SQL hub and checks the actual loopback socket peer, Host
-and Origin. No request body is required. It stops admission, waits up to 30 seconds for in-flight
-requests, refuses to abandon active local jobs, stops background producers and flushes the outbox.
-Success is HTTP 200 `{"status":"drained","pending_writes":0}`; the response is sent before HTTP
-serving stops and normal shutdown completes. Allow up to five minutes for the request because worker
-shutdown and SQL flush have bounded waits. HTTP 503 `drain_pending` with `Retry-After: 1` leaves the
-hub draining; retry after jobs finish or SQL recovers. Health remains available and reports
-`draining: true`; other requests return 503 `hub_draining`. A response timeout is not proof of
-success: preserve the home until success and process exit are confirmed. After a successful drain,
-HTTP server shutdown still proceeds if the caller disconnects or the response cannot be flushed. A
-failed or pending drain never schedules shutdown.
-
-Older binaries without this endpoint require a first **in-place, same-home bridge upgrade**:
-preserve the complete home/outbox, stop the exact old process, then start the new binary against
-that same home so replay can finish. Do not delete an undrained home to perform the bridge.
-
-SQL cleanup checks for retention candidates first, then tries its GC and lease locks without
-waiting. If either is busy, that pass skips cleanup and retries after the 30-second maintenance
-interval. It runs in indexed, bounded batches with seven-day retention and protects active leases,
-unfinished jobs, their output and control records, and unresolved pins. Job summaries and output are
-read lazily; startup does not load seven days of output. Both hubs must use SQL mode against the
-same database: a database-backed lease does **not** coordinate with an existing file-mode hub.
-
-The startup log names `storage: azure_sql`, server/database and the process owner incarnation; the
-dashboard sidebar shows `storage Azure SQL` and pending/rejected delivery counts. `/healthz` probes
-SQL and reports the read model's readiness, last-good snapshot age, last refresh duration and last
-error. SQL mode also warms common dashboard and API reads in the background after HTTP binding;
-`storage.warmup.warm`, `status` (`warming`, `ready`, or `degraded`), `warm_seconds`, and
-`last_error` describe warmup readiness and failures. Common report ranges and target probes continue
-refreshing while the hub is idle. A normal SQL-mode target listing returns cached probe results;
-`refresh=true` waits for fresh probes. Once a snapshot is available, dashboard reads can serve it
-while background refreshes continue; its age can grow during an outage. A cold read that cannot
-hydrate in time returns 503 with `Retry-After`. Shared record deletions are reconciled periodically,
-so they can remain visible for up to the reconciliation interval plus a refresh. Lease mutations and
-output cursor claims remain SQL-authoritative. `/v1` includes detailed storage health. The isolated
-Basic-tier SQL benchmark (20 simulated devboxes, 3,360 jobs over seven days, 4 KiB output per job)
-measured a 200-job page at 0.63 seconds, seven-day statistics at 4.21 seconds, dashboard HTML at
-5.35 seconds and an output page at 1.42 seconds. This is not a production-tier or
-two-physical-machine measurement. Dashboard pages render cached listener statuses while stale probes
-continue in the background, waiting at most 0.5 seconds for a refresh. SQL-backed reports reuse the
-job counts already read for that page.
-
-Probe history reads use a covering SQL index over computed status and latency fields, while fetching
-full payloads only for each target's latest probe; the additive schema bootstrap is serialized and
-remains compatible with version-1 peers. For short-lived diagnostics, set `PRIVY_SQL_PROFILE=1`
-before starting the hub. The `sql_profile` log entries separate connection acquisition, SQL
-execution/fetch/nextset, cursor close, commit, connection return, per-kind record decoding and
-counts, report assembly, and HTML rendering. Failed statements include the exception and SQL text
-but never bind parameters or record payloads; unset the variable to disable profiling.
+every request, so startup is instant and works without an Azure login.
 
 ## Quick start
 
@@ -258,19 +94,6 @@ normal **Release** action; **Force release** remains a separately confirmed admi
 If browser storage is cleared, or you switch between `localhost` and `127.0.0.1`, that origin has a
 different identity; the existing force-release action provides recovery. Identity metadata is
 cooperative coordination, not authentication.
-
-The lease table's sortable **Last used** column tracks lease-backed commands, transfers, and
-terminal activity, including job completion, rather than renewal or heartbeat. It is persisted with
-the lease and shared between SQL-backed hubs. **Never** means no recorded use since acquisition;
-older leases with insufficient retained history show **unknown**, not never.
-
-Use the row checkboxes or select-all-visible to choose active leases. **Select never used** and
-**Select idle >** (30m, 1h, or 4h) only select visible leases with known history; idle age uses
-acquisition when a lease has never been used. Selection survives automatic refresh. **Force release
-selected (N)** lists the chosen leases and warns about running jobs/pins before confirmation. Each
-release uses the existing dashboard-only force-release endpoint independently, without cancelling
-remote jobs or changing pin reconciliation. Per-lease results remain visible until **Close and
-refresh**; failures and timeouts are not automatically retried.
 
 Closing or refreshing the dashboard does not release or renew a reservation. Lease state survives
 hub restarts. Creation uses the existing acquisition endpoint with `X-Privy-UI: 1` and a matching
@@ -655,11 +478,10 @@ On **Relay HYCOs**, the **Status** column is color-coded: green for `online`, or
 The line under it says how long the HYCO has had that status, such as "for 2h 15m", plus the reason
 when it is not online. "For at least" means the status has not changed since the hub first checked
 that HYCO. **Last seen online** shows "now" for online HYCOs, the last time the hub saw the others
-online, or "not since hub start". Both come from listener probes, which run when a page or tool asks
-about a HYCO, so they are approximate. In file mode they are kept in memory and reset on restart; in
-SQL mode retained probe history is shared and can be recovered after restart. `GET /v1/stats`
-reports them per HYCO as `status_since`, `status_since_first_check`, and `last_online`; each is
-`null` when unknown.
+online, or "not since hub start". Both come from the hub's own listener probes, which run when a
+page or tool asks about a HYCO, so they are approximate. They are kept in memory and reset when the
+hub restarts. `GET /v1/stats` reports them per HYCO as `status_since`, `status_since_first_check`,
+and `last_online`; each is `null` when unknown.
 
 **Relay HYCOs** also shows **OS**, **Env**, **Privy**, and **Python** columns, with **Arch** and
 **Shell** available from **Columns**; the column choice is remembered in the browser. The filter
@@ -693,12 +515,11 @@ resolutions return HTTP 400. Responses expose `requested_resolution`, `bucket_s`
 resolution), and `resolution_adjusted`. Omitting the new parameters preserves the existing 24-hour
 view and preset bucket widths.
 
-In file mode, jobs, request samples, and probe measurements are kept in RAM without age-based expiry
-during the process lifetime; request/probe history and buffered job output are lost on restart.
-Recent job summaries can be restored from `audit.jsonl`. In SQL mode, job summaries, output, request
-samples, and probes are shared and retained according to the configured SQL retention period, with
-active work protected from cleanup. Process-bound workers and terminals do not restart on another
-hub.
+Jobs, request samples, and probe measurements are kept in RAM without age-based expiry during the
+process lifetime. Memory usage grows until the hub restarts. Request/probe history and buffered job
+output are lost on restart; no persistent telemetry store is introduced. Existing startup
+restoration of recent job summaries from `audit.jsonl` remains unchanged and is labeled separately.
+Job-output buffer limits and the separate purpose timeline's retention limits are unchanged.
 
 ### Export Relay credentials
 

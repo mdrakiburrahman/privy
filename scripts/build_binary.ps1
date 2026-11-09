@@ -13,7 +13,7 @@ Push-Location $repoRoot
 try {
     if (-not $SkipSync) {
         Write-Host ">> syncing Windows binary build dependencies"
-        & uv sync --locked --group binary --extra sql
+        & uv sync --locked --group binary
         if ($LASTEXITCODE -ne 0) {
             throw "uv sync failed with exit code $LASTEXITCODE"
         }
@@ -24,7 +24,7 @@ try {
         @("run", "--no-sync")
     }
     else {
-        @("run", "--locked", "--group", "binary", "--extra", "sql")
+        @("run", "--locked", "--group", "binary")
     }
     & uv @runArguments pyinstaller --clean --noconfirm privy.spec
     if ($LASTEXITCODE -ne 0) {

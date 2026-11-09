@@ -6,7 +6,6 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -118,75 +117,6 @@ def test_defaults_persistence_and_client_session_idempotency(leasing, tmp_path):
     assert '"event": "lease.acquired"' in hub.audit_path.read_text()
 
 
-def test_effective_sql_config_applies_omitted_manual_ttl_default(leasing, tmp_path):
-    hub, first, _ = leasing
-    second_home = tmp_path / "second"
-    second_home.mkdir()
-    (second_home / "leases.yaml").write_text(
-        DEFAULT_CONFIG.replace("  manual_max_ttl: 365d\n", ""), encoding="utf-8"
-    )
-    second = LeaseStore(hub.registry, home=second_home)
-    assert first.effective_config == second.effective_config
-
-
-def test_sql_force_release_reconciles_only_stopped_or_unresolved_pins(leasing):
-    _, store, _ = leasing
-    owner = client(store)
-    lease = acquire(store, owner)
-    record = store._leases[lease["lease_id"]]
-    record["running_jobs"] = ["stopped-job", "live-job"]
-    record["job_owners"] = {"stopped-job": "stopped-owner", "live-job": "live-owner"}
-    store.sql_backend = SimpleNamespace(
-        owner_is_stale=lambda value: value in {"stopped-owner", "unresolved-file-import"}
-    )
-    with pytest.raises(LeaseError) as error:
-        store.release(lease["lease_id"], force=True)
-    assert error.value.code == "lease_pinned"
-    assert record["running_jobs"] == ["stopped-job", "live-job"]
-
-    record["running_jobs"] = ["stopped-job", "file-job"]
-    record["job_owners"] = {"stopped-job": "stopped-owner", "file-job": "unresolved-file-import"}
-    store.release(lease["lease_id"], force=True)
-    assert record["running_jobs"] == []
-    assert record["job_owners"] == {}
-    assert record["state"] == "released"
-    assert record["events"][-2]["event"] == "pins_reconciled"
-    assert "may still be running" in record["events"][-2]["warning"]
-
-
-@pytest.mark.parametrize(
-    "pins",
-    [
-        {"running_jobs": ["job-after-confirmation"]},
-        {"job_owners": {"unknown-job": "unresolved-file-import"}},
-        {"job_owners": ["malformed-pin-metadata"]},
-    ],
-)
-@pytest.mark.parametrize("sql_mode", [False, True])
-def test_require_unpinned_rejects_new_and_unknown_pins_before_reconciliation(leasing, pins, sql_mode):
-    _, store, _ = leasing
-    owner = client(store)
-    lease = acquire(store, owner)
-    record = store._leases[lease["lease_id"]]
-    assert record["running_jobs"] == []
-
-    record.update(pins)
-    if sql_mode:
-        store.sql_backend = SimpleNamespace(
-            owner_is_stale=lambda _owner: pytest.fail(
-                "unpinned guard must run before stale-owner reconciliation"
-            )
-        )
-
-    with pytest.raises(LeaseError) as error:
-        store.release(lease["lease_id"], force=True, require_unpinned=True)
-
-    assert error.value.code == "lease_pinned"
-    assert record["state"] == "active"
-    for name, value in pins.items():
-        assert record[name] == value
-
-
 def test_first_leasing_start_restores_cooldown_from_existing_hub_audit(tmp_path):
     hub = Hub(tmp_path)
     result = hub.call(
@@ -202,102 +132,6 @@ def test_first_leasing_start_restores_cooldown_from_existing_hub_audit(tmp_path)
         store.acquire(owner, target="dev/box1_windows")
     assert error.value.code == "cooling_down"
     assert error.value.details["last_used_by"] == {"origin": "ui"}
-
-
-def test_sql_group_snapshot_displays_expiry_without_persisting_sweep(leasing, monkeypatch):
-    _, store, now = leasing
-    owner = client(store)
-    lease = acquire(store, owner, ttl="1m")
-    now[0] += 61
-    before = json.loads(json.dumps(store._leases[lease["lease_id"]]))
-
-    class SnapshotLock:
-        @contextmanager
-        def read_snapshot(self):
-            yield {"now": now[0], "clients": store._clients, "leases": store._leases, "uses": store._uses}
-
-    store._lock = SnapshotLock()
-    store.sql_backend = object()
-    monkeypatch.setattr(store, "_save", lambda: pytest.fail("dashboard snapshot persisted sweep"))
-
-    groups = {item["group"]: item for item in store.groups()}
-    group = groups["dev/raki-windows-big"]
-    assert group["state"] == "cooling"
-    assert group["lease"] is None
-    assert store._leases[lease["lease_id"]] == before
-
-
-@pytest.mark.parametrize("local_cache", ["empty", "stale"])
-def test_sql_group_snapshot_uses_detached_holder_data_with_sql_time(leasing, local_cache):
-    _, store, now = leasing
-    owner = client(store)
-    lease = acquire(store, owner, ttl="1m")
-    now[0] += 10
-    fresh_client = json.loads(json.dumps(store._clients[owner]))
-    fresh_client["name"] = "peer-created-client"
-    fresh_client["host"] = "peer-host"
-    active = json.loads(json.dumps(store._leases[lease["lease_id"]]))
-    expired = json.loads(json.dumps(active))
-    expired["lease_id"] = "expired-peer-lease"
-    expired["expires_ts"] = now[0] - 1
-    expired["running_jobs"] = []
-    snapshot_leases = {expired["lease_id"]: expired, lease["lease_id"]: active}
-    snapshot_reads = 0
-
-    if local_cache == "empty":
-        store._clients = {}
-        store._leases = {}
-    else:
-        stale_client = json.loads(json.dumps(fresh_client))
-        stale_client["name"] = "stale-client"
-        stale_lease = json.loads(json.dumps(active))
-        stale_lease["lease_id"] = "stale-lease"
-        store._clients = {owner: stale_client}
-        store._leases = {stale_lease["lease_id"]: stale_lease}
-
-    class SnapshotLock:
-        @contextmanager
-        def read_snapshot(self):
-            nonlocal snapshot_reads
-            snapshot_reads += 1
-            yield {
-                "now": now[0],
-                "clients": {owner: fresh_client},
-                "leases": snapshot_leases,
-                "uses": {},
-            }
-
-    store._lock = SnapshotLock()
-    store.sql_backend = object()
-    local_clients = json.loads(json.dumps(store._clients))
-    local_leases = json.loads(json.dumps(store._leases))
-    assert store.target_summaries([]) == {}
-    assert snapshot_reads == 0
-    groups = {item["group"]: item for item in store.groups()}
-    group = groups["dev/raki-windows-big"]
-    assert snapshot_reads == 1
-
-    assert group["lease"]["lease_id"] == lease["lease_id"]
-    assert group["lease"]["holder"]["name"] == "peer-created-client"
-    assert group["lease"]["holder"]["host"] == "peer-host"
-    assert group["lease"]["holder"]["leases"] == [lease["lease_id"]]
-
-    target_ids = [
-        "dev/raki-windows-big_windows",
-        "dev/raki-windows-big_wsl",
-        "dev/raki-windows-big_devcontainer",
-    ]
-    summaries = store.target_summaries(target_ids)
-    assert snapshot_reads == 2
-    for target_id in target_ids:
-        summary = summaries[target_id]
-        assert summary["group"] == "dev/raki-windows-big"
-        assert summary["lease"]["lease_id"] == lease["lease_id"]
-        assert summary["lease"]["holder"]["name"] == "peer-created-client"
-        assert summary["lease"]["holder"]["host"] == "peer-host"
-        assert summary["lease"]["holder"]["leases"] == [lease["lease_id"]]
-    assert store._clients == local_clients
-    assert store._leases == local_leases
 
 
 def test_group_regex_boundaries_unmatched_and_only_required_layer_online(leasing):

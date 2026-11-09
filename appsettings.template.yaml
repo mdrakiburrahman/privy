@@ -1,8 +1,0 @@
-version: 1
-storage:
-  mode: azure_sql
-  server: YOUR-SERVER.database.windows.net
-  database: privy
-  driver: ODBC Driver 18 for SQL Server
-  retention_days: 7
-  outbox_max_bytes: 268435456

@@ -12,11 +12,9 @@ import logging
 import os
 import re
 import socket
-import threading
 import time
-import uuid
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -29,13 +27,10 @@ from privy.hub.jobs import DEFAULT_MAX_RUNNING, AuditLog, JobManager
 from privy.hub.leases import LeaseStore
 from privy.hub.listener_facts import ListenerInfoStore
 from privy.hub.mcp import MCP_PATH, McpEndpoint
-from privy.hub.metrics import RANGES, ReportSelection
 from privy.hub.registry import DEFAULT_PROBE_TTL_S, TargetRegistry
-from privy.hub.request_context import REQUEST_ID
 from privy.hub.responses import HTML_TYPE, HttpResponse, error_response
 from privy.hub.rest import RestApi
 from privy.hub.service import HubService
-from privy.hub.sql_store import StorageError
 
 __all__ = ["Headers", "HttpResponse", "HubApp", "HubHTTPServer", "HubRuntime", "build_hub"]
 
@@ -122,12 +117,6 @@ class HubApp:
         self.service = service
         self.rest = RestApi(service)
         self.mcp = McpEndpoint(service)
-        self.warmup = None
-        self.drain = None
-        self.draining = False
-        self._requests = threading.Condition()
-        self._active_requests = 0
-        self._drain_lock = threading.Lock()
         self.set_port(port)
 
     def set_port(self, port: int) -> None:
@@ -172,69 +161,12 @@ class HubApp:
             return rejected
         parsed = urlsplit(target)
         path = parsed.path or "/"
-        if path == "/v1/admin/drain":
-            if method != "POST":
-                return error_response(405, "method_not_allowed", "use POST", {"Allow": "POST"})
-            if self.drain is None:
-                return error_response(409, "drain_unavailable", "SQL drain requires a loopback-bound hub")
-            if not self._drain_lock.acquire(blocking=False):
-                return error_response(
-                    503, "drain_pending", "Another drain is in progress", {"Retry-After": "1"}
-                )
-            try:
-                with self._requests:
-                    self.draining = True
-                    if not self._requests.wait_for(lambda: self._active_requests <= 1, timeout=30):
-                        return error_response(
-                            503,
-                            "drain_pending",
-                            "Existing requests are still completing",
-                            {"Retry-After": "1"},
-                        )
-                try:
-                    return self.drain()
-                except StorageError:
-                    log.exception("SQL drain could not complete; storage remains open")
-                    return error_response(
-                        503,
-                        "drain_pending",
-                        "SQL drain could not complete; see hub logs",
-                        {"Retry-After": "1"},
-                    )
-            finally:
-                self._drain_lock.release()
-        if self.draining and path != "/healthz":
-            return error_response(
-                503, "hub_draining", "Hub is draining; retry on the replacement hub", {"Retry-After": "1"}
-            )
         if path == "/healthz":
             if method not in ("GET", "HEAD"):
                 response = error_response(405, "method_not_allowed", "use GET", {"Allow": "GET, HEAD"})
             else:
-                backend = getattr(self.service.jobs, "backend", None)
-                if backend is not None:
-                    try:
-                        storage = backend.health()
-                    except StorageError:
-                        return error_response(
-                            503, "storage_unavailable", "Authoritative SQL backing store is unavailable"
-                        )
-                    model = getattr(backend, "read_model", None)
-                    if model is not None:
-                        storage["read_model"] = model.health()
-                    if self.warmup is not None:
-                        storage["warmup"] = self.warmup.status()
-                else:
-                    storage = {"mode": "file"}
                 response = HttpResponse(
-                    200,
-                    {
-                        "status": "ok",
-                        "service": "privy-hub",
-                        "version": self.service.version,
-                        "draining": self.draining,
-                        "storage": storage,
-                    },
+                    200, {"status": "ok", "service": "privy-hub", "version": self.service.version}
                 )
             response.surface = "health"
             return response
@@ -243,14 +175,7 @@ class HubApp:
             response.surface = "mcp"
             return response
         query = parse_qs(parsed.query, keep_blank_values=True)
-        try:
-            response = self.rest.handle(method, path, query, headers, body)
-        except StorageError:
-            response = error_response(
-                503, "storage_unavailable", "shared storage is unavailable; retry later", {"Retry-After": "1"}
-            )
-        if response.status == 503 and response.note == "storage_unavailable":
-            response.headers["Retry-After"] = "1"
+        response = self.rest.handle(method, path, query, headers, body)
         ui = headers.get("X-Privy-UI") or path == "/ui" or path.startswith("/ui/")
         response.surface = "ui" if ui or response.media_type() == HTML_TYPE else "rest"
         return response
@@ -270,19 +195,8 @@ class HubApp:
         return f"{label} {_describe_body(body)}" if body else label
 
     def log_call(self, method: str, target: str, body: bytes, response: HttpResponse, seconds: float) -> None:
-        if self.draining:
-            return
         surface = response.surface or "rest"
         self.service.metrics.call(surface, response.status, seconds)
-        if os.environ.get("PRIVY_SQL_PROFILE") == "1":
-            log.info(
-                "request_profile id=%s method=%s path=%s status=%s total_ms=%.1f",
-                REQUEST_ID.get(),
-                method,
-                target.split("?", 1)[0],
-                response.status,
-                seconds * 1000,
-            )
         outcome = f"{response.status} {response.note}" if response.note else str(response.status)
         if surface == "ui" and response.status < 400:
             # The dashboard refreshes itself every few seconds; keep the console for real work.
@@ -300,51 +214,24 @@ class _Handler(BaseHTTPRequestHandler):
     server: HubHTTPServer
 
     def _dispatch(self) -> None:
-        if urlsplit(self.path).path == "/v1/admin/drain" and self.client_address[0] not in (
-            "127.0.0.1",
-            "::1",
-        ):
-            self._send(error_response(403, "forbidden_peer", "Drain requires a loopback connection"))
-            return
-        with self.server.app._requests:
-            self.server.app._active_requests += 1
-        try:
-            self._dispatch_registered()
-        finally:
-            with self.server.app._requests:
-                self.server.app._active_requests -= 1
-                self.server.app._requests.notify_all()
-
-    def _dispatch_registered(self) -> None:
         started = time.monotonic()
-        token = REQUEST_ID.set(uuid.uuid4().hex[:12])
-        drained = False
+        body, response = self._read_and_handle()
         try:
-            body, response = self._read_and_handle()
-            drained = response.status == 200 and response.note == "drained"
-            try:
-                if response.stream is not None:
-                    self._send_stream(response)
-                else:
-                    self._send(response)
-                if drained:
-                    self.wfile.flush()
-            except ConnectionError:
-                # The caller went away (Ctrl-C on curl, a client timeout); jobs keep running.
-                response.note = (
-                    f"{response.note}, client disconnected" if response.note else "client disconnected"
-                )
-                self.close_connection = True
-            except Exception:  # noqa: BLE001 - keep the server alive
-                log.exception("failed to answer %s %s", self.command, self.path)
-                response.note = f"{response.note}, failed" if response.note else "failed"
-                self.close_connection = True
-            self.server.app.log_call(self.command, self.path, body, response, time.monotonic() - started)
-        finally:
-            if drained:
-                self.close_connection = True
-                threading.Thread(target=self.server.shutdown, name="privy-drain-stop", daemon=True).start()
-            REQUEST_ID.reset(token)
+            if response.stream is not None:
+                self._send_stream(response)
+            else:
+                self._send(response)
+        except ConnectionError:
+            # The caller went away (Ctrl-C on curl, a client timeout); jobs keep running.
+            response.note = (
+                f"{response.note}, client disconnected" if response.note else "client disconnected"
+            )
+            self.close_connection = True
+        except Exception:  # noqa: BLE001 - keep the server alive
+            log.exception("failed to answer %s %s", self.command, self.path)
+            response.note = f"{response.note}, failed" if response.note else "failed"
+            self.close_connection = True
+        self.server.app.log_call(self.command, self.path, body, response, time.monotonic() - started)
 
     def _read_and_handle(self) -> tuple[bytes, HttpResponse]:
         headers = Headers(self.headers.items())
@@ -433,91 +320,6 @@ class HubHTTPServer(ThreadingHTTPServer):
         super().server_bind()
 
 
-class _Warmup:
-    def __init__(self, app, model):
-        self.app, self.model = app, model
-        self._stop = threading.Event()
-        self._lock = threading.Lock()
-        self._started = None
-        self._duration = None
-        self._warm = False
-        self._error = None
-        self._thread = threading.Thread(target=self._run, name="privy-sql-warmup", daemon=True)
-
-    def start(self):
-        self._started = time.monotonic()
-        self._thread.start()
-
-    def status(self):
-        with self._lock:
-            error = self._error or self.model.reads.core_error()
-            if self.model.health()["last_error"]:
-                error = error or "SQL record refresh failed"
-            warm = self._warm and error is None
-            return {
-                "warm": warm,
-                "status": "ready" if warm else "degraded" if error else "warming",
-                "warm_seconds": self._duration,
-                "last_error": error,
-            }
-
-    def _run(self):
-        from privy.hub.dashboard import DEFAULT_JOB_LIMIT, DEFAULT_LOG_LIMIT, build_shell_report
-
-        next_probe = 0.0
-        while not self._stop.is_set():
-            try:
-                if not self.model._ready.wait(1):
-                    continue
-                service = self.app.service
-                registry = service.registry
-                targets = list(registry.snapshot().targets)
-                if time.monotonic() >= next_probe:
-                    registry.probe_many(targets)
-                    next_probe = time.monotonic() + registry.probe_ttl_s
-                probes = {target.id: registry.cached(target) for target in targets}
-                service.listener_facts_many(targets, probes)
-                service.leases.target_summaries([target.id for target in targets])
-                service.leases.groups()
-                service.leases.list_leases(state="all")
-                service.leases.list_clients(active=False)
-                service.metrics.count_jobs_by_lease()
-                service.metrics.count_jobs_by_target()
-                service.metrics.entries(limit=DEFAULT_JOB_LIMIT + 1)
-                service.metrics.entries(limit=DEFAULT_LOG_LIMIT + 1)
-                service.jobs.list(limit=50)
-                build_shell_report(service, ReportSelection())
-                for name in (*RANGES, "all"):
-                    if self._stop.is_set():
-                        return
-                    service.metrics.report(
-                        targets,
-                        probes,
-                        selection=ReportSelection(name),
-                        max_running=service.jobs.max_running,
-                    )
-                with self._lock:
-                    self._warm = True
-                    if self._duration is None:
-                        self._duration = time.monotonic() - self._started
-                    self._error = None
-            except Exception as exc:
-                with self._lock:
-                    self._warm = False
-                    pending = isinstance(exc, StorageError) and "still hydrating" in str(exc)
-                    self._error = None if pending else type(exc).__name__
-                if not pending:
-                    log.warning("SQL dashboard warmup failed (%s)", type(exc).__name__)
-            self._stop.wait(10)
-
-    def close(self):
-        self._stop.set()
-        if self._thread.ident is not None:
-            self._thread.join(timeout=75)
-            if self._thread.is_alive():
-                raise StorageError("SQL dashboard warmup did not stop; backend resources remain in use")
-
-
 @dataclass
 class HubRuntime:
     """A constructed hub: its service, HTTP server, and where it keeps state."""
@@ -527,8 +329,6 @@ class HubRuntime:
     app: HubApp
     home: Path
     relays_file: Path
-    storage: Any = None
-    _closed: bool = field(default=False, init=False)
 
     @property
     def url(self) -> str:
@@ -539,54 +339,13 @@ class HubRuntime:
         return f"http://{host}:{port}"
 
     def serve_forever(self) -> None:
-        if self.storage is not None:
-            self.service.jobs.start_audit_import(self.home / AUDIT_FILENAME)
-            if self.app.warmup is not None:
-                self.app.warmup.start()
         self.server.serve_forever(poll_interval=0.5)
 
     def shutdown(self) -> None:
+        self.app.rest.terminals.close()
         self.server.shutdown()
-        self.close()
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self.app.rest.terminals.close()
         self.server.server_close()
-        if self.app.warmup is not None:
-            self.app.warmup.close()
         self.service.listener_infos.flush()
-        if self.storage is not None:
-            self.service.jobs.close()
-            if self.service.jobs.audit_import_running:
-                from privy.hub.sql_store import StorageError
-
-                raise StorageError("audit import is still running; SQL storage remains open")
-            self.storage.close()
-        self._closed = True
-
-    def drain(self) -> HttpResponse:
-        with self.service.jobs._lock:
-            if any(not job.done for job in self.service.jobs._jobs.values()):
-                return error_response(
-                    503, "drain_pending", "Local jobs are still running", {"Retry-After": "1"}
-                )
-        if self.app.warmup is not None:
-            self.app.warmup.close()
-        self.app.rest.terminals.close()
-        model = getattr(self.storage, "read_model", None)
-        if model is not None:
-            model.close()
-        self.storage.stop_worker()
-        if not self.service.jobs.close(timeout=30) or not self.storage.flush(timeout=30):
-            return error_response(503, "drain_pending", "SQL writes have not drained", {"Retry-After": "1"})
-        pending = self.storage.status()["pending_writes"]
-        if pending:
-            return error_response(503, "drain_pending", "SQL writes have not drained", {"Retry-After": "1"})
-        response = HttpResponse(200, {"status": "drained", "pending_writes": 0})
-        response.note = "drained"
-        return response
 
 
 def build_hub(
@@ -599,8 +358,6 @@ def build_hub(
     probe_ttl_s: float = DEFAULT_PROBE_TTL_S,
     version: str,
     client_factory: Any = None,
-    settings_file: Path | None = None,
-    sql_connect: Any = None,
 ) -> HubRuntime:
     """Create the hub's components and bind its HTTP server (without serving yet)."""
     ensure_home(home)
@@ -608,82 +365,28 @@ def build_hub(
     store = RelaysStore(relays_path)
     store.snapshot()
     registry = TargetRegistry(store, client_factory=client_factory, probe_ttl_s=probe_ttl_s)
-    from privy.hub.settings import load_settings
-
-    sql_settings = load_settings(home, settings_file)
-    storage = None
-    jobs = None
-    server = None
-    try:
-        if sql_settings is None:
-            jobs = JobManager(registry, max_running=max_jobs, audit=AuditLog(home / AUDIT_FILENAME))
-            leases = LeaseStore(registry, home=home, audit=jobs.audit)
-            listener_infos = ListenerInfoStore(home)
-        else:
-            from privy.hub.read_model import SqlReadModel
-            from privy.hub.shared_jobs import SharedAuditLog, SharedJobManager
-            from privy.hub.sql_store import SqlBackend
-
-            storage = SqlBackend(sql_settings, home, connect=sql_connect)
-            if callable(getattr(storage, "read_changes", None)):
-                storage.read_model = SqlReadModel(storage)
-            jobs = SharedJobManager(
-                registry, backend=storage, max_running=max_jobs, audit=SharedAuditLog(storage)
-            )
-            leases = LeaseStore(registry, home=home, audit=jobs.audit, sql_backend=storage)
-            listener_infos = ListenerInfoStore(home, backend=getattr(storage, "read_model", storage))
-        service = HubService(
-            registry=registry,
-            jobs=jobs,
-            version=version,
-            leases=leases,
-            listener_infos=listener_infos,
-        )
-        if storage is None:
-            service.metrics.restore(home / AUDIT_FILENAME)
-        else:
-            from privy.hub.shared_metrics import SharedHubMetrics
-
-            service.metrics = SharedHubMetrics(
-                getattr(storage, "read_model", storage), registry, max_running=jobs.max_running
-            )
-        app = HubApp(service, port=port)
-        server = HubHTTPServer((host, port), app)
-        app.set_port(server.server_address[1])
-        model = getattr(storage, "read_model", None)
-        if model is not None:
-            app.warmup = _Warmup(app, model)
-            service.background_warmup = app.warmup
-        runtime = HubRuntime(
-            service=service, server=server, app=app, home=home, relays_file=relays_path, storage=storage
-        )
-        if storage is not None and host in ("127.0.0.1", "::1", "localhost"):
-            app.drain = runtime.drain
-        write_state(
-            home,
-            {
-                "url": runtime.url,
-                "pid": os.getpid(),
-                "version": version,
-                "started_at": service.started_at,
-                "relays_file": str(relays_path),
-            },
-        )
-        return runtime
-    except BaseException:
-        if server is not None:
-            server.server_close()
-        if storage is not None:
-            jobs_stopped = True
-            try:
-                if jobs is not None:
-                    jobs.close(timeout=35)
-            except Exception:
-                jobs_stopped = False
-                log.exception("SQL job cleanup failed after hub construction error")
-            if jobs_stopped:
-                try:
-                    storage.close()
-                except Exception:
-                    log.exception("SQL storage cleanup failed after hub construction error")
-        raise
+    jobs = JobManager(registry, max_running=max_jobs, audit=AuditLog(home / AUDIT_FILENAME))
+    leases = LeaseStore(registry, home=home, audit=jobs.audit)
+    service = HubService(
+        registry=registry,
+        jobs=jobs,
+        version=version,
+        leases=leases,
+        listener_infos=ListenerInfoStore(home),
+    )
+    service.metrics.restore(home / AUDIT_FILENAME)
+    app = HubApp(service, port=port)
+    server = HubHTTPServer((host, port), app)
+    app.set_port(server.server_address[1])
+    runtime = HubRuntime(service=service, server=server, app=app, home=home, relays_file=relays_path)
+    write_state(
+        home,
+        {
+            "url": runtime.url,
+            "pid": os.getpid(),
+            "version": version,
+            "started_at": service.started_at,
+            "relays_file": str(relays_path),
+        },
+    )
+    return runtime

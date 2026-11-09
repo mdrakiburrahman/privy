@@ -799,7 +799,6 @@ Point an LLM at http://127.0.0.1:7748/ and ask it to run something.
         help="hydrated relays file (default: HOME/relays.json)",
     )
     hub_serve.add_argument("--max-jobs", type=_positive_int, default=32, help="jobs that may run at once")
-    hub_serve.add_argument("--settings", help="Explicit local appsettings.yaml (missing/invalid is an error)")
     hub_serve.add_argument(
         "--probe-ttl-s",
         type=_positive_float,
@@ -1009,8 +1008,6 @@ def _cmd_hub_serve(args: argparse.Namespace) -> int:
     from privy.executor import set_echo_output
     from privy.hub.app import LOOPBACK_HOSTS, build_hub
     from privy.hub.home import LEGACY_TOKEN_FILENAME
-    from privy.hub.settings import SettingsError
-    from privy.hub.sql_store import StorageError
 
     echo_output = _resolve_echo_output(args)
     if max(args.verbose, getattr(args, "verbose_sub", 0)) == 0:
@@ -1028,46 +1025,41 @@ def _cmd_hub_serve(args: argparse.Namespace) -> int:
             max_jobs=args.max_jobs,
             probe_ttl_s=args.probe_ttl_s,
             version=__version__,
-            settings_file=Path(args.settings).expanduser() if args.settings else None,
         )
     except OSError as exc:
         raise CliError(f"cannot start the hub on {args.host}:{args.port}: {exc}") from exc
-    except (SettingsError, StorageError) as exc:
-        raise CliError(str(exc)) from exc
 
     log = logging.getLogger("privy.hub")
+    summary = runtime.service.summary()
+    url = runtime.url
+    log.info("privy hub %s listening on %s (home %s)", __version__, url, home)
+    if args.host not in LOOPBACK_HOSTS:
+        log.warning(
+            "The hub has no authentication and listens on %s: local Host and same-origin checks still "
+            "apply, but remote clients can forge headers to run code on every target and export keys.",
+            args.host,
+        )
+    legacy_token = home / LEGACY_TOKEN_FILENAME
+    if legacy_token.exists():
+        log.info("%s is no longer used (the hub has no authentication); it is safe to delete.", legacy_token)
+    if summary["relays_file"]["exists"]:
+        log.info(
+            "Serving %d relay(s) with %d target(s) from %s",
+            summary["relays"],
+            summary["targets"],
+            runtime.relays_file,
+        )
+    else:
+        log.info("Waiting for %s to be hydrated; serving no targets until then.", runtime.relays_file)
+    log.info("Point an LLM at %s/ (quickstart, no authentication); MCP: %s/mcp", url, url)
+    if not echo_output:
+        log.info("Live command output is not shown (--no-echo-output); result boxes still are.")
     try:
-        snapshot = runtime.service.registry.snapshot()
-        url = runtime.url
-        log.info("privy hub %s listening on %s (home %s)", __version__, url, home)
-        if args.host not in LOOPBACK_HOSTS:
-            log.warning(
-                "The hub has no authentication and listens on %s: local Host and same-origin checks still "
-                "apply, but remote clients can forge headers to run code on every target and export keys.",
-                args.host,
-            )
-        legacy_token = home / LEGACY_TOKEN_FILENAME
-        if legacy_token.exists():
-            log.info(
-                "%s is no longer used (the hub has no authentication); it is safe to delete.", legacy_token
-            )
-        if snapshot.file_exists:
-            log.info(
-                "Serving %d relay(s) with %d target(s) from %s",
-                len(snapshot.relays),
-                len(snapshot.targets),
-                runtime.relays_file,
-            )
-        else:
-            log.info("Waiting for %s to be hydrated; serving no targets until then.", runtime.relays_file)
-        log.info("Point an LLM at %s/ (quickstart, no authentication); MCP: %s/mcp", url, url)
-        if not echo_output:
-            log.info("Live command output is not shown (--no-echo-output); result boxes still are.")
         runtime.serve_forever()
     except KeyboardInterrupt:
         log.info("Stopping hub.")
     finally:
-        runtime.close()
+        runtime.server.server_close()
     return 0
 
 

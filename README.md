@@ -53,13 +53,6 @@ through a REST API and an MCP endpoint. It has no authentication: point an AI as
 `http://127.0.0.1:7748/` and it can start running commands. See [Hub](docs/HUB.md) and
 [Scheduled tasks](docs/SCHEDULED_TASKS.md).
 
-In Azure SQL mode, leases are transactional; history and other non-lease writes are asynchronously
-flushed from a local durable journal. For a planned move, call the loopback-only
-`POST /v1/admin/drain` and require `200 {"status":"drained","pending_writes":0}` plus process exit
-before replacing the home. A fresh home restores SQL-committed shared state. An arbitrary crash
-followed by destruction of an undrained home can lose unflushed asynchronous writes; it is not a
-zero-loss recovery guarantee. See [SQL recovery and draining](docs/HUB.md).
-
 ## Documentation
 
 | Guide                                      | Contents                                                                                      |

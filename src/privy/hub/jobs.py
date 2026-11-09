@@ -163,7 +163,7 @@ class HubJob:
         purpose: str | None = None,
         lease_id: str | None = None,
     ) -> None:
-        self.id = uuid.uuid4().hex
+        self.id = uuid.uuid4().hex[:12]
         self.type = job_type
         self.target = target
         self.spec = spec
@@ -225,7 +225,7 @@ class HubJob:
         else:
             result["type"] = self.type
         result["state"] = self.state
-        result["done"] = self.state in TERMINAL_STATES
+        result["done"] = self.done
         if self.exit_code is not None:
             result["exit_code"] = self.exit_code
         if self.error:
@@ -521,7 +521,7 @@ class JobManager:
         lease_id: str | None = None,
     ) -> tuple[Broadcast, list[HubJob]]:
         """Start ``code`` on every ``(target, language)`` pair."""
-        broadcast_id = "b" + uuid.uuid4().hex
+        broadcast_id = "b" + uuid.uuid4().hex[:11]
         self._ensure_capacity(len(runs))
         self._audit.record(
             "broadcast.start",
@@ -539,30 +539,20 @@ class JobManager:
             code=code,
             origin=origin,
         )
-        from privy.hub.sql_store import StorageError
-
-        jobs = []
-        skipped = list(skipped)
-        for target, language in runs:
-            try:
-                jobs.append(
-                    self.start_exec(
-                        target,
-                        language=language,
-                        code=code,
-                        mode=mode,
-                        timeout_s=timeout_s,
-                        origin=origin,
-                        broadcast_id=broadcast_id,
-                        purpose=purpose,
-                        lease_id=lease_id,
-                    )
-                )
-            except StorageError:
-                if not jobs:
-                    raise
-                log.exception("broadcast %s could not admit target %s", broadcast_id, target.id)
-                skipped.append({"target": target.id, "status": "storage_unavailable"})
+        jobs = [
+            self.start_exec(
+                target,
+                language=language,
+                code=code,
+                mode=mode,
+                timeout_s=timeout_s,
+                origin=origin,
+                broadcast_id=broadcast_id,
+                purpose=purpose,
+                lease_id=lease_id,
+            )
+            for target, language in runs
+        ]
         broadcast = Broadcast(
             id=broadcast_id,
             created_at=time.time(),
@@ -641,24 +631,20 @@ class JobManager:
             while True:
                 remaining = deadline - time.monotonic()
                 with job.cond:
-                    if remaining <= 0 or job.done:
+                    if job.done or remaining <= 0:
                         break
-                    interval = getattr(job, "poll_interval", None)
-                    job.cond.wait(min(remaining, interval or TICK_S) if on_tick or interval else remaining)
+                    job.cond.wait(min(remaining, TICK_S) if on_tick else remaining)
                 if on_tick is not None:
                     on_tick()
         if on_tick is not None:
             on_tick()
 
-    def cancel(self, job_id: str, *, current: HubJob | None = None) -> HubJob:
-        if current is not None and current.id != job_id.strip():
-            raise JobLookupError(f"unknown job {job_id!r}")
-        job = current if current is not None else self.get(job_id)
+    def cancel(self, job_id: str) -> HubJob:
+        job = self.get(job_id)
         with job.cond:
             if job.done:
                 return job
             job.cancel_requested = True
-            self._job_changed(job)
             console.cancel_requested(job)
             if job.state == QUEUED:
                 self._finish_locked(job, CANCELLED, error="cancelled before it started")
@@ -687,7 +673,6 @@ class JobManager:
                 if self.on_job is not None:
                     self.on_job(job)
                 admitted = True
-                self._admit(job)
             self._audit.record("job.start", **self._audit_fields(job, include_spec=True))
             thread = threading.Thread(
                 target=self._run,
@@ -700,26 +685,14 @@ class JobManager:
             # Never leave a job queued that no thread will ever run.
             with self._lock:
                 self._jobs.pop(job.id, None)
-            self._launch_failed(job, admitted)
+            if admitted and self.on_finish is not None:
+                self.on_finish(job)
             raise
         return job
-
-    def _launch_failed(self, job: HubJob, admitted: bool) -> None:
-        if admitted and self.on_finish is not None:
-            self.on_finish(job)
 
     def _host(self, target: Target) -> str | None:
         cached = self._registry.cached(target)
         return (cached.info or {}).get("hostname") if cached and cached.info else None
-
-    def _admit(self, job: HubJob) -> None:
-        """Persistence hook, after admission callbacks and before worker launch."""
-
-    def _job_changed(self, job: HubJob) -> None:
-        """Persistence hook called while holding the job condition."""
-
-    def _output_record(self, job: HubJob, stream: str, start: int, data: bytes) -> None:
-        """Persistence hook for an immutable output chunk."""
 
     def _run(self, job: HubJob, body: Callable[[HubJob], None]) -> None:
         with self._slots:
@@ -729,7 +702,6 @@ class JobManager:
                 if start:
                     job.state = RUNNING
                     job.started_at = time.time()
-                    self._job_changed(job)
                     job.cond.notify_all()
             if start:
                 console.job_started(job, self._host(job.target))
@@ -792,7 +764,6 @@ class JobManager:
         def progress(done: int, total: int) -> None:
             with job.cond:
                 job.progress = (done, total)
-                self._job_changed(job)
                 job.progress_step = console.transfer_progress(job, done, total, job.progress_step)
                 job.cond.notify_all()
                 if job.cancel_requested:
@@ -833,7 +804,6 @@ class JobManager:
                 job.sync_progress = dict(update)
                 job.transfer = dict(update)
                 job.progress = update["bytes_done"], update["bytes_total"]
-                self._job_changed(job)
                 job.progress_step = console.transfer_progress(job, *job.progress, job.progress_step)
                 job.cond.notify_all()
 
@@ -872,21 +842,18 @@ class JobManager:
         with job.cond:
             buffer = job.buffer(stream)
             start = buffer.total
-            self._output_record(job, stream, start, data)
             buffer.append(data)
             job.chunks.append((stream, start, buffer.total))
             if len(job.chunks) > MAX_TRACKED_CHUNKS:
                 drop = len(job.chunks) - MAX_TRACKED_CHUNKS
                 del job.chunks[:drop]
                 job.chunks_base += drop
-            self._job_changed(job)
             job.cond.notify_all()
         console.echo(job, stream, data)
 
     def _adopt_remote(self, job: HubJob, remote_job_id: str) -> None:
         with job.cond:
             job.remote_job_id = remote_job_id
-            self._job_changed(job)
             cancel_now = job.cancel_requested
         if cancel_now:
             self._cancel_remote(job)
@@ -917,7 +884,6 @@ class JobManager:
         job.state = state
         job.error = error
         job.finished_at = time.time()
-        self._job_changed(job)
         if self.on_finish is not None:
             self.on_finish(job)
         self._audit.record("job.finish", **self._audit_fields(job, include_spec=False))

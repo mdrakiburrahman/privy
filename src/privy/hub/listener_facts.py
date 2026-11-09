@@ -170,10 +170,8 @@ class ListenerInfoStore:
         *,
         clock: Callable[[], float] = time.time,
         save_delay_s: float = SAVE_DELAY_S,
-        backend: Any = None,
     ) -> None:
-        self._backend = backend
-        self.path = home / STATE_FILENAME if home is not None and backend is None else None
+        self.path = home / STATE_FILENAME if home is not None else None
         self._clock = clock
         self._save_delay_s = save_delay_s
         self._lock = threading.Lock()
@@ -210,21 +208,6 @@ class ListenerInfoStore:
         if result.status != ONLINE or not isinstance(result.info, dict):
             return
         info = {key: value for key, value in result.info.items() if key not in _VOLATILE}
-        if self._backend is not None:
-            from privy.hub.shared_jobs import shared_payload
-
-            info = shared_payload(info)
-            self._backend.enqueue(
-                "listener",
-                target.id,
-                {
-                    "target": target.id,
-                    "owner": self._backend.owner,
-                    "created_at": result.checked_at,
-                    "seen_at": result.checked_at,
-                    "info": info,
-                },
-            )
         with self._lock:
             previous = self._known.get(target.id)
             self._known[target.id] = {"seen_at": result.checked_at, "info": info}
@@ -240,42 +223,13 @@ class ListenerInfoStore:
                 self._timer.daemon = True
                 self._timer.start()
 
-    def last_many(self, target_ids: Sequence[str]) -> dict[str, tuple[dict[str, Any], float] | None]:
-        keys = list(dict.fromkeys(target_ids))
-        if not keys:
-            return {}
-        with self._lock:
-            items = {target_id: self._known.get(target_id) for target_id in keys}
-        if self._backend is not None:
-            get_many = getattr(self._backend, "get_many", None)
-            shared_items = (
-                get_many("listener", keys)
-                if get_many is not None
-                else {target_id: self._backend.get("listener", target_id) for target_id in keys}
-            )
-            for target_id in keys:
-                shared = shared_items.get(target_id)
-                item = items[target_id]
-                if shared is not None and (item is None or shared["seen_at"] >= item["seen_at"]):
-                    items[target_id] = shared
-        cutoff = self._clock() - FORGET_S
-        return {
-            target_id: (
-                (item["info"], item["seen_at"])
-                if item is not None and (self._backend is None or item["seen_at"] >= cutoff)
-                else None
-            )
-            for target_id, item in items.items()
-        }
-
     def last(self, target_id: str) -> tuple[dict[str, Any], float] | None:
-        return self.last_many([target_id])[target_id]
+        with self._lock:
+            item = self._known.get(target_id)
+        return (item["info"], item["seen_at"]) if item else None
 
     def flush(self) -> None:
         """Write pending changes now."""
-        if self._backend is not None:
-            self._backend.flush()
-            return
         with self._write_lock:
             with self._lock:
                 if self._timer is not None:
@@ -300,43 +254,15 @@ class ListenerInfoStore:
                     self._dirty = True
 
 
-def _facts_from_known(
-    path: str, probe: ProbeResult | None, known: tuple[dict[str, Any], float] | None
-) -> dict[str, Any]:
-    if probe is not None and probe.status == ONLINE and probe.info is not None:
-        info, seen, stale = probe.info, probe.checked_at, False
-    else:
-        info, seen, stale = (known[0], known[1], True) if known else (None, None, False)
-    facts = describe(info, path)
-    facts.update(info_seen_at=utc_iso(seen), info_seen_at_ts=seen, info_stale=stale)
-    return facts
-
-
 def facts_for(
     store: ListenerInfoStore, target_id: str, path: str, probe: ProbeResult | None
 ) -> dict[str, Any]:
     """Facts from the live probe, else the last known description (``info_stale``)."""
-    known = (
-        None
-        if probe is not None and probe.status == ONLINE and probe.info is not None
-        else store.last(target_id)
-    )
-    return _facts_from_known(path, probe, known)
-
-
-def facts_for_many(
-    store: ListenerInfoStore,
-    targets: Sequence[Target],
-    probes: Mapping[str, ProbeResult | None],
-) -> dict[str, dict[str, Any]]:
-    """Build target facts with one shared-store read for offline listeners."""
-    offline_ids = [
-        target.id
-        for target in targets
-        if (probe := probes.get(target.id)) is None or probe.status != ONLINE or probe.info is None
-    ]
-    known = store.last_many(offline_ids)
-    return {
-        target.id: _facts_from_known(target.path, probes.get(target.id), known.get(target.id))
-        for target in targets
-    }
+    if probe is not None and probe.status == ONLINE and probe.info is not None:
+        info, seen, stale = probe.info, probe.checked_at, False
+    else:
+        known = store.last(target_id)
+        info, seen, stale = (known[0], known[1], True) if known else (None, None, False)
+    facts = describe(info, path)
+    facts.update(info_seen_at=utc_iso(seen), info_seen_at_ts=seen, info_stale=stale)
+    return facts

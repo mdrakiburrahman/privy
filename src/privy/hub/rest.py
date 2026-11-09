@@ -408,23 +408,17 @@ class RestApi:
                         f"unknown argument(s) for stream_job: {', '.join(sorted(set(args) - {'job_id', 'lease_id'}))}"
                     )
                 return _stream_response(
-                    *self.service.job_usage(
-                        args["job_id"], lease_id=args.get("lease_id"), origin=origin, read_only=True
-                    )
+                    *self.service.job_usage(args["job_id"], lease_id=args.get("lease_id"), origin=origin)
                 )
             if route.operation == FORCE_RELEASE_OPERATION.name:
-                args = FORCE_RELEASE_OPERATION.parse(args)
+                FORCE_RELEASE_OPERATION.parse(args)
                 if headers.get("X-Privy-UI") != "1" or not _same_origin_ui(headers):
                     return error_response(
                         403,
                         "forbidden_origin",
                         "Force-release requires a same-origin dashboard request with X-Privy-UI: 1",
                     )
-                result = self.service._op_force_release_lease(
-                    origin="rest",
-                    lease_id=args["lease_id"],
-                    require_unpinned=args["require_unpinned"],
-                )
+                result = self.service._op_force_release_lease(origin="rest", lease_id=args["lease_id"])
                 if text:
                     return HttpResponse(
                         200,
@@ -435,15 +429,13 @@ class RestApi:
                 header_lease = headers.get("X-Privy-Lease")
                 if header_lease:
                     with _translated_errors():
-                        self.service.leases.read_touch(header_lease)
+                        self.service.leases.touch(header_lease)
             if stream and route.operation == "run":
                 return _stream_response(self.service.start_run(args, origin=origin))
             if stream:
                 OPERATIONS_BY_NAME[route.operation].parse(args)
                 return _stream_response(
-                    *self.service.job_usage(
-                        args["job_id"], lease_id=args.get("lease_id"), origin=origin, read_only=True
-                    )
+                    *self.service.job_usage(args["job_id"], lease_id=args.get("lease_id"), origin=origin)
                 )
             if route.operation == SYNC_OPERATION.name:
                 result = self.service.start_sync(args, origin=origin)
@@ -1049,37 +1041,6 @@ def openapi_document(service: HubService, base_url: str) -> dict[str, Any]:
             }
             spec["description"] += " Optional purpose is hub-only metadata; history resets on hub restart."
         paths[path] = {"post": spec}
-    paths["/v1/admin/drain"] = {
-        "post": {
-            "operationId": "drain_hub",
-            "summary": "Drain this SQL hub and exit",
-            "description": "Loopback-bound SQL hubs only; the socket peer must also be loopback. "
-            "Host and Origin protections apply. Stops admission, waits for local requests/jobs, "
-            "stops background producers and flushes the durable SQL outbox. "
-            "A 503 leaves admission stopped; retry the same drain after outstanding work completes. "
-            "A 200 is sent only with pending_writes=0, then the process shuts down.",
-            "responses": {
-                "200": {
-                    "description": "Drained; the hub exits after sending this response",
-                    "content": {
-                        "application/json": {
-                            "schema": {
-                                "type": "object",
-                                "required": ["status", "pending_writes"],
-                                "properties": {
-                                    "status": {"const": "drained"},
-                                    "pending_writes": {"const": 0},
-                                },
-                            }
-                        }
-                    },
-                },
-                "403": {"description": "Non-loopback peer or invalid Host/Origin"},
-                "409": {"description": "Drain unavailable in file mode or a non-loopback bind"},
-                "503": {"description": "drain_pending; retry with admission still stopped"},
-            },
-        },
-    }
     paths["/healthz"] = {
         "get": {
             "operationId": "health",
