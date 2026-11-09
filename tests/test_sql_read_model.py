@@ -811,7 +811,7 @@ def test_output_snapshot_reads_metadata_before_bounded_chunks_in_one_execute():
     chunk = {"index": 0, "stream": "stdout", "start": 0, "end": 4, "data": "YWJjZA=="}
     cursor = SimpleNamespace(
         execute=lambda *args: executes.append(args),
-        fetchone=lambda: (4, 0, 1),
+        fetchone=lambda: (4, 0, 1, None),
         fetchall=lambda: [(json.dumps(chunk),)],
         nextset=lambda: next(sets),
     )
@@ -827,6 +827,25 @@ def test_output_snapshot_reads_metadata_before_bounded_chunks_in_one_execute():
     assert len(executes) == 1 and executes[0][1:] == ("j", "j")
     assert executes[0][0].startswith("SELECT COALESCE")
     assert "bytes<=8388608" in executes[0][0]
+
+
+def test_reconciled_output_snapshot_uses_accepted_watermarks():
+    sets = iter([True, False])
+    cursor = SimpleNamespace(
+        execute=lambda *args: None,
+        fetchone=lambda: (4, 2, 1, "reconciled"),
+        fetchall=lambda: [],
+        nextset=lambda: next(sets),
+    )
+    backend = object.__new__(SqlBackend)
+
+    @contextlib.contextmanager
+    def transaction():
+        yield cursor
+
+    backend.transaction = transaction
+    backend.output_watermarks = lambda job_id: {"stdout_bytes": 9, "stderr_bytes": 0, "chunk_count": 3}
+    assert backend.read_output_snapshot("j")["sizes"] == {"stdout": 9, "stderr": 2, "chunks": 3}
 
 
 def advisory_store():

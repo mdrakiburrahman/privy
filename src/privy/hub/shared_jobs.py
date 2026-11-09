@@ -353,6 +353,12 @@ class SharedJob(HubJob):
             "reconciliation",
         ):
             setattr(self, name, record.get(name))
+        if record.get("reconciled_at"):
+            accepted = self.backend.output_watermarks(self.id)
+            self._record = dict(record)
+            for name, total in accepted.items():
+                self._record[name] = max(int(record.get(name, 0)), total)
+            record = self._record
         progress = record.get("progress")
         self.progress = tuple(progress) if progress else None
         for stream in STREAMS:

@@ -605,6 +605,9 @@ class SqlReadModel:
         # do not hydrate hundreds of thousands of raw probe JSON documents.
         return self.backend.report_history(after=after, before=before)
 
+    def output_watermarks(self, job_id):
+        return self.backend.output_watermarks(job_id)
+
     def _output_snapshot(self, job_id, required=None):
         key = ("output", job_id)
 

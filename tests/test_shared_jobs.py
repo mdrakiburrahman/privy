@@ -18,7 +18,7 @@ from hub_fakes import FakeListener, Hub, blocking_run, exec_result
 from privy.hub.jobs import CANCELLED, RUNNING, SUCCEEDED, HubJob, JobManager, utc_iso
 from privy.hub.listener_facts import ListenerInfoStore
 from privy.hub.metrics import ReportSelection
-from privy.hub.registry import ONLINE, ProbeResult
+from privy.hub.registry import ONLINE, ProbeResult, Target
 from privy.hub.rest import RestApi
 from privy.hub.service import HubError, HubService
 from privy.hub.shared_jobs import SharedAuditLog, SharedJob, SharedJobManager, job_record
@@ -114,6 +114,14 @@ class Backend:
             key=lambda r: r["start"],
         )
 
+    def output_watermarks(self, job_id):
+        result = {"chunk_count": 0}
+        for row in self.list("output", target=job_id, limit=100000):
+            name = f"{row['stream']}_bytes"
+            result[name] = max(result.get(name, 0), row["end"])
+            result["chunk_count"] = max(result["chunk_count"], row["index"] + 1)
+        return result
+
     def pieces(self, job_id, index, limit=200):
         self.output_reads += 1
         return sorted(
@@ -170,6 +178,42 @@ def start(jobs, hub, **kwargs):
         origin="test",
         **kwargs,
     )
+
+
+@pytest.mark.parametrize("snapshot", [False, True])
+def test_reconciled_job_exposes_accepted_late_output_without_changing_terminal_identity(snapshot):
+    backend = Backend()
+    local = HubJob(
+        job_type="exec",
+        target=Target("dev/box1_windows", "dev", "", "box1_windows"),
+        spec={"language": "bash", "code": "test", "mode": "subprocess", "timeout_s": 30},
+        origin="test",
+        output_limit=1024,
+    )
+    record = job_record(local, backend.owner)
+    record.update(state=SUCCEEDED, exit_code=0, reconciled_at="test", reconciliation={"proof": "exit"})
+    backend.put("job", local.id, record)
+    backend.put(
+        "output",
+        local.id + ":0",
+        {
+            "job_id": local.id,
+            "target": local.id,
+            "index": 0,
+            "stream": "stdout",
+            "start": 0,
+            "end": 4,
+            "data": base64.b64encode(b"late").decode(),
+        },
+    )
+    shared = SharedJob(backend, record, snapshot=snapshot)
+    assert shared.read_output("stdout", 0, 100)["data"] == "late"
+    assert shared.view(max_output_bytes=100, offsets={"stdout": 0, "stderr": 0})["stdout"] == "late"
+    pieces, index, complete = shared.next_pieces(0, 0)
+    assert [(piece.stream, piece.data) for piece in pieces] == [("stdout", b"late")]
+    assert (index, complete) == (1, True)
+    assert shared.summary()["state"] == SUCCEEDED
+    assert backend.get("job", local.id) == record
 
 
 def test_completed_job_cursor_pages_preserve_multibyte_output(tmp_path):

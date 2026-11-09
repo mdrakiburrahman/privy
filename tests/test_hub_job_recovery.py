@@ -69,6 +69,9 @@ class RecoveryBackend:
     def flush(self, timeout=10):
         return True
 
+    def output_watermarks(self, job_id):
+        return {}
+
 
 def _record():
     return {

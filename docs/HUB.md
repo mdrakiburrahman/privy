@@ -116,12 +116,28 @@ installs an additive replay-fence table and database trigger under the existing 
 permanent, compact job-identity fences are not deleted with seven-day history. They reject legacy
 writers attempting to overwrite or reinsert a reconciled job; updated hubs skip such job journal
 records while continuing other deliveries. A legacy batch rejected by the trigger stays pending and
-reports a storage error until that exact journal is replayed by updated code. The supporting hub
-must successfully install this database guard before reconciliation is enabled. Protocol errors
-(including `bad_offset`) are not execution-exit evidence and keep the pin. The listener's subprocess
-timeout sentinel (`timed_out=true`, `error=timeout`, `exit_code=-1`) also keeps the pin: it means a
-process exit was not observed after the termination wait. Job summaries retain the reconciliation
-evidence. This is not a process-kill or listener-restart mechanism.
+reports a storage error until that exact journal is replayed by updated code.
+
+Current imports capture `OUTPUT` into a table variable, then select inserted identities, because SQL
+Server prohibits direct `OUTPUT` on a table with an enabled INSERT trigger. **Legacy imports still
+use direct `OUTPUT` and will fail with error 334 while this guard is installed.** This source change
+does not make mixed-version imports compatible: guard installation remains blocked until affected
+legacy import producers are explicitly accounted for and the write boundary is SQL-engine validated.
+First-time marker backfill holds an exclusive source-table lock through guard creation in the schema
+transaction; the hub schema application lock alone cannot exclude old journal writers. This
+migration can block other record writes and must not be installed as an unreviewed supporting-hub
+startup.
+
+Accepted late output advances separate durable fence watermarks, not the fenced terminal job
+payload. Public output and chunk reads merge those monotonic watermarks with terminal metadata.
+These counters do not promise retained bytes after history garbage collection, and must not be taken
+as new exit proof.
+
+The supporting hub must successfully install this database guard before reconciliation is enabled.
+Protocol errors (including `bad_offset`) are not execution-exit evidence and keep the pin. The
+listener's subprocess timeout sentinel (`timed_out=true`, `error=timeout`, `exit_code=-1`) also
+keeps the pin: it means a process exit was not observed after the termination wait. Job summaries
+retain the reconciliation evidence. This is not a process-kill or listener-restart mechanism.
 
 SQL is authoritative for lease policy. A missing `leases.yaml` is hydrated from the shared policy;
 an existing local policy does not override SQL. Target configuration comparisons ignore ordering,

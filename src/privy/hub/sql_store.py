@@ -535,6 +535,18 @@ FROM @latest n WHERE n.kind='output' AND NOT EXISTS(
     SELECT 1 FROM dbo.privy_output p WITH(UPDLOCK,HOLDLOCK)
     WHERE p.job_id=JSON_VALUE(n.payload,'$.job_id')
       AND p.chunk_index=CAST(JSON_VALUE(n.payload,'$.index') AS bigint));
+UPDATE f SET
+    stdout_bytes=CASE WHEN o.stdout_bytes>f.stdout_bytes THEN o.stdout_bytes ELSE f.stdout_bytes END,
+    stderr_bytes=CASE WHEN o.stderr_bytes>f.stderr_bytes THEN o.stderr_bytes ELSE f.stderr_bytes END,
+    chunk_count=CASE WHEN o.chunk_count>f.chunk_count THEN o.chunk_count ELSE f.chunk_count END
+FROM dbo.privy_job_fences f
+CROSS APPLY (SELECT
+    COALESCE(MAX(CASE WHEN stream='stdout' THEN end_offset END),0) AS stdout_bytes,
+    COALESCE(MAX(CASE WHEN stream='stderr' THEN end_offset END),0) AS stderr_bytes,
+    COALESCE(MAX(chunk_index)+1,0) AS chunk_count
+    FROM dbo.privy_output p WHERE p.job_id=f.job_id) o
+WHERE EXISTS(SELECT 1 FROM @latest n WHERE n.kind='output'
+    AND JSON_VALUE(n.payload,'$.job_id')=f.job_id);
 """
 
 _READ_SCHEMA = """
@@ -551,12 +563,24 @@ IF OBJECT_ID('dbo.privy_job_fences') IS NULL
     CREATE TABLE dbo.privy_job_fences(
         job_id nvarchar(400) NOT NULL PRIMARY KEY,
         owner nvarchar(64) NOT NULL,
-        reconciled_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME());
+        reconciled_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        stdout_bytes bigint NOT NULL DEFAULT 0,
+        stderr_bytes bigint NOT NULL DEFAULT 0,
+        chunk_count bigint NOT NULL DEFAULT 0);
+IF COL_LENGTH('dbo.privy_job_fences','stdout_bytes') IS NULL
+    ALTER TABLE dbo.privy_job_fences ADD stdout_bytes bigint NOT NULL DEFAULT 0;
+IF COL_LENGTH('dbo.privy_job_fences','stderr_bytes') IS NULL
+    ALTER TABLE dbo.privy_job_fences ADD stderr_bytes bigint NOT NULL DEFAULT 0;
+IF COL_LENGTH('dbo.privy_job_fences','chunk_count') IS NULL
+    ALTER TABLE dbo.privy_job_fences ADD chunk_count bigint NOT NULL DEFAULT 0;
+IF OBJECT_ID('dbo.privy_reconciled_job_guard','TR') IS NULL
+BEGIN
+DECLARE @locked_rows bigint;
+SELECT @locked_rows=COUNT_BIG(*) FROM dbo.privy_records WITH(TABLOCKX,HOLDLOCK);
 INSERT dbo.privy_job_fences(job_id,owner)
 SELECT p.id,p.owner FROM dbo.privy_records p
 WHERE p.kind='job' AND JSON_VALUE(p.payload,'$.reconciled_at') IS NOT NULL
 AND NOT EXISTS(SELECT 1 FROM dbo.privy_job_fences f WHERE f.job_id=p.id);
-IF OBJECT_ID('dbo.privy_reconciled_job_guard','TR') IS NULL
     EXEC('CREATE TRIGGER dbo.privy_reconciled_job_guard ON dbo.privy_records
         AFTER INSERT, UPDATE AS
         BEGIN
@@ -565,9 +589,11 @@ IF OBJECT_ID('dbo.privy_reconciled_job_guard','TR') IS NULL
                 ON i.kind=''job'' AND i.id=f.job_id)
                 THROW 51002, ''Privy reconciled job replay is fenced'', 1;
         END');
+END;
 """
 
 _IMPORT_BATCH = """
+DECLARE @inserted TABLE(kind nvarchar(32), id nvarchar(400));
 DECLARE @rows TABLE(kind nvarchar(32), id nvarchar(400), payload nvarchar(max),
     owner nvarchar(64), at float, target nvarchar(300),
     lease_id nvarchar(80), client_id nvarchar(80), PRIMARY KEY(kind,id));
@@ -576,12 +602,13 @@ WITH(kind nvarchar(32), id nvarchar(400), payload nvarchar(max) AS JSON,
      owner nvarchar(64), at float, target nvarchar(300),
      lease_id nvarchar(80), client_id nvarchar(80));
 INSERT dbo.privy_records(kind,id,payload,owner,revision,at,target,lease_id,client_id)
-OUTPUT inserted.kind,inserted.id
+OUTPUT inserted.kind,inserted.id INTO @inserted
 SELECT n.kind,n.id,n.payload,n.owner,0,n.at,n.target,n.lease_id,n.client_id
 FROM @rows n WHERE (n.kind<>'job' OR NOT EXISTS(
     SELECT 1 FROM dbo.privy_job_fences f WHERE f.job_id=n.id))
 AND NOT EXISTS(
     SELECT 1 FROM dbo.privy_records p WITH(UPDLOCK,HOLDLOCK) WHERE p.kind=n.kind AND p.id=n.id);
+SELECT kind,id FROM @inserted;
 """
 
 
@@ -1039,12 +1066,32 @@ class SqlBackend:
             )
             return {str(target): json.loads(payload) for target, payload in cursor.fetchall()}
 
+    def output_watermarks(self, job_id: str) -> dict[str, int]:
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT stream,MAX(end_offset),MAX(chunk_index)+1 "
+                "FROM dbo.privy_output WHERE job_id=? GROUP BY stream "
+                "UNION ALL SELECT 'stdout',stdout_bytes,chunk_count FROM dbo.privy_job_fences WHERE job_id=? "
+                "UNION ALL SELECT 'stderr',stderr_bytes,chunk_count FROM dbo.privy_job_fences WHERE job_id=?",
+                job_id,
+                job_id,
+                job_id,
+            )
+            rows = cursor.fetchall()
+        result = {"chunk_count": 0}
+        for stream, end, count in rows:
+            name = f"{stream}_bytes"
+            result[name] = max(result.get(name, 0), int(end))
+            result["chunk_count"] = max(result["chunk_count"], int(count))
+        return result
+
     def read_output_snapshot(self, job_id: str):
         with self.transaction() as cursor:
             cursor.execute(
                 "SELECT COALESCE(TRY_CONVERT(bigint,JSON_VALUE(payload,'$.stdout_bytes')),0),"
                 "COALESCE(TRY_CONVERT(bigint,JSON_VALUE(payload,'$.stderr_bytes')),0),"
-                "COALESCE(TRY_CONVERT(bigint,JSON_VALUE(payload,'$.chunk_count')),0) "
+                "COALESCE(TRY_CONVERT(bigint,JSON_VALUE(payload,'$.chunk_count')),0),"
+                "JSON_VALUE(payload,'$.reconciled_at') "
                 "FROM dbo.privy_records WHERE kind='job' AND id=?; "
                 "WITH tail AS (SELECT TOP (4096) chunk_index,payload FROM dbo.privy_output "
                 "WHERE job_id=? ORDER BY chunk_index DESC), bounded AS ("
@@ -1061,9 +1108,18 @@ class SqlBackend:
             rows = [json.loads(row[0]) for row in cursor.fetchall()]
             if cursor.nextset():
                 raise StorageError("SQL output snapshot returned an unexpected result-set count")
+        sizes = {"stdout": int(metadata[0]), "stderr": int(metadata[1]), "chunks": int(metadata[2])}
+        if metadata[3] is not None:
+            accepted = self.output_watermarks(job_id)
+            for name, key in (
+                ("stdout", "stdout_bytes"),
+                ("stderr", "stderr_bytes"),
+                ("chunks", "chunk_count"),
+            ):
+                sizes[name] = max(sizes[name], accepted.get(key, 0))
         return {
             "rows": sorted(rows, key=lambda row: row["index"]),
-            "sizes": {"stdout": int(metadata[0]), "stderr": int(metadata[1]), "chunks": int(metadata[2])},
+            "sizes": sizes,
         }
 
     def get(self, kind: str, key: str) -> dict | None:

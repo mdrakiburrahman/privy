@@ -21,7 +21,7 @@ from privy.hub.jobs import RUNNING
 from privy.hub.leases import LeaseError, LeaseStore
 from privy.hub.service import HubService
 from privy.hub.settings import load_settings
-from privy.hub.shared_jobs import SharedJobManager
+from privy.hub.shared_jobs import SharedJob, SharedJobManager
 from privy.hub.sql_store import AzureSqlConnections, SqlBackend, StorageError
 
 pytestmark = pytest.mark.skipif(
@@ -296,7 +296,6 @@ def test_real_sql_reconcile_requires_inactive_owner_and_blocks_delayed_job_repla
         purpose="isolated SQL reconciliation test",
         state=RUNNING,
     )
-    a.job_started(job)
     record = {
         "job_id": job_id,
         "owner": one.owner,
@@ -320,10 +319,6 @@ def test_real_sql_reconcile_requires_inactive_owner_and_blocks_delayed_job_repla
         "stderr_bytes": 0,
         "chunk_count": 0,
     }
-    one.put("job", job_id, record)
-    assert one.flush(timeout=30)
-    assert two.request_cancel(job_id)["acknowledged"] is False
-
     listener = a.registry.client(target).listener
 
     def poll(_request, requested_id, *, wait_s):
@@ -359,6 +354,16 @@ def test_real_sql_reconcile_requires_inactive_owner_and_blocks_delayed_job_repla
     jobs = SharedJobManager(a.registry, backend=two, cancel_poll_s=60)
     service = HubService(registry=a.registry, jobs=jobs, leases=b, version="test")
     try:
+        a.job_started(job)
+        one.put("job", job_id, record)
+        assert one.flush(timeout=30)
+        assert two.flush(timeout=30)
+        assert two.request_cancel(job_id)["acknowledged"] is False
+        imported = two.import_records(
+            [("audit", job_id + ":ordinary-import", {"created_at": time.time(), "job_id": job_id})]
+        )
+        assert imported == {("audit", job_id + ":ordinary-import")}
+        assert two.get("audit", job_id + ":ordinary-import")["job_id"] == job_id
         one.mark_stopped()
         assert two.owner_is_inactive(one.owner)
         result = service.reconcile_job(
@@ -375,11 +380,17 @@ def test_real_sql_reconcile_requires_inactive_owner_and_blocks_delayed_job_repla
 
         # A delayed pre-recovery journal record cannot replace the verified terminal result.
         candidate = two.reconciliation_candidate(job_id)
+        superseded = []
         for _ in range(candidate["revision"] + 2):
             replay_revision = two.outbox.append("job", job_id, record, one.owner)
             if replay_revision > candidate["revision"]:
                 break
+            superseded.append(replay_revision)
+        two.outbox.ack_batch(superseded)
         assert replay_revision > candidate["revision"]
+        selected = two.outbox.pending(limit=500)
+        assert selected[0][0] == replay_revision
+        assert all(row[2] == job_id and row[0] > candidate["revision"] for row in selected)
         legacy_flush = (Path(__file__).parent / "fixtures" / "legacy_sql_flush_ef946.sql").read_text()
         with monkeypatch.context() as legacy:
             legacy.setattr(sql_store, "_FLUSH_BATCH", legacy_flush)
@@ -393,6 +404,31 @@ def test_real_sql_reconcile_requires_inactive_owner_and_blocks_delayed_job_repla
         assert persisted["reconciled_at"] == result["job"]["reconciled_at"]
         assert (persisted["stdout_bytes"], persisted["stderr_bytes"], persisted["chunk_count"]) == (41, 9, 3)
         assert b.get_lease(lease["lease_id"])["running_jobs"] == []
+
+        late = {
+            "job_id": job_id,
+            "target": job_id,
+            "index": 3,
+            "stream": "stdout",
+            "start": 41,
+            "end": 45,
+            "data": "bGF0ZQ==",
+        }
+        two.outbox.append("output", job_id + ":3", late, one.owner)
+        two.outbox.append("job", job_id, record, one.owner)
+        assert two.flush(timeout=30)
+        public = SharedJob(two, two.get("job", job_id))
+        assert public.read_output("stdout", 41, 100)["data"] == "late"
+        assert public.view(max_output_bytes=100, offsets={"stdout": 41, "stderr": 9})["stdout"] == "late"
+        pieces, index, complete = public.next_pieces(3, 0)
+        assert [(piece.stream, piece.data) for piece in pieces] == [("stdout", b"late")]
+        assert (index, complete) == (4, True)
+        assert two.get("job", job_id) == persisted
+        assert two.read_output_snapshot(job_id)["sizes"] == {"stdout": 45, "stderr": 9, "chunks": 4}
+        with two.transaction() as cursor:
+            cursor.execute("DELETE dbo.privy_output WHERE job_id=? AND chunk_index=3", job_id)
+        assert two.output_watermarks(job_id)["stdout_bytes"] == 45
+        assert two.output_watermarks(job_id)["chunk_count"] == 4
 
         two.delete("job", job_id)  # Exact fixture history removal, as retention would do.
         two.outbox.append("job", job_id, record, one.owner)
@@ -425,6 +461,8 @@ def test_real_sql_reconcile_requires_inactive_owner_and_blocks_delayed_job_repla
             a.job_finished(job)
         b.release(lease["lease_id"], client_id)
         two.delete("job", job_id)
+        two.delete("audit", job_id + ":ordinary-import")
         with two.transaction() as cursor:
+            cursor.execute("DELETE dbo.privy_output WHERE job_id=?", job_id)
             cursor.execute("DELETE dbo.privy_cancels WHERE job_id=?", job_id)
             cursor.execute("DELETE dbo.privy_job_fences WHERE job_id=?", job_id)

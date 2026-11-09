@@ -11,6 +11,7 @@ from privy.hub.request_context import REQUEST_ID
 from privy.hub.settings import SettingsError, load_settings
 from privy.hub.sql_store import (
     _IMPORT_BATCH,
+    _RECONCILIATION_SCHEMA,
     _SCHEMA,
     SqlBackend,
     StorageError,
@@ -135,6 +136,28 @@ def test_sql_get_many_skips_empty_key_sets():
     assert backend.get_many("listener", []) == {}
 
 
+def test_reconciliation_backfill_excludes_source_writes_until_guard_creation():
+    assert (
+        _RECONCILIATION_SCHEMA.index("WITH(TABLOCKX,HOLDLOCK)")
+        < _RECONCILIATION_SCHEMA.index("INSERT dbo.privy_job_fences")
+        < _RECONCILIATION_SCHEMA.index("CREATE TRIGGER")
+    )
+
+
+def test_sql_output_watermarks_merge_persisted_fence_and_accepted_output_monotonically():
+    cursor = FakeCursor([("stdout", 9, 3), ("stdout", 12, 4), ("stderr", 2, 4)])
+
+    @contextmanager
+    def transaction():
+        yield cursor
+
+    backend = object.__new__(SqlBackend)
+    backend.transaction = transaction
+    assert backend.output_watermarks("job") == {"stdout_bytes": 12, "stderr_bytes": 2, "chunk_count": 4}
+    assert cursor.statements[0][1] == ("job", "job", "job")
+    assert "dbo.privy_job_fences" in cursor.statements[0][0]
+
+
 def test_sql_import_commits_deduplicated_insert_only_batch_before_return():
     cursor = FakeCursor([("audit", "missing")])
     committed = []
@@ -155,6 +178,8 @@ def test_sql_import_commits_deduplicated_insert_only_batch_before_return():
     query, args = cursor.statements[0]
     assert query == _IMPORT_BATCH
     assert "OUTPUT inserted.kind,inserted.id" in query and "NOT EXISTS" in query
+    assert "OUTPUT inserted.kind,inserted.id INTO @inserted" in query
+    assert query.rstrip().endswith("SELECT kind,id FROM @inserted;")
     assert "UPDATE " not in query and "DELETE " not in query
     assert json.loads(args[0]) == [
         {
