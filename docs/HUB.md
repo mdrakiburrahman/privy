@@ -101,47 +101,47 @@ an existing local policy does not override SQL. Target configuration comparisons
 but still reject different target identities, namespaces or paths.
 
 If a SQL-enabled home contains `leases-state.json`, startup imports missing records under the same
-SQL lock and keeps existing SQL identities, allocations and pins unchanged. Historical local
-clients with a matching shared session use the canonical SQL client ID. An active or pinned local
-allocation that would require changing its owner is rejected rather than silently reassigned.
-Equivalent/newer shared records do not block restart. Successful imports are retired to
-`leases-state.json.imported-snapshot`, preserving prior snapshots. Imports never access another home.
-Newly imported released/expired pinned work is rejected until that unresolved work has been checked.
-Local PID discovery files, Relay secrets, sockets,
-interactive terminal sessions and hub-local transfer paths do not migrate through SQL. Metadata is
-shared; files and interactive resources still belong to the machine hosting them.
+SQL lock and keeps existing SQL identities, allocations and pins unchanged. Historical local clients
+with a matching shared session use the canonical SQL client ID. An active or pinned local allocation
+that would require changing its owner is rejected rather than silently reassigned. Equivalent/newer
+shared records do not block restart. Successful imports are retired to
+`leases-state.json.imported-snapshot`, preserving prior snapshots. Imports never access another
+home. Newly imported released/expired pinned work is rejected until that unresolved work has been
+checked. Local PID discovery files, Relay secrets, sockets, interactive terminal sessions and
+hub-local transfer paths do not migrate through SQL. Metadata is shared; files and interactive
+resources still belong to the machine hosting them.
 
 ### Fresh-home recovery and planned cutovers
 
 A new home with regenerated `relays.json` and SQL `appsettings.yaml` reads the same shared clients,
-leases, jobs/output/history, listener facts and dashboard telemetry. Its newly generated `.sql-hub-id`
-does not partition shared reads or transfer ownership of another hub's running work.
+leases, jobs/output/history, listener facts and dashboard telemetry. Its newly generated
+`.sql-hub-id` does not partition shared reads or transfer ownership of another hub's running work.
 SQL `restored_jobs` counts SQL-loaded report entries consistently across hubs; process uptime and
 owner-local execution/terminal capabilities still describe the current process.
 
-| Home file | SQL-mode recovery role |
-|---|---|
-| `relays.json`, `appsettings.yaml` | Local connection/secret configuration; regenerate securely, not stored in SQL. |
-| `leases.yaml` | SQL policy is authoritative; missing file is hydrated. |
-| `leases-state.json`, `audit.jsonl` | Optional legacy migration inputs, retired after successful durable import. |
-| `listener-info-state.json` | File-mode only; SQL listener facts are read from shared storage. |
-| `.sql-hub-id`, `sql-home.lock` | Local incarnation/fencing and exclusive-home coordination, regenerated on a new home. |
-| `hub-state.json`, legacy `hub-token` | Local PID/URL discovery and obsolete authentication, not shared authority. |
-| `sql-outbox.sqlite3` and its SQLite sidecars | Pending asynchronous writes; preserve the entire home until drained. |
+| Home file                                    | SQL-mode recovery role                                                                |
+| -------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `relays.json`, `appsettings.yaml`            | Local connection/secret configuration; regenerate securely, not stored in SQL.        |
+| `leases.yaml`                                | SQL policy is authoritative; missing file is hydrated.                                |
+| `leases-state.json`, `audit.jsonl`           | Optional legacy migration inputs, retired after successful durable import.            |
+| `listener-info-state.json`                   | File-mode only; SQL listener facts are read from shared storage.                      |
+| `.sql-hub-id`, `sql-home.lock`               | Local incarnation/fencing and exclusive-home coordination, regenerated on a new home. |
+| `hub-state.json`, legacy `hub-token`         | Local PID/URL discovery and obsolete authentication, not shared authority.            |
+| `sql-outbox.sqlite3` and its SQLite sidecars | Pending asynchronous writes; preserve the entire home until drained.                  |
 
 **Deleting an undrained home or losing its machine can lose acknowledged asynchronous writes that
 have not reached SQL.** A fresh home restores SQL-committed state, not a lost local journal or live
 terminal/socket/worker process. Planned cutovers must use `POST /v1/admin/drain` first.
 
-Drain is available only on a loopback-bound SQL hub and checks the actual loopback socket peer,
-Host and Origin. No request body is required. It stops admission, waits up to 30 seconds for
-in-flight requests, refuses to abandon active local jobs, stops background producers and flushes
-the outbox. Success is HTTP 200 `{"status":"drained","pending_writes":0}`; the response is sent before
-HTTP serving stops and normal shutdown completes. Allow up to five minutes for the request because
-worker shutdown and SQL flush have bounded waits. HTTP 503 `drain_pending` with `Retry-After: 1`
-leaves the hub draining; retry after jobs finish or SQL recovers. Health remains available and
-reports `draining: true`; other requests return 503 `hub_draining`. A response timeout is not proof
-of success: preserve the home until success and process exit are confirmed.
+Drain is available only on a loopback-bound SQL hub and checks the actual loopback socket peer, Host
+and Origin. No request body is required. It stops admission, waits up to 30 seconds for in-flight
+requests, refuses to abandon active local jobs, stops background producers and flushes the outbox.
+Success is HTTP 200 `{"status":"drained","pending_writes":0}`; the response is sent before HTTP
+serving stops and normal shutdown completes. Allow up to five minutes for the request because worker
+shutdown and SQL flush have bounded waits. HTTP 503 `drain_pending` with `Retry-After: 1` leaves the
+hub draining; retry after jobs finish or SQL recovers. Health remains available and reports
+`draining: true`; other requests return 503 `hub_draining`. A response timeout is not proof of
+success: preserve the home until success and process exit are confirmed.
 
 Older binaries without this endpoint require a first **in-place, same-home bridge upgrade**:
 preserve the complete home/outbox, stop the exact old process, then start the new binary against
