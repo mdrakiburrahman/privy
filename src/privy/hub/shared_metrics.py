@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import os
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -12,6 +15,8 @@ from privy.hub.metrics import DEFAULT_RANGE, CallSample, HubMetrics, JobEntry, R
 from privy.hub.purpose import PurposeHistory, normalize_purpose
 from privy.hub.registry import ProbeResult
 from privy.hub.shared_jobs import SharedJob, shared_payload, shared_records
+
+log = logging.getLogger(__name__)
 
 
 class _SharedEntry(JobEntry):
@@ -124,11 +129,25 @@ class _SharedPurposes:
 
 
 class SharedMetrics(HubMetrics):
-    def __init__(self, backend: Any, registry=None, *, clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self, backend: Any, registry=None, *, clock: Callable[[], float] = time.time, max_running=0
+    ) -> None:
         super().__init__(clock=clock)
         self.backend = backend
         self.registry = registry
         self.purposes = _SharedPurposes(backend, clock)
+        self.max_running = max_running
+        reads = getattr(backend, "reads", None)
+        if reads is not None and registry is not None:
+            for range_name in (DEFAULT_RANGE, "1h", "7d", "30d", "all"):
+                selection = ReportSelection(range_name)
+                reads.get(
+                    ("report", selection, (("max_running", max_running),)),
+                    lambda selection=selection: self._report(
+                        registry.snapshot().targets, {}, selection=selection, max_running=max_running
+                    ),
+                    wait=False,
+                )
 
     def job_added(self, job: HubJob) -> None:
         # The manager writes admission after all callbacks (including lease pinning).
@@ -172,14 +191,59 @@ class SharedMetrics(HubMetrics):
         # SQL is authoritative. No local audit file or outputs are loaded on startup.
         return 0
 
-    def entries(self, target_id=None, *, after=None, before=None):
+    def entries(
+        self,
+        target_id=None,
+        *,
+        after=None,
+        before=None,
+        lease_id=None,
+        limit=None,
+        states: set[str] | frozenset[str] | None = None,
+    ):
+        if limit is None:
+            rows = shared_records(
+                self.backend,
+                "job",
+                target=target_id,
+                after=after,
+                before=before,
+                lease_id=lease_id,
+            )
+            if states is not None:
+                rows = (row for row in rows if row.get("state") in states)
+        else:
+            rows = self.backend.list(
+                "job",
+                limit=limit,
+                target=target_id,
+                lease_id=lease_id,
+                after=after,
+                before=before,
+                states=states,
+            )
         return sorted(
-            (
-                _entry(self.backend, row)
-                for row in shared_records(self.backend, "job", target=target_id, after=after, before=before)
-            ),
+            (_entry(self.backend, row) for row in rows),
             key=lambda entry: (entry.created_at, entry.id),
         )
+
+    def count_jobs_by_target(self, *, lease_id=None):
+        count = getattr(self.backend, "count_jobs_by_target", None)
+        if count is not None:
+            return count(lease_id=lease_id)
+        return super().count_jobs_by_target(lease_id=lease_id)
+
+    def count_jobs_by_lease(self):
+        count = getattr(self.backend, "count_jobs_by_lease", None)
+        if count is not None:
+            return count()
+        return super().count_jobs_by_lease()
+
+    def count_job_records(self, *, lease_id=None, states=None, after=None, before=None):
+        count = getattr(self.backend, "count_job_records", None)
+        if count is not None:
+            return count(lease_id=lease_id, states=states, after=after, before=before)
+        return super().count_job_records(lease_id=lease_id, states=states, after=after, before=before)
 
     def entry(self, job_id):
         record = self.backend.get("job", job_id)
@@ -201,6 +265,23 @@ class SharedMetrics(HubMetrics):
         )
 
     def report(self, targets, probes, **kwargs):
+        reads = getattr(self.backend, "reads", None)
+        if reads is None:
+            return self._report(targets, probes, **kwargs)
+        selection = kwargs.get("selection") or ReportSelection(kwargs.get("range_name", DEFAULT_RANGE))
+        options = {k: v for k, v in kwargs.items() if k not in ("range_name", "selection")}
+        options.setdefault("max_running", self.max_running)
+        key = ("report", selection, tuple(sorted(options.items())))
+
+        def build():
+            current_targets = self.registry.snapshot().targets if self.registry is not None else targets
+            return self._report(current_targets, probes, selection=selection, **options)
+
+        return reads.get(key, build)
+
+    def _report(self, targets, probes, **kwargs):
+        profile_started = time.perf_counter()
+        profile = os.environ.get("PRIVY_SQL_PROFILE") == "1"
         snapshot = HubMetrics(clock=self._clock)
         snapshot.started_at = self.started_at
         selection = kwargs.get("selection") or ReportSelection(kwargs.get("range_name", DEFAULT_RANGE))
@@ -208,11 +289,29 @@ class SharedMetrics(HubMetrics):
         window_start, window_end, _, _ = selection.window(now, self.started_at)
         after = None if selection.range_name == "all" else window_start
         before = window_end if selection.range_name == "custom" else None
-        snapshot._entries = self.entries(after=after, before=before)
-        purpose_rows = [entry.job._record for entry in snapshot._entries]
-        purpose_rows += list(shared_records(self.backend, "purpose", after=after, before=before))
+        history_read_started = time.perf_counter()
+        probe_stats = None
+        call_stats = None
+        report_history = getattr(self.backend, "report_history", None)
+        report_counts = None
+        if report_history is not None:
+            history = report_history(after=after, before=before)
+            snapshot._entries = sorted(
+                (_entry(self.backend, row) for row in history["jobs"]),
+                key=lambda entry: (entry.created_at, entry.id),
+            )
+            purpose_rows = [*history["jobs"], *history["purposes"], *history["latest_before"]]
+            probe_rows = history["probes"]
+            calls = []
+            probe_stats = history["probe_stats"]
+            call_stats = history["call_stats"]
+            report_counts = history["job_counts"]
+        else:
+            snapshot._entries = self.entries(after=after, before=before)
+            purpose_rows = [entry.job._record for entry in snapshot._entries]
+            purpose_rows += list(shared_records(self.backend, "purpose", after=after, before=before))
         targets = list(targets)
-        if after is not None:
+        if report_history is None and after is not None:
             if hasattr(self.backend, "latest_before"):
                 purpose_rows += self.backend.latest_before(after)
             else:
@@ -225,9 +324,14 @@ class SharedMetrics(HubMetrics):
         snapshot.purposes = self.purposes._snapshot(rows=purpose_rows)
         earliest = [entry.created_at for entry in snapshot._entries]
         shared_probes = dict(probes)
-        for row in sorted(
-            shared_records(self.backend, "probe", after=after, before=before), key=lambda r: r["at"]
-        ):
+        if report_history is None:
+            probe_rows = list(
+                self.backend.probe_history(after=after, before=before)
+                if hasattr(self.backend, "probe_history")
+                else shared_records(self.backend, "probe", after=after, before=before)
+            )
+        probe_assembly_started = time.perf_counter()
+        for row in sorted(probe_rows, key=lambda r: r["at"]):
             target_id = row["target"]
             result = self._probe_result(row)
             # HubMetrics.probe needs only the target's id.
@@ -237,18 +341,49 @@ class SharedMetrics(HubMetrics):
             if previous is None or result.checked_at > previous.checked_at:
                 shared_probes[target_id] = result
             earliest.append(row["at"])
-        calls = list(shared_records(self.backend, "call", after=after, before=before))
+        probe_processing_ms = (time.perf_counter() - probe_assembly_started) * 1000
+        if report_history is None:
+            calls = list(shared_records(self.backend, "call", after=after, before=before))
+        calls.sort(key=lambda row: row["at"])
         snapshot._calls.extend(CallSample(r["at"], r["surface"], r["status"], r["seconds"]) for r in calls)
         earliest.extend(r["at"] for r in calls)
+        if probe_stats is not None:
+            for target_id, stats in probe_stats["by_target"].items():
+                snapshot._status_since[target_id] = stats["status_since"]
+                snapshot._status_since_first_check[target_id] = stats["status_since_first_check"]
+                if stats["last_online"] is not None:
+                    snapshot._last_online[target_id] = stats["last_online"]
+                earliest.append(stats["earliest_at"])
+        if call_stats is not None and call_stats["earliest_at"] is not None:
+            earliest.append(call_stats["earliest_at"])
         snapshot.started_at = min([self.started_at, *earliest])
-        snapshot.restored_jobs = sum(entry.job.owner != self.backend.owner for entry in snapshot._entries)
+        snapshot.restored_jobs = len(snapshot._entries)
+        history_read_ms = (time.perf_counter() - history_read_started) * 1000
         if any(name not in kwargs for name in ("jobs_running", "jobs_queued", "jobs_retained")):
-            counts = self.backend.count_jobs()
+            counts = report_counts if report_counts is not None else self.backend.count_jobs()
             kwargs.setdefault("jobs_running", counts["running"])
             kwargs.setdefault("jobs_queued", counts["queued"])
             kwargs.setdefault("jobs_retained", counts["retained"])
+        report_started = time.perf_counter()
+        kwargs["probe_stats"] = probe_stats
+        kwargs["call_stats"] = call_stats
         result = snapshot.report(targets, shared_probes, **kwargs)
+        report_math_ms = (time.perf_counter() - report_started) * 1000
         result["hub_started_at"] = utc_iso(self.started_at)
+        if profile:
+            log.info(
+                "sql_profile report_assembly thread=%s duration_ms=%.1f probe_assembly_ms=%.1f "
+                "history_read_ms=%.1f metrics_report_ms=%.1f jobs=%d purposes=%d probes=%d calls=%d",
+                threading.get_ident(),
+                (time.perf_counter() - profile_started) * 1000,
+                probe_processing_ms,
+                history_read_ms,
+                report_math_ms,
+                len(snapshot._entries),
+                max(0, len(purpose_rows) - len(snapshot._entries)),
+                probe_stats["samples"] if probe_stats is not None else len(probe_rows),
+                call_stats["total"] if call_stats is not None else len(calls),
+            )
         return result
 
 

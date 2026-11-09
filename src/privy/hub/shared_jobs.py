@@ -301,9 +301,17 @@ class SharedJob(HubJob):
 
     poll_interval = TICK_S
 
-    def __init__(self, backend: Any, record: dict[str, Any], *, snapshot: bool = False) -> None:
+    def __init__(
+        self,
+        backend: Any,
+        record: dict[str, Any],
+        *,
+        snapshot: bool = False,
+        submitted: HubJob | None = None,
+    ) -> None:
         self.backend = backend
         self._snapshot = snapshot
+        self._submitted = submitted
         target_id = record["target"]
         relay, _, path = target_id.partition("/")
         super().__init__(
@@ -351,7 +359,13 @@ class SharedJob(HubJob):
     def refresh(self) -> None:
         if self._snapshot:
             return
-        record = self.backend.get("job", self.id)
+        try:
+            record = self.backend.get("job", self.id)
+        except StorageError:
+            if self._submitted is None:
+                raise
+            log.warning("SQL refresh unavailable for admitted job %s; returning owner-local state", self.id)
+            record = job_record(self._submitted, self.owner)
         if record is not None:
             with self.cond:
                 self._apply(record)
@@ -366,17 +380,19 @@ class SharedJob(HubJob):
             return self._record.get("duration_ms")
         return super().duration_ms()
 
-    def summary(self, *, include_created: bool = False) -> dict[str, Any]:
-        self.refresh()
+    def summary(self, *, include_created: bool = False, refresh: bool = True) -> dict[str, Any]:
+        if refresh:
+            self.refresh()
         result = super().summary(include_created=include_created)
         result["owner"] = self.owner
         return result
 
-    def _bytes(self, stream: str, offset: int, limit: int) -> tuple[int, bytes]:
+    def _bytes(self, stream: str, offset: int, limit: int, *, chunks=None) -> tuple[int, bytes]:
         # Never skip a temporarily absent chunk: the output row may still be flushing.
         begin = min(max(0, offset), self.buffer(stream).total)
         end = min(begin + max(0, limit), self.buffer(stream).total)
-        chunks = self.backend.output(self.id, stream, begin, max(0, end - begin)) if end > begin else []
+        if chunks is None:
+            chunks = self.backend.output(self.id, stream, begin, max(0, end - begin)) if end > begin else []
         data = bytearray()
         position = begin
         for chunk in chunks:
@@ -389,8 +405,9 @@ class SharedJob(HubJob):
                 position = right
         return begin, bytes(data)
 
-    def read_output(self, stream: str, offset: int, limit: int) -> dict[str, Any]:
-        self.refresh()
+    def read_output(self, stream: str, offset: int, limit: int, *, refresh: bool = True) -> dict[str, Any]:
+        if refresh:
+            self.refresh()
         done = self.state in TERMINAL_STATES
         begin, data = self._bytes(stream, offset, limit)
         total = self.buffer(stream).total
@@ -412,11 +429,35 @@ class SharedJob(HubJob):
         return self._bytes(stream, max(since, self.buffer(stream).total - max(0, limit)), limit)
 
     def read_cursor(self) -> dict[str, int]:
-        self.cursor = {stream: self.backend.advance_cursor(self.id, stream, 0) for stream in STREAMS}
+        self.cursor = self.backend.read_cursors(self.id, STREAMS)
         return dict(self.cursor)
 
-    def view(self, *, max_output_bytes: int, offsets=None, advance: bool = True) -> dict[str, Any]:
-        result = self.summary()
+    def view(
+        self, *, max_output_bytes: int, offsets=None, advance: bool = True, refresh: bool = True
+    ) -> dict[str, Any]:
+        try:
+            return self._view(
+                max_output_bytes=max_output_bytes, offsets=offsets, advance=advance, refresh=refresh
+            )
+        except StorageError:
+            if self._submitted is None:
+                raise
+            log.warning(
+                "SQL output unavailable for admitted job %s; returning owner-local view without "
+                "advancing shared cursors",
+                self.id,
+            )
+            result = shared_payload(
+                self._submitted.view(max_output_bytes=max_output_bytes, offsets=offsets, advance=False),
+                local_path=self._submitted.spec.get("local_path"),
+            )
+            result["owner"] = self.owner
+            return result
+
+    def _view(
+        self, *, max_output_bytes: int, offsets=None, advance: bool = True, refresh: bool = True
+    ) -> dict[str, Any]:
+        result = self.summary(refresh=refresh)
         if self.type != "exec":
             result.update(local_path=self.spec["local_path"], remote_path=self.spec["remote_path"])
             if self.progress is not None:
@@ -429,27 +470,56 @@ class SharedJob(HubJob):
             if self.transfer is not None:
                 result["result"] = dict(self.transfer)
             return result
+        cursor_streams = [stream for stream in STREAMS if offsets is None or offsets.get(stream) is None]
+        read_batch = getattr(self.backend, "read_view_output", None)
+        if read_batch is not None:
+            cursors, chunks = read_batch(
+                self.id,
+                {
+                    stream: (
+                        None if offsets is None else offsets.get(stream),
+                        self.buffer(stream).total,
+                        max_output_bytes,
+                    )
+                    for stream in STREAMS
+                },
+            )
+        else:
+            cursors = self.backend.read_cursors(self.id, cursor_streams) if cursor_streams else {}
+            chunks = {}
+        candidates = {}
+        claims = {}
         for stream in STREAMS:
             explicit = None if offsets is None else offsets.get(stream)
-            # advance_cursor(..., 0) is a non-reserving atomic read.
-            start = self.backend.advance_cursor(self.id, stream, 0) if explicit is None else explicit
+            start = cursors[stream] if explicit is None else explicit
             # Unlike a bounded memory buffer, shared output has not been discarded.
             # Consume a contiguous prefix; a summary is not evidence that its
             # newest output chunks have reached SQL yet.
             desired = start
-            begin, data = self._bytes(stream, desired, max_output_bytes)
+            begin, data = self._bytes(stream, desired, max_output_bytes, chunks=chunks.get(stream))
             lead = _skip_continuation_bytes(data)
             begin, data = begin + lead, data[lead:]
             if begin + len(data) < self.buffer(stream).total or self.state not in TERMINAL_STATES:
                 data = data[: _utf8_safe_length(data)]
             end = begin + len(data)
             if advance and explicit is None and data:
-                previous = self.backend.advance_cursor(self.id, stream, end)
+                claims[stream] = end
+            candidates[stream] = (start, begin, data)
+        claim_batch = getattr(self.backend, "advance_cursors", None)
+        previous_offsets = (
+            claim_batch(self.id, claims)
+            if claims and claim_batch is not None
+            else {stream: self.backend.advance_cursor(self.id, stream, end) for stream, end in claims.items()}
+        )
+        for stream in STREAMS:
+            start, begin, data = candidates[stream]
+            if stream in claims:
+                previous = previous_offsets[stream]
                 # Another hub may have consumed some or all of our candidate bytes.
                 consumed = min(len(data), max(0, previous - begin))
                 begin, data = begin + consumed, data[consumed:]
                 start = max(start, previous)
-                self.cursor[stream] = max(previous, end)
+                self.cursor[stream] = max(previous, claims[stream])
             if not data:
                 begin = start
             result[stream] = data.decode("utf-8", "replace")
@@ -462,7 +532,12 @@ class SharedJob(HubJob):
         deadline = time.monotonic() + max(0, timeout)
         while True:
             self.refresh()
-            rows = self.backend.pieces(self.id, index, limit=200)
+            read = getattr(self.backend, "read_pieces", None)
+            rows = (
+                read(self.id, index, limit=200, chunk_count=self._record.get("chunk_count", 0))
+                if read is not None
+                else self.backend.pieces(self.id, index, limit=200)
+            )
             pieces = []
             for row in rows:
                 if row["index"] != index:
@@ -488,6 +563,7 @@ class SharedJobManager(JobManager):
         self._audit_import_thread: threading.Thread | None = None
         self._pending_lock = threading.Lock()
         self._pending_finishes: dict[str, HubJob] = {}
+        self._pending_broadcasts: dict[str, dict[str, Any]] = {}
         self._cancel_thread = threading.Thread(
             target=self._monitor_cancels, name="privy-shared-cancel", daemon=True
         )
@@ -505,7 +581,16 @@ class SharedJobManager(JobManager):
 
         def run() -> None:
             try:
+                before = path.stat() if path.exists() else None
                 imported = self.import_audit(path, timeout=300, cancel_event=self._audit_import_stop)
+                if before is not None:
+                    after = path.stat()
+                    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                        raise StorageError("Migration audit changed before retirement")
+                    snapshot = path.with_name(path.name + ".imported-snapshot")
+                    if snapshot.exists():
+                        snapshot = path.with_name(path.name + f".{time.time_ns()}.imported-snapshot")
+                    path.replace(snapshot)
                 self._set_migration_status(
                     {"state": "complete", "imported_jobs": imported, "source": "audit.jsonl"}
                 )
@@ -530,12 +615,21 @@ class SharedJobManager(JobManager):
     ) -> int:
         """Import a supplied migration home's bounded, last-week audit once.
 
-        No worker or lease callback is invoked. Flush both before resuming a
-        partial import and before committing its content-addressed marker.
+        No worker or lease callback is invoked. SQL batches insert only missing
+        records and commit before the content-addressed completion marker.
         """
         now = time.time() if now is None else now
         if not math.isfinite(now):
             raise ValueError("audit import time must be finite")
+        deadline = time.monotonic() + timeout
+
+        def check_progress():
+            if cancel_event is not None and cancel_event.is_set():
+                raise StorageError("audit import stopped before completion")
+            if time.monotonic() >= deadline:
+                raise StorageError("audit import timed out before durable delivery")
+
+        bulk_import = getattr(self.backend, "import_records", None)
         try:
             stream = Path(path).open("rb")
         except FileNotFoundError:
@@ -550,8 +644,7 @@ class SharedJobManager(JobManager):
             content = hashlib.sha256()
             remaining = size
             while remaining:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise StorageError("audit import stopped before completion")
+                check_progress()
                 data = stream.read(min(remaining, IMPORT_LINE_BYTES))
                 if not data:
                     raise StorageError("migration audit changed during hashing")
@@ -559,20 +652,28 @@ class SharedJobManager(JobManager):
                 remaining -= len(data)
             digest = content.hexdigest()
             transaction = getattr(self.backend, "transaction", None)
-            guard = transaction("privy.audit.import") if transaction else contextlib.nullcontext()
+            guard = (
+                transaction("privy.audit.import")
+                if transaction and bulk_import is None
+                else contextlib.nullcontext()
+            )
             with guard:
                 marker_key = f"audit:{digest}"
                 if self.backend.get("import", marker_key) is not None:
                     return 0
+                if bulk_import is not None and not self.backend.flush(
+                    timeout=max(0, deadline - time.monotonic())
+                ):
+                    raise StorageError("cannot resume audit import before durable delivery")
                 begin = max(0, size - IMPORT_MAX_BYTES)
                 stream.seek(begin)
                 if begin:
                     stream.readline(IMPORT_LINE_BYTES + 1)
                 starts, finishes, local_paths = {}, {}, {}
+                finish_keys = set()
                 cutoff = now - IMPORT_HISTORY_S
                 for line_hash, at, raw in _audit_lines(stream):
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise StorageError("audit import stopped before completion")
+                    check_progress()
                     if not cutoff <= at <= now or raw["event"] not in ("job.start", "job.finish"):
                         continue
                     job_id = raw.get("job_id")
@@ -585,6 +686,7 @@ class SharedJobManager(JobManager):
                         if isinstance(local_path, str):
                             local_paths[job_id] = local_path
                     else:
+                        finish_keys.add((job_id, f"file:{line_hash}"))
                         previous = finishes.get(job_id)
                         if previous is None or at >= previous[0]:
                             finishes[job_id] = (at, safe)
@@ -593,10 +695,39 @@ class SharedJobManager(JobManager):
                     if hasattr(self.backend, "existing")
                     else {job_id for job_id in starts if self.backend.get("job", job_id) is not None}
                 )
+                audit_keys = [f"file:{value[0]}" for value in starts.values()]
+                audit_keys.extend(key for job_id, key in finish_keys if job_id in starts)
+                existing_audits = (
+                    self.backend.existing("audit", audit_keys)
+                    if hasattr(self.backend, "existing")
+                    else {key for key in audit_keys if self.backend.get("audit", key) is not None}
+                )
                 imported = 0
+                batch = []
+
+                def commit_batch():
+                    nonlocal imported
+                    check_progress()
+                    inserted = bulk_import(batch)
+                    imported += sum(kind == "job" for kind, _ in inserted)
+                    batch.clear()
+
+                def write(kind, key, payload):
+                    nonlocal imported
+                    if kind == "audit":
+                        if key in existing_audits:
+                            return
+                        existing_audits.add(key)
+                    if bulk_import is not None:
+                        batch.append((kind, key, payload))
+                        if len(batch) == 500:
+                            commit_batch()
+                    else:
+                        self.backend.enqueue(kind, key, payload)
+                        imported += kind == "job"
+
                 for index, (job_id, (line_hash, at, start)) in enumerate(starts.items(), 1):
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise StorageError("audit import stopped before completion")
+                    check_progress()
                     finish = finishes.get(job_id)
                     finish = finish if finish is not None and finish[0] >= at else None
                     if finish is not None:
@@ -605,9 +736,8 @@ class SharedJobManager(JobManager):
                     if record is None:
                         continue
                     if job_id not in existing_jobs:
-                        self.backend.enqueue("job", job_id, record)
-                        imported += 1
-                    self.backend.enqueue(
+                        write("job", job_id, record)
+                    write(
                         "audit",
                         f"file:{line_hash}",
                         {
@@ -633,15 +763,14 @@ class SharedJobManager(JobManager):
                 if begin:
                     stream.readline(IMPORT_LINE_BYTES + 1)
                 for line_hash, at, raw in _audit_lines(stream):
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise StorageError("audit import stopped before completion")
+                    check_progress()
                     if (
                         cutoff <= at <= now
                         and raw["event"] == "job.finish"
                         and isinstance(raw.get("job_id"), str)
                         and raw["job_id"] in starts
                     ):
-                        self.backend.enqueue(
+                        write(
                             "audit",
                             f"file:{line_hash}",
                             {
@@ -651,22 +780,27 @@ class SharedJobManager(JobManager):
                                 "imported": True,
                             },
                         )
+                if batch:
+                    commit_batch()
                 final_stat = os.fstat(stream.fileno())
                 if final_stat.st_size != size or final_stat.st_mtime_ns != initial_stat.st_mtime_ns:
                     raise StorageError("migration audit changed during import; no marker committed")
-                if not self.backend.flush(timeout=timeout):
+                check_progress()
+                if bulk_import is None and not self.backend.flush(
+                    timeout=max(0, deadline - time.monotonic())
+                ):
                     raise StorageError("cannot commit audit import before durable delivery")
-                self.backend.put(
-                    "import",
-                    marker_key,
-                    {
-                        "owner": self.backend.owner,
-                        "created_at": now,
-                        "sha256": digest,
-                        "jobs": len(starts),
-                        "window_s": IMPORT_HISTORY_S,
-                    },
-                )
+                marker = {
+                    "owner": self.backend.owner,
+                    "created_at": now,
+                    "sha256": digest,
+                    "jobs": len(starts),
+                    "window_s": IMPORT_HISTORY_S,
+                }
+                if bulk_import is not None:
+                    bulk_import([("import", marker_key, marker)])
+                else:
+                    self.backend.put("import", marker_key, marker)
                 return imported
 
     def _admit(self, job: HubJob) -> None:
@@ -674,10 +808,7 @@ class SharedJobManager(JobManager):
         job._shared_admitted = True
 
     def _launch_failed(self, job: HubJob, admitted: bool) -> None:
-        if not getattr(job, "_shared_admitted", False):
-            # A failed SQL drain may have left a durable admission in the outbox.
-            # Its outcome is uncertain, so never release its pin.
-            log.error("shared job %s admission failed; retaining any admission pin", job.id)
+        if not admitted:
             return
         with job.cond:
             self._finish_locked(job, ERROR, error="hub could not launch the worker")
@@ -726,9 +857,18 @@ class SharedJobManager(JobManager):
     def _retry_finishes(self) -> None:
         with self._pending_lock:
             jobs = list(self._pending_finishes.values())
+            broadcasts = list(self._pending_broadcasts.items())
         for job in jobs:
             with job.cond:
                 self._complete_locked(job)
+        for broadcast_id, record in broadcasts:
+            try:
+                self.backend.enqueue("broadcast", broadcast_id, record)
+            except StorageError:
+                log.exception("shared broadcast %s persistence failed; will retry", broadcast_id)
+            else:
+                with self._pending_lock:
+                    self._pending_broadcasts.pop(broadcast_id, None)
 
     def _output_record(self, job: HubJob, stream: str, start: int, data: bytes) -> None:
         index = job.chunks_base + len(job.chunks)
@@ -750,7 +890,8 @@ class SharedJobManager(JobManager):
 
     def _launch(self, job, body):
         super()._launch(job, body)
-        return self.get(job.id)
+        reader = getattr(self.backend, "read_model", self.backend)
+        return SharedJob(reader, job_record(job, self.backend.owner), submitted=job)
 
     def _run(self, job, body):
         try:
@@ -761,15 +902,17 @@ class SharedJobManager(JobManager):
                 self._finish_locked(job, ERROR, error="shared worker could not persist its state")
 
     def get(self, job_id: str) -> SharedJob:
-        record = self.backend.get("job", job_id.strip())
+        reader = getattr(self.backend, "read_model", self.backend)
+        record = reader.get("job", job_id.strip())
         if record is None:
             raise JobLookupError(f"unknown job {job_id!r}")
-        return SharedJob(self.backend, record)
+        return SharedJob(reader, record)
 
     def list(self, *, target_id=None, limit=20, lease_id=None, client_id=None):
+        reader = getattr(self.backend, "read_model", self.backend)
         return [
-            SharedJob(self.backend, row, snapshot=True)
-            for row in self.backend.list(
+            SharedJob(reader, row, snapshot=True)
+            for row in reader.list(
                 "job",
                 limit=limit,
                 target=target_id,
@@ -779,11 +922,14 @@ class SharedJobManager(JobManager):
         ]
 
     def counts(self):
-        return self.backend.count_jobs()
+        return getattr(self.backend, "read_model", self.backend).count_jobs()
 
     def start_broadcast(self, *args, **kwargs):
         broadcast, jobs = super().start_broadcast(*args, **kwargs)
-        self.backend.put("broadcast", broadcast.id, {**asdict(broadcast), "owner": self.backend.owner})
+        record = {**asdict(broadcast), "owner": self.backend.owner}
+        with self._pending_lock:
+            self._pending_broadcasts[broadcast.id] = record
+        self._retry_finishes()
         return broadcast, jobs
 
     def get_broadcast(self, broadcast_id):
@@ -795,8 +941,10 @@ class SharedJobManager(JobManager):
         )
         return broadcast, [self.get(job_id) for job_id in broadcast.job_ids]
 
-    def cancel(self, job_id):
-        job = self.get(job_id)
+    def cancel(self, job_id, *, current: SharedJob | None = None):
+        if current is not None and current.id != job_id.strip():
+            raise JobLookupError(f"unknown job {job_id!r}")
+        job = current if current is not None else self.get(job_id)
         if not job.done:
             self.backend.request_cancel(job.id)
         return job
@@ -807,6 +955,13 @@ class SharedJobManager(JobManager):
                 job = self._jobs.get(job_id)
             # Old incarnations never acknowledge, execute, or unpin abandoned work.
             if job is None:
+                record = self.backend.get("job", job_id)
+                if (
+                    record is not None
+                    and record.get("owner") == self.backend.owner
+                    and record.get("state") in TERMINAL_STATES
+                ):
+                    self.backend.ack_cancel(job_id)
                 continue
             try:
                 with job.cond:
@@ -849,10 +1004,12 @@ class SharedJobManager(JobManager):
                 log.error("Azure SQL audit import did not stop; storage must remain open")
                 return False
         self._cancel_thread.join(timeout)
+        if self._cancel_thread.is_alive():
+            raise StorageError("SQL cancellation monitor did not stop; storage must remain open")
         self._retry_finishes()
         flushed = self.backend.flush(timeout=timeout)
         with self._pending_lock:
-            return flushed and not self._pending_finishes
+            return flushed and not self._pending_finishes and not self._pending_broadcasts
 
     @property
     def audit_import_running(self) -> bool:

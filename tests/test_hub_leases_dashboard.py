@@ -1,5 +1,6 @@
 """Lease dashboard rendering uses the same public store as the advisory API."""
 
+import copy
 import html
 import json
 import re
@@ -9,6 +10,7 @@ import pytest
 from hub_fakes import FakeListener, Hub, relays_document, write_relays
 
 from privy.hub import dashboard
+from privy.hub.leases import LeaseStore
 from privy.hub.metrics import HubMetrics
 
 BOX = "dev/box1_windows"
@@ -63,6 +65,24 @@ def test_hycos_show_whole_group_lease_and_filter_with_escaped_metadata(leased_hu
     assert " style=" not in text and "unsafe-inline" not in response.headers["Content-Security-Policy"]
 
 
+def test_html_report_reuses_fresh_lease_group_snapshot(leased_hub, monkeypatch):
+    hub, _, lease = leased_hub
+    store = hub.service.leases
+    calls = []
+    original = store.groups
+
+    def groups():
+        calls.append(True)
+        return original()
+
+    monkeypatch.setattr(store, "groups", groups)
+    response = hub.call("GET", "/ui/hycos")
+
+    assert response.status == 200
+    assert len(calls) == 1
+    assert f"lease {lease['lease_id']} · group dev/box1" in response.text
+
+
 def test_leases_tab_clients_groups_peek_and_effective_rules_are_read_only(leased_hub):
     hub, client, lease = leased_hub
     before = hub.service.leases.get_lease(lease["lease_id"])["expires_at"]
@@ -99,6 +119,9 @@ def test_expired_and_pinned_lease_rendering(leased_hub):
     hub, _, lease = leased_hub
     store = hub.service.leases
     clock = time.time()
+    store._leases[lease["lease_id"]]["running_jobs"] = ["j-one"]
+    assert 'data-bulk-safe="false"' in hub.call("GET", "/ui/leases").text
+    store._leases[lease["lease_id"]]["running_jobs"] = []
     store._clock = lambda: clock + 1801
     page = hub.call("GET", "/ui/leases?state=expired").text
     assert 'class="lease-state expired"' in page
@@ -151,3 +174,49 @@ def test_remote_exec_target_payload_exposes_holder_without_acquiring_a_lease(tmp
     assert targets[0]["lease"]["holder"]["session_id"] == "other-session"
     assert "Open terminal" in response.text and "Your clicks run without a lease" in response.text
     assert not hub.listeners[BOX].terminal_requests
+
+
+def test_last_used_is_not_renewal_survives_unleased_use_and_restart(leased_hub, tmp_path):
+    hub, client, lease = leased_hub
+    store = hub.service.leases
+    store.state_path = tmp_path / "leases-state.json"
+    now = time.time()
+    store._clock = lambda: now
+    store.renew(lease["lease_id"], client["client_id"])
+    assert store.get_lease(lease["lease_id"])["last_used_at"] is None
+    page = hub.call("GET", "/ui/leases").text
+    assert '<th data-sort>Last used<span class="s"></span></th>' in page
+    assert 'data-use-known="true"' in page and ">never</td>" in page
+    store.use(WSL, lease["lease_id"])
+    used = store.get_lease(lease["lease_id"])["last_used_at"]
+    store._clock = lambda: now + 60
+    store.use(BOX)
+    store.touch(lease["lease_id"])
+    restored = LeaseStore(hub.registry, home=store.state_path.parent, clock=lambda: now + 60)
+    assert restored.get_lease(lease["lease_id"])["last_used_at"] == used
+    page = hub.call("GET", "/ui/leases").text
+    assert f'data-v="{dashboard.lease_time(used)}"' in page
+    assert dashboard.utc_time(dashboard.lease_time(used)) in page
+    assert 'id="select-all-leases"' in page and f'data-select-lease="{lease["lease_id"]}"' in page
+    assert 'id="select-never-used"' in page and 'id="select-idle"' in page
+
+
+def test_last_used_uses_shared_snapshot_and_legacy_unknown_is_not_never(leased_hub):
+    hub, _, lease = leased_hub
+    store = hub.service.leases
+    record = copy.deepcopy(store._leases[lease["lease_id"]])
+    record.pop("last_used_ts")
+    assert store._view(record)["last_use_known"] is False
+    moment = record["acquired_ts"] + 10
+    snapshot = {
+        "leases": {lease["lease_id"]: record},
+        "clients": {},
+        "uses": {lease["group"]: {"at": moment, "by": {"lease_id": lease["lease_id"]}}},
+    }
+    view = store._view(record, snapshot=snapshot)
+    assert dashboard.lease_time(view["last_used_at"]) == pytest.approx(moment, abs=0.001)
+    assert view["last_use_known"] is True
+    snapshot["uses"][lease["group"]]["by"] = {"origin": "ui"}
+    assert store._view(record, snapshot=snapshot)["last_use_known"] is False
+    record["events"].append({"event": "pinned", "at": view["last_used_at"]})
+    assert store._view(record, snapshot=snapshot)["last_used_at"] == view["last_used_at"]

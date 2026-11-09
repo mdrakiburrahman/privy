@@ -408,12 +408,54 @@ class HubMetrics:
 
     # ---- reading --------------------------------------------------------------
 
-    def entries(self, target_id: str | None = None) -> list[JobEntry]:
+    def entries(
+        self,
+        target_id: str | None = None,
+        *,
+        lease_id: str | None = None,
+        limit: int | None = None,
+        states: set[str] | frozenset[str] | None = None,
+    ) -> list[JobEntry]:
         with self._lock:
             entries = list(self._entries)
         if target_id is not None:
             entries = [entry for entry in entries if entry.target_id == target_id]
+        if lease_id is not None:
+            entries = [entry for entry in entries if entry.lease_id == lease_id]
+        if states is not None:
+            entries = [entry for entry in entries if entry.view()["state"] in states]
+        if limit is not None:
+            entries.sort(key=lambda entry: (entry.created_at, entry.id), reverse=True)
+            entries = entries[:limit]
         return entries
+
+    def count_jobs_by_target(self, *, lease_id: str | None = None) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for entry in self.entries():
+            if lease_id is None or entry.lease_id == lease_id:
+                counts[entry.target_id] = counts.get(entry.target_id, 0) + 1
+        return counts
+
+    def count_jobs_by_lease(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for entry in self.entries():
+            if entry.lease_id:
+                counts[entry.lease_id] = counts.get(entry.lease_id, 0) + 1
+        return counts
+
+    def count_job_records(
+        self,
+        *,
+        lease_id: str | None = None,
+        states: set[str] | frozenset[str] | None = None,
+        after: float | None = None,
+        before: float | None = None,
+    ) -> int:
+        return sum(
+            1
+            for entry in self.entries(lease_id=lease_id, states=states)
+            if (after is None or entry.created_at >= after) and (before is None or entry.created_at < before)
+        )
 
     def entry(self, job_id: str) -> JobEntry | None:
         with self._lock:
@@ -434,6 +476,8 @@ class HubMetrics:
         jobs_queued: int = 0,
         jobs_retained: int | None = None,
         max_running: int = 0,
+        probe_stats: Mapping[str, Any] | None = None,
+        call_stats: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Every number on the dashboard, as JSON-ready data."""
         selection = selection or ReportSelection(range_name=range_name)
@@ -493,22 +537,38 @@ class HubMetrics:
             target_views = data["views"]
             target = configured.get(target_id)
             probe = probes.get(target_id)
+            target_probe_stats = probe_stats["by_target"].get(target_id) if probe_stats is not None else None
             finished = [view for view in target_views if view["state"] in (SUCCEEDED, *BAD_STATES)]
             ok = sum(1 for view in finished if view["state"] == SUCCEEDED)
             durations = [view["duration_ms"] for view in target_views if view["duration_ms"] is not None]
             origins = Counter(view["origin"] for view in target_views)
             target_samples = samples.get(target_id, [])
-            online_samples = sum(1 for sample in target_samples if sample.status == ONLINE)
-            latencies = [
-                s.latency_ms for s in target_samples if s.status == ONLINE and s.latency_ms is not None
-            ]
+            online_samples = (
+                target_probe_stats["online"]
+                if target_probe_stats is not None
+                else sum(1 for sample in target_samples if sample.status == ONLINE)
+            )
+            latencies = (
+                []
+                if target_probe_stats is not None
+                else [s.latency_ms for s in target_samples if s.status == ONLINE and s.latency_ms is not None]
+            )
             info = (probe.info or {}) if probe is not None else {}
             platform = info.get("platform") or {}
             last_used = all_last_used.get(target_id)
             status = probe.status if probe is not None else UNKNOWN
             # A failed job can change the shown status without a probe; then its start is unknown.
             since = status_since.get(target_id) if probed_status.get(target_id) == status else None
-            seen_online = last_online.get(target_id)
+            if target_probe_stats is not None and probed_status.get(target_id) == status:
+                since = target_probe_stats["status_since"]
+            seen_online = (
+                target_probe_stats["last_online"]
+                if target_probe_stats is not None
+                else last_online.get(target_id)
+            )
+            probe_sample_count = (
+                target_probe_stats["samples"] if target_probe_stats is not None else len(target_samples)
+            )
             top_origin = origins.most_common(1)[0] if origins else None
             rows.append(
                 {
@@ -523,18 +583,26 @@ class HubMetrics:
                     "status": status,
                     "status_since": utc_iso(since),
                     "status_since_ts": since,
-                    "status_since_first_check": status_since_first_check.get(target_id, False)
-                    if since is not None
-                    else None,
+                    "status_since_first_check": (
+                        target_probe_stats["status_since_first_check"]
+                        if target_probe_stats is not None and since is not None
+                        else status_since_first_check.get(target_id, False)
+                        if since is not None
+                        else None
+                    ),
                     "reason": probe.error if probe is not None else None,
                     "latency_ms": probe.latency_ms if probe is not None else None,
-                    "latency_p50_ms": percentile(latencies, 0.5),
+                    "latency_p50_ms": (
+                        target_probe_stats["latency_p50_ms"]
+                        if target_probe_stats is not None
+                        else percentile(latencies, 0.5)
+                    ),
                     "host": info.get("hostname"),
                     "user": info.get("user"),
                     "os": platform.get("description") or platform.get("system"),
                     "listener_version": info.get("privy_version"),
-                    "uptime_pct": round(100 * online_samples / len(target_samples), 1)
-                    if target_samples
+                    "uptime_pct": round(100 * online_samples / probe_sample_count, 1)
+                    if probe_sample_count
                     else None,
                     "jobs": len(target_views),
                     "running": sum(1 for view in target_views if view["state"] in (RUNNING, QUEUED)),
@@ -582,13 +650,27 @@ class HubMetrics:
             item["targets"] = sorted(item["targets"])
         failures = [view for view in views if view["state"] in BAD_STATES]
         failures.sort(key=lambda view: view["created_at"], reverse=True)
-        latencies_all = [
-            sample.latency_ms
-            for target_samples in samples.values()
-            for sample in target_samples
-            if sample.status == ONLINE and sample.latency_ms is not None
-        ]
-        surfaces = Counter(call.surface for call in calls)
+        if probe_stats is None:
+            latencies_all = [
+                sample.latency_ms
+                for target_samples in samples.values()
+                for sample in target_samples
+                if sample.status == ONLINE and sample.latency_ms is not None
+            ]
+            probe_latency = {"p50": percentile(latencies_all, 0.5), "p95": percentile(latencies_all, 0.95)}
+        else:
+            probe_latency = {
+                "p50": probe_stats["latency_p50_ms"],
+                "p95": probe_stats["latency_p95_ms"],
+            }
+        if call_stats is None:
+            surfaces = Counter(call.surface for call in calls)
+            total_calls = len(calls)
+            call_errors = sum(1 for call in calls if call.status >= 400)
+        else:
+            surfaces = Counter(call_stats["by_surface"])
+            total_calls = call_stats["total"]
+            call_errors = call_stats["errors"]
         statuses = sum(1 for view in rows if view["status"] == ONLINE and view["configured"])
         bytes_by_type = Counter()
         for view in views:
@@ -635,14 +717,11 @@ class HubMetrics:
             },
             "bytes_moved": {name: bytes_by_type.get(name, 0) for name in TRANSFER_TYPES},
             "calls": {
-                "total": len(calls),
+                "total": total_calls,
                 "by_surface": {name: surfaces.get(name, 0) for name in SURFACES},
-                "errors": sum(1 for call in calls if call.status >= 400),
+                "errors": call_errors,
             },
-            "probe_latency_ms": {
-                "p50": percentile(latencies_all, 0.5),
-                "p95": percentile(latencies_all, 0.95),
-            },
+            "probe_latency_ms": probe_latency,
             "series": series,
             "targets": rows,
             "top_commands": top_commands,

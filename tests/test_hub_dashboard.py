@@ -2,13 +2,14 @@ import json
 import re
 import threading
 import time
+from datetime import datetime, timezone
 
 import pytest
 from hub_fakes import FakeListener, Hub, blocking_run, exec_result
 
 from privy.client import RelayHTTPError
 from privy.hub import dashboard
-from privy.hub.dashboard import fmt_bytes, fmt_ms, sparkline
+from privy.hub.dashboard import fmt_bytes, fmt_interval, fmt_ms, sparkline
 from privy.hub.jobs import utc_iso
 from privy.hub.metrics import HubMetrics, public_report
 from privy.hub.registry import ProbeResult
@@ -54,6 +55,64 @@ def html_of(response):
     return response.text
 
 
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [
+        (0, "0 seconds"),
+        (1.25, "1.25 seconds"),
+        (60, "1 minute"),
+        (90.5, "1 minute 30.5 seconds"),
+        (900, "15 minutes"),
+        (900.25, "15 minutes 0.25 seconds"),
+        (86400, "1 day"),
+    ],
+)
+def test_interval_format_is_natural_and_keeps_fractional_seconds(seconds, expected):
+    assert fmt_interval(seconds) == expected
+
+
+def test_overview_filter_controls_keep_selection_and_expose_exact_utc_range():
+    start = datetime(2026, 11, 7, 16, 30, tzinfo=timezone.utc)
+    end = datetime(2026, 11, 8, 16, 30, tzinfo=timezone.utc)
+    report = {
+        "range": "24h",
+        "requested_resolution": "15m",
+        "start_ts": start.timestamp(),
+        "end_ts": end.timestamp(),
+        "start": "2026-11-07T16:30:00.000Z",
+        "end": "2026-11-08T16:30:00.000Z",
+        "resolution_adjusted": False,
+        "bucket_s": 900,
+        "telemetry_started_at": "2026-11-08T16:30:00.000Z",
+    }
+
+    text = dashboard.overview_controls(report)
+
+    assert 'id="metrics-controls" class="metrics-filter-form"' in text
+    assert 'for="metrics-range"' in text and 'for="metrics-resolution"' in text
+    assert 'value="24h" selected>24h</option>' in text
+    assert 'value="15m" selected>15m</option>' in text
+    assert 'class="report-dates" hidden' in text
+    assert 'id="metrics-start"' in text and 'id="metrics-end"' in text
+    assert 'class="lease-button primary filter-apply"' in text
+    assert 'role="alert" aria-live="polite"' in text
+    assert "<strong>15 minutes</strong> per column" in text
+    assert 'datetime="2026-11-07T16:30:00.000Z"' in text
+    assert 'datetime="2026-11-08T16:30:00.000Z"' in text
+    assert "Nov 7, 2026 · 4:30 PM" in text and "Nov 8, 2026 · 4:30 PM" in text
+    assert "Exact UTC instant: 2026-11-07T16:30:00.000Z" in text
+    assert "Telemetry is kept in RAM without age-based expiry" in text
+
+    sql_text = dashboard.overview_controls(report, sql_backed=True)
+    assert "shared through Azure SQL" in sql_text
+    assert "collected after 7 days" in sql_text
+    assert "Telemetry is kept in RAM" not in sql_text
+    assert "resets on restart" not in sql_text
+
+    custom_text = dashboard.overview_controls({**report, "range": "custom"})
+    assert 'class="report-dates" hidden' not in custom_text
+
+
 # ---- negotiation and pages ---------------------------------------------------------
 
 
@@ -84,6 +143,47 @@ def test_gather_probes_renders_before_stale_refresh_finishes():
         assert time.monotonic() - begin < 2
     finally:
         release.set()
+
+
+def test_sql_history_report_reuses_its_job_counts(monkeypatch):
+    class Registry:
+        def snapshot(self):
+            return type("Snapshot", (), {"targets": []})()
+
+    class Jobs:
+        max_running = 3
+
+        def counts(self):
+            raise AssertionError("SQL history already provides the report counts")
+
+    class Backend:
+        def report_history(self, **_kwargs):
+            raise AssertionError("The metrics report owns the history read")
+
+    class Metrics:
+        backend = Backend()
+
+        def report(self, _targets, _probes, **kwargs):
+            self.kwargs = kwargs
+            return {"targets": []}
+
+    metrics = Metrics()
+    service = type(
+        "Service",
+        (),
+        {
+            "registry": Registry(),
+            "jobs": Jobs(),
+            "metrics": metrics,
+            "listener_facts_many": lambda _self, _targets, _probes: {},
+        },
+    )()
+    monkeypatch.setattr(dashboard, "gather_probes", lambda _service: {})
+
+    dashboard.build_report(service)
+
+    assert metrics.kwargs["max_running"] == 3
+    assert not {"jobs_running", "jobs_queued", "jobs_retained"} & metrics.kwargs.keys()
 
 
 def test_root_serves_the_dashboard_to_browsers_and_markdown_to_everyone_else(hub):
@@ -217,6 +317,61 @@ def test_jobs_page_filters_by_state(tmp_path):
     assert only_failed.count('<tr data-href="/ui/logs') == 1 and "nope" in only_failed
     logs = html_of(hub.call("GET", f"/ui/logs?target={BOX2}"))
     assert 'class="term bad"' in logs and '<span class="err">boom\n</span>' in logs
+
+
+def test_jobs_and_logs_pages_bound_job_history_reads(hub, monkeypatch):
+    for target, command in ((BOX1, "one"), (BOX1, "two"), (BOX2, "three"), (BOX2, "four")):
+        run(hub, target, command)
+
+    metrics = hub.service.metrics
+    entry_calls = []
+    count_calls = []
+    totals_calls = []
+    original_entries = metrics.entries
+    original_counts = metrics.count_jobs_by_target
+    original_total = metrics.count_job_records
+
+    def entries(*args, **kwargs):
+        entry_calls.append((args, kwargs))
+        return original_entries(*args, **kwargs)
+
+    def counts(*args, **kwargs):
+        count_calls.append(kwargs)
+        return original_counts(*args, **kwargs)
+
+    def total(*args, **kwargs):
+        totals_calls.append(kwargs)
+        return original_total(*args, **kwargs)
+
+    monkeypatch.setattr(metrics, "entries", entries)
+    monkeypatch.setattr(metrics, "count_jobs_by_target", counts)
+    monkeypatch.setattr(metrics, "count_job_records", total)
+
+    jobs = html_of(hub.call("GET", "/ui/jobs?limit=1"))
+    assert len(re.findall(r'<tr data-href="/ui/logs', jobs)) == 1
+    assert "4 jobs" in jobs and "Show more (3 older jobs)" in jobs
+    assert any(kwargs.get("limit") == 2 and kwargs.get("states") is None for _, kwargs in entry_calls)
+    assert totals_calls[-1]["states"] is None
+
+    logs = html_of(hub.call("GET", f"/ui/logs?target={BOX1}&limit=1"))
+    assert len(re.findall(r'<details class="term', logs)) == 1
+    assert "2 jobs kept" in logs and "Show more (1 older job)" in logs
+    assert count_calls[-1] == {"lease_id": None}
+    assert any(args == (BOX1,) and kwargs.get("limit") == 2 for args, kwargs in entry_calls)
+
+
+def test_jobs_and_leases_pages_skip_full_dashboard_history_report(hub, monkeypatch):
+    run(hub, BOX1, "one")
+
+    def unexpected_report(*args, **kwargs):
+        pytest.fail("jobs and leases pages must not load the full dashboard report")
+
+    monkeypatch.setattr(dashboard, "build_report", unexpected_report)
+
+    jobs = html_of(hub.call("GET", "/ui/jobs"))
+    leases = html_of(hub.call("GET", "/ui/leases"))
+    assert "1 job" in jobs
+    assert "<title>Leases · privy hub</title>" in leases
 
 
 def test_ui_calls_are_counted_but_not_echoed(hub, capsys):

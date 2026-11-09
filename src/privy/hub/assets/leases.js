@@ -1,6 +1,8 @@
 window.PrivyLeases = (() => {
   "use strict";
   let dialog = null;
+  let bulkBusy = false;
+  const selected = new Set(JSON.parse(sessionStorage.getItem("privy.lease-selection") || "[]"));
   const $ = id => document.getElementById(id);
   const operatorKey = "privy.manual-operator";
 
@@ -58,8 +60,142 @@ window.PrivyLeases = (() => {
       }
       anchor.href = next.pathname + next.search;
     });
+    document.querySelectorAll("[data-select-lease]").forEach(input => {
+      if (input.closest("tr").dataset.bulkSafe !== "true") selected.delete(input.dataset.selectLease);
+      input.checked = selected.has(input.dataset.selectLease);
+    });
+    document.querySelectorAll("[data-lease-row]").forEach(row => {
+      if (!row.querySelector("[data-select-lease]")) selected.delete(row.dataset.leaseId);
+    });
+    updateSelection();
+    persistSelection();
   }
 
+  function persistSelection() {
+    sessionStorage.setItem("privy.lease-selection", JSON.stringify([...selected]));
+  }
+  function visibleSelections() {
+    return [...document.querySelectorAll("[data-select-lease]")].filter(input => !input.closest("tr").hidden);
+  }
+  function updateSelection() {
+    const inputs = visibleSelections(), count = inputs.filter(input => input.checked).length;
+    const button = $("force-release-selected"), all = $("select-all-leases");
+    if (button) { button.disabled = count === 0 || bulkBusy; button.textContent = `Force release selected (${count})`; }
+    if (all) {
+      all.checked = inputs.length > 0 && count === inputs.length;
+      all.indeterminate = count > 0 && count < inputs.length;
+    }
+  }
+  async function releaseSelected() {
+    if (dialog || bulkBusy) return;
+    const inputs = visibleSelections().filter(input => input.checked);
+    if (!inputs.length) return;
+    const selectedIds = inputs.map(input => input.dataset.selectLease);
+    const button = $("force-release-selected"); bulkBusy = true; button.disabled = true;
+    try {
+      const leases = await Promise.all(selectedIds.map(id => get(`/v1/leases/${encodeURIComponent(id)}`)));
+      const panel = element("dialog", "", "lease-dialog"); dialog = panel;
+      const heading = element("h2", `Force release ${leases.length} selected leases?`);
+      heading.id = "lease-bulk-title"; panel.setAttribute("aria-labelledby", heading.id);
+      panel.append(heading, element("p",
+        "This releases whole groups and skips cooldown. Existing pin reconciliation rules still apply; remote work may still be running. Verify it has stopped before continuing.",
+        "lease-warning"));
+      const list = element("ul", "");
+      const releasable = [];
+      const blocked = [];
+      for (const lease of leases) {
+        const runningJobs = Array.isArray(lease.running_jobs) ? lease.running_jobs : [];
+        const owners = lease.job_owners && typeof lease.job_owners === "object" && !Array.isArray(lease.job_owners)
+          ? Object.keys(lease.job_owners) : [];
+        const running = [...new Set([...runningJobs, ...owners])];
+        const invalidMetadata = (lease.running_jobs && !Array.isArray(lease.running_jobs)) ||
+          (lease.job_owners && (typeof lease.job_owners !== "object" || Array.isArray(lease.job_owners)));
+        const isBlocked = running.length > 0 || invalidMetadata;
+        if (isBlocked) {
+          blocked.push(lease);
+          selected.delete(lease.lease_id);
+        } else releasable.push(lease);
+        list.append(element("li", `${lease.lease_id} · ${lease.group} · ${lease.holder?.name || lease.client_id}` +
+          (isBlocked ? ` — BLOCKED: ${running.length ? `running jobs/pins ${running.join(", ")}` : "invalid pin metadata"}; will not be submitted`
+            : " — no running jobs or pins; eligible"),
+        isBlocked ? "lease-warning" : ""));
+      }
+      persistSelection();
+      const results = element("div", ""); results.setAttribute("role", "status");
+      blocked.forEach(lease => results.append(element("p",
+        `${lease.lease_id}: skipped; running jobs or pins were detected, so no release request will be sent.`,
+        "lease-warning")));
+      const actions = element("div", "", "lease-dialog-actions");
+      const cancel = element("button", "Cancel", "lease-button");
+      const proceed = element("button", `Force release unpinned (${releasable.length})`, "lease-button danger");
+      proceed.disabled = releasable.length === 0;
+      cancel.type = proceed.type = "button"; actions.append(cancel, proceed);
+      panel.append(list, results, actions); document.body.append(panel);
+      let submitting = false, completed = false;
+      const close = () => {
+        if (submitting) return;
+        panel.close(); panel.remove(); dialog = null; bulkBusy = false;
+        persistSelection();
+        if (completed) location.reload(); else { updateSelection(); button.focus(); }
+      };
+      cancel.onclick = close;
+      panel.addEventListener("cancel", event => { event.preventDefault(); close(); });
+      proceed.onclick = async () => {
+        if (submitting || completed) return;
+        submitting = true; proceed.disabled = true; cancel.disabled = true;
+        results.replaceChildren();
+        let freshLeases;
+        try {
+          freshLeases = await Promise.all(selectedIds.map(id => get(`/v1/leases/${encodeURIComponent(id)}`)));
+        } catch (error) {
+          results.append(element("p",
+            `Could not refresh selected leases before submission: ${error.message}. No releases were submitted.`,
+            "lease-action-error"));
+          submitting = false; completed = true; cancel.disabled = false;
+          cancel.textContent = "Close and refresh";
+          return;
+        }
+        list.replaceChildren();
+        for (const lease of freshLeases) {
+          const runningJobs = Array.isArray(lease.running_jobs) ? lease.running_jobs : [];
+          const owners = lease.job_owners && typeof lease.job_owners === "object" && !Array.isArray(lease.job_owners)
+            ? Object.keys(lease.job_owners) : [];
+          const running = [...new Set([...runningJobs, ...owners])];
+          const invalidMetadata = (lease.running_jobs && !Array.isArray(lease.running_jobs)) ||
+            (lease.job_owners && (typeof lease.job_owners !== "object" || Array.isArray(lease.job_owners)));
+          const isBlocked = running.length > 0 || invalidMetadata;
+          list.append(element("li", `${lease.lease_id} · ${lease.group} · ${lease.holder?.name || lease.client_id}` +
+            (isBlocked ? ` — BLOCKED: ${running.length ? `running jobs/pins ${running.join(", ")}` : "invalid pin metadata"}; will not be submitted`
+              : " — no running jobs or pins; eligible"),
+          isBlocked ? "lease-warning" : ""));
+          if (isBlocked) {
+            selected.delete(lease.lease_id);
+            persistSelection();
+            results.append(element("p",
+              `${lease.lease_id}: skipped; running jobs or pins were detected during pre-submit refresh.`,
+              "lease-warning"));
+            continue;
+          }
+          const result = element("p", `${lease.lease_id}: releasing…`); results.append(result);
+          selected.delete(lease.lease_id);
+          persistSelection();
+          try {
+            await mutate(`/v1/leases/${encodeURIComponent(lease.lease_id)}/force-release`, "POST", {
+              require_unpinned: true
+            });
+            result.textContent = `${lease.lease_id}: released`;
+          } catch (error) {
+            result.textContent = `${lease.lease_id}: ${error.name === "AbortError"
+              ? "Timed out; outcome unknown. Check the refreshed list before retrying." : error.message}`;
+            result.className = "lease-action-error";
+          }
+        }
+        submitting = false; completed = true; cancel.disabled = false;
+        cancel.textContent = "Close and refresh";
+      };
+      panel.showModal(); cancel.focus();
+    } catch (error) { bulkBusy = false; notice(error.message); updateSelection(); }
+  }
   function element(tag, text, className = "") {
     const node = document.createElement(tag);
     node.textContent = text;
@@ -299,7 +435,33 @@ window.PrivyLeases = (() => {
   document.addEventListener("input", event => {
     if (event.target.matches("#leaseq, #leaselabel")) filter();
   });
+  document.addEventListener("change", event => {
+    if (event.target.matches("#select-all-leases")) {
+      visibleSelections().forEach(input => { input.checked = event.target.checked; });
+    }
+    if (event.target.matches("#select-all-leases, [data-select-lease]")) {
+      document.querySelectorAll("[data-select-lease]").forEach(input => {
+        if (input.checked) selected.add(input.dataset.selectLease); else selected.delete(input.dataset.selectLease);
+      });
+      persistSelection();
+      updateSelection();
+    }
+  });
   document.addEventListener("click", async event => {
+    const quick = event.target.closest("#select-never-used, #select-idle");
+    if (quick) {
+      const cutoff = Date.now() / 1000 - Number($("lease-idle-threshold").value);
+      visibleSelections().forEach(input => {
+        const row = input.closest("tr"), last = Number(row.dataset.lastUsed);
+        input.checked = row.dataset.bulkSafe === "true" && row.dataset.useKnown === "true" &&
+          (quick.id === "select-never-used" ? last === 0
+          : (last || Number(row.dataset.acquired)) < cutoff);
+        if (input.checked) selected.add(input.dataset.selectLease); else selected.delete(input.dataset.selectLease);
+      });
+      persistSelection();
+      updateSelection(); return;
+    }
+    if (event.target.closest("#force-release-selected")) { await releaseSelected(); return; }
     const take = event.target.closest("#take-lease");
     if (take) { await takeLease(take); return; }
     const button = event.target.closest("[data-force-release], [data-owner-release]");

@@ -225,7 +225,7 @@ class HubJob:
         else:
             result["type"] = self.type
         result["state"] = self.state
-        result["done"] = self.done
+        result["done"] = self.state in TERMINAL_STATES
         if self.exit_code is not None:
             result["exit_code"] = self.exit_code
         if self.error:
@@ -539,20 +539,30 @@ class JobManager:
             code=code,
             origin=origin,
         )
-        jobs = [
-            self.start_exec(
-                target,
-                language=language,
-                code=code,
-                mode=mode,
-                timeout_s=timeout_s,
-                origin=origin,
-                broadcast_id=broadcast_id,
-                purpose=purpose,
-                lease_id=lease_id,
-            )
-            for target, language in runs
-        ]
+        from privy.hub.sql_store import StorageError
+
+        jobs = []
+        skipped = list(skipped)
+        for target, language in runs:
+            try:
+                jobs.append(
+                    self.start_exec(
+                        target,
+                        language=language,
+                        code=code,
+                        mode=mode,
+                        timeout_s=timeout_s,
+                        origin=origin,
+                        broadcast_id=broadcast_id,
+                        purpose=purpose,
+                        lease_id=lease_id,
+                    )
+                )
+            except StorageError:
+                if not jobs:
+                    raise
+                log.exception("broadcast %s could not admit target %s", broadcast_id, target.id)
+                skipped.append({"target": target.id, "status": "storage_unavailable"})
         broadcast = Broadcast(
             id=broadcast_id,
             created_at=time.time(),
@@ -631,7 +641,7 @@ class JobManager:
             while True:
                 remaining = deadline - time.monotonic()
                 with job.cond:
-                    if job.done or remaining <= 0:
+                    if remaining <= 0 or job.done:
                         break
                     interval = getattr(job, "poll_interval", None)
                     job.cond.wait(min(remaining, interval or TICK_S) if on_tick or interval else remaining)
@@ -640,8 +650,10 @@ class JobManager:
         if on_tick is not None:
             on_tick()
 
-    def cancel(self, job_id: str) -> HubJob:
-        job = self.get(job_id)
+    def cancel(self, job_id: str, *, current: HubJob | None = None) -> HubJob:
+        if current is not None and current.id != job_id.strip():
+            raise JobLookupError(f"unknown job {job_id!r}")
+        job = current if current is not None else self.get(job_id)
         with job.cond:
             if job.done:
                 return job

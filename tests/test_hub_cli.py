@@ -77,11 +77,15 @@ def test_hub_serve_builds_the_runtime_and_stops_on_interrupt(tmp_path, monkeypat
                 "Service",
                 (),
                 {
-                    "summary": lambda self: {
-                        "relays_file": {"exists": False},
-                        "relays": 0,
-                        "targets": 0,
-                    }
+                    "registry": type(
+                        "Registry",
+                        (),
+                        {
+                            "snapshot": lambda self: type(
+                                "Snapshot", (), {"file_exists": False, "relays": (), "targets": ()}
+                            )()
+                        },
+                    )()
                 },
             )()
             self.server = type(
@@ -90,6 +94,9 @@ def test_hub_serve_builds_the_runtime_and_stops_on_interrupt(tmp_path, monkeypat
 
         def serve_forever(self):
             raise KeyboardInterrupt
+
+        def close(self):
+            self.server.server_close()
 
     def fake_build_hub(**kwargs):
         captured.update(kwargs)

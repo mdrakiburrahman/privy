@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import os
 import socket
 import sqlite3
@@ -20,13 +21,154 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from privy.hub.request_context import REQUEST_ID
 from privy.hub.settings import SqlSettings
 
 log = logging.getLogger("privy.hub")
 
 
+def _profile_sql_enabled() -> bool:
+    return os.environ.get("PRIVY_SQL_PROFILE") == "1"
+
+
+class _ProfileCursor:
+    def __init__(self, cursor) -> None:
+        self._cursor = cursor
+        self._query = ""
+
+    def execute(self, query, *params):
+        self._query = query
+        started = time.perf_counter()
+        try:
+            return self._cursor.execute(query, *params)
+        except Exception as exc:
+            log.error(
+                "sql_profile execute failed request_id=%s thread=%s error_type=%s query=%r",
+                REQUEST_ID.get(),
+                threading.get_ident(),
+                type(exc).__name__,
+                query,
+            )
+            raise
+        finally:
+            log.info(
+                "sql_profile execute request_id=%s thread=%s duration_ms=%.1f query=%r",
+                REQUEST_ID.get(),
+                threading.get_ident(),
+                (time.perf_counter() - started) * 1000,
+                query,
+            )
+
+    def fetchall(self):
+        started = time.perf_counter()
+        try:
+            rows = self._cursor.fetchall()
+        except Exception as exc:
+            log.error(
+                "sql_profile fetchall failed request_id=%s thread=%s error_type=%s query=%r",
+                REQUEST_ID.get(),
+                threading.get_ident(),
+                type(exc).__name__,
+                self._query,
+            )
+            raise
+        log.info(
+            "sql_profile fetchall request_id=%s thread=%s duration_ms=%.1f rows=%d query=%r",
+            REQUEST_ID.get(),
+            threading.get_ident(),
+            (time.perf_counter() - started) * 1000,
+            len(rows),
+            self._query,
+        )
+        return rows
+
+    def fetchone(self):
+        started = time.perf_counter()
+        try:
+            row = self._cursor.fetchone()
+        except Exception as exc:
+            log.error(
+                "sql_profile fetchone failed request_id=%s thread=%s error_type=%s query=%r",
+                REQUEST_ID.get(),
+                threading.get_ident(),
+                type(exc).__name__,
+                self._query,
+            )
+            raise
+        log.info(
+            "sql_profile fetchone request_id=%s thread=%s duration_ms=%.1f rows=%d query=%r",
+            REQUEST_ID.get(),
+            threading.get_ident(),
+            (time.perf_counter() - started) * 1000,
+            int(row is not None),
+            self._query,
+        )
+        return row
+
+    def nextset(self):
+        started = time.perf_counter()
+        result = None
+        try:
+            result = self._cursor.nextset()
+            return result
+        except Exception as exc:
+            log.error(
+                "sql_profile nextset failed request_id=%s thread=%s error_type=%s query=%r",
+                REQUEST_ID.get(),
+                threading.get_ident(),
+                type(exc).__name__,
+                self._query,
+            )
+            raise
+        finally:
+            log.info(
+                "sql_profile nextset request_id=%s thread=%s duration_ms=%.1f result=%r query=%r",
+                REQUEST_ID.get(),
+                threading.get_ident(),
+                (time.perf_counter() - started) * 1000,
+                result,
+                self._query,
+            )
+
+    def close(self):
+        started = time.perf_counter()
+        try:
+            return self._cursor.close()
+        except Exception as exc:
+            log.error(
+                "sql_profile cursor_close failed request_id=%s thread=%s error_type=%s query=%r",
+                REQUEST_ID.get(),
+                threading.get_ident(),
+                type(exc).__name__,
+                self._query,
+            )
+            raise
+        finally:
+            log.info(
+                "sql_profile cursor_close request_id=%s thread=%s duration_ms=%.1f query=%r",
+                REQUEST_ID.get(),
+                threading.get_ident(),
+                (time.perf_counter() - started) * 1000,
+                self._query,
+            )
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
 class StorageError(RuntimeError):
     """An authoritative operation or durable delivery could not complete."""
+
+
+def _delivery_failure(exc: BaseException) -> str:
+    current: BaseException | None = exc
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if "51001" in str(current):
+            return "SQL job ownership conflict (51001); journal retained for replay"
+        current = current.__cause__ or current.__context__
+    return "SQL delivery unavailable; journal retained for replay"
 
 
 class _HomeLock:
@@ -140,6 +282,10 @@ class DurableOutbox:
                 "SELECT seq,kind,key,payload,owner FROM pending ORDER BY seq LIMIT ?", (limit,)
             ).fetchall()
 
+    def pending_keys(self) -> set[tuple[str, str]]:
+        with self._lock:
+            return set(self._db.execute("SELECT DISTINCT kind,key FROM pending").fetchall())
+
     def ack(self, seq: int) -> None:
         with self._lock:
             self._db.execute("DELETE FROM pending WHERE seq=?", (seq,))
@@ -219,7 +365,7 @@ class AzureSqlConnections:
                 f"Driver={{{s.driver}}};Server=tcp:{s.server},1433;Database={s.database};"
                 "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=10;",
                 attrs_before={1256: token},
-                autocommit=False,
+                autocommit=True,
             )
             connection.timeout = 15
             return _PooledConnection(self, connection, expiry)
@@ -228,6 +374,13 @@ class AzureSqlConnections:
 
     def _release(self, connection, expiry: float, broken: bool) -> None:
         try:
+            if not broken:
+                try:
+                    connection.rollback()
+                    connection.autocommit = True
+                except Exception as exc:
+                    connection.close()
+                    raise StorageError("Azure SQL pool reset failed; connection discarded") from exc
             with self._lock:
                 if broken or self._closed or expiry <= time.time() + 300:
                     connection.close()
@@ -251,6 +404,7 @@ class _PooledConnection:
         self._returned = False
 
     def cursor(self):
+        self._connection.autocommit = False
         return self._connection.cursor()
 
     def commit(self) -> None:
@@ -285,12 +439,30 @@ BEGIN
         revision bigint NOT NULL, at float NOT NULL,
         target nvarchar(300) NULL, lease_id nvarchar(80) NULL, client_id nvarchar(80) NULL,
         updated datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        probe_status AS (CONVERT(nvarchar(32), JSON_VALUE(payload,'$.status'))),
+        probe_latency_ms AS (TRY_CONVERT(int, JSON_VALUE(payload,'$.latency_ms'))),
         CONSTRAINT PK_privy_records PRIMARY KEY(kind,id));
     CREATE INDEX IX_privy_records_at ON dbo.privy_records(kind,at DESC);
     CREATE INDEX IX_privy_records_target ON dbo.privy_records(kind,target,at DESC);
     CREATE INDEX IX_privy_records_lease ON dbo.privy_records(kind,lease_id,at DESC);
     CREATE INDEX IX_privy_records_client ON dbo.privy_records(kind,client_id,at DESC);
 END;
+IF COL_LENGTH('dbo.privy_records','probe_status') IS NULL
+    ALTER TABLE dbo.privy_records ADD probe_status AS (CONVERT(nvarchar(32), JSON_VALUE(payload,'$.status')));
+IF COL_LENGTH('dbo.privy_records','probe_latency_ms') IS NULL
+    ALTER TABLE dbo.privy_records ADD probe_latency_ms AS (TRY_CONVERT(int, JSON_VALUE(payload,'$.latency_ms')));
+IF NOT EXISTS(SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.privy_records') AND name='IX_privy_probe_history')
+    CREATE INDEX IX_privy_probe_history ON dbo.privy_records(at DESC)
+        INCLUDE(target,probe_status,probe_latency_ms) WHERE kind='probe';
+IF NOT EXISTS(SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.privy_records') AND name='IX_privy_probe_target_history')
+    CREATE INDEX IX_privy_probe_target_history ON dbo.privy_records(target,at,id)
+        INCLUDE(probe_status,probe_latency_ms) WHERE kind='probe';
+IF NOT EXISTS(SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.privy_records') AND name='IX_privy_probe_target_latency')
+    CREATE INDEX IX_privy_probe_target_latency ON dbo.privy_records(target,probe_latency_ms,at,id)
+        WHERE kind='probe';
+IF NOT EXISTS(SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.privy_records') AND name='IX_privy_probe_latency')
+    CREATE INDEX IX_privy_probe_latency ON dbo.privy_records(probe_latency_ms,target,at,id)
+        INCLUDE(probe_status) WHERE kind='probe';
 IF OBJECT_ID('dbo.privy_coordination') IS NULL
 BEGIN
     CREATE TABLE dbo.privy_coordination(
@@ -326,8 +498,9 @@ WITH(kind nvarchar(32), id nvarchar(400), payload nvarchar(max) AS JSON,
 DECLARE @latest TABLE(kind nvarchar(32), id nvarchar(400), payload nvarchar(max),
     owner nvarchar(64), revision bigint, at float, target nvarchar(300),
     lease_id nvarchar(80), client_id nvarchar(80), PRIMARY KEY(kind,id));
-INSERT @latest SELECT r.* FROM @rows r WHERE revision=(
-    SELECT MAX(revision) FROM @rows p WHERE p.kind=r.kind AND p.id=r.id);
+INSERT @latest SELECT kind,id,payload,owner,revision,at,target,lease_id,client_id
+FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY kind,id ORDER BY revision DESC) AS n FROM @rows) ranked
+WHERE n=1;
 IF EXISTS(SELECT 1 FROM @latest n JOIN dbo.privy_records p WITH(UPDLOCK,HOLDLOCK)
     ON p.kind=n.kind AND p.id=n.id WHERE n.kind='job' AND p.owner<>n.owner)
     THROW 51001, 'Privy job ownership conflict', 1;
@@ -350,6 +523,30 @@ FROM @latest n WHERE n.kind='output' AND NOT EXISTS(
     SELECT 1 FROM dbo.privy_output p WITH(UPDLOCK,HOLDLOCK)
     WHERE p.job_id=JSON_VALUE(n.payload,'$.job_id')
       AND p.chunk_index=CAST(JSON_VALUE(n.payload,'$.index') AS bigint));
+"""
+
+_READ_SCHEMA = """
+IF COL_LENGTH('dbo.privy_records','change_version') IS NULL
+    ALTER TABLE dbo.privy_records ADD change_version rowversion;
+IF NOT EXISTS(SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.privy_records')
+    AND name='IX_privy_read_changes')
+    EXEC('CREATE INDEX IX_privy_read_changes ON dbo.privy_records(change_version)
+        INCLUDE(kind,id) WHERE kind<>''probe'' AND kind<>''call''');
+"""
+
+_IMPORT_BATCH = """
+DECLARE @rows TABLE(kind nvarchar(32), id nvarchar(400), payload nvarchar(max),
+    owner nvarchar(64), at float, target nvarchar(300),
+    lease_id nvarchar(80), client_id nvarchar(80), PRIMARY KEY(kind,id));
+INSERT @rows SELECT * FROM OPENJSON(?)
+WITH(kind nvarchar(32), id nvarchar(400), payload nvarchar(max) AS JSON,
+     owner nvarchar(64), at float, target nvarchar(300),
+     lease_id nvarchar(80), client_id nvarchar(80));
+INSERT dbo.privy_records(kind,id,payload,owner,revision,at,target,lease_id,client_id)
+OUTPUT inserted.kind,inserted.id
+SELECT n.kind,n.id,n.payload,n.owner,0,n.at,n.target,n.lease_id,n.client_id
+FROM @rows n WHERE NOT EXISTS(
+    SELECT 1 FROM dbo.privy_records p WITH(UPDLOCK,HOLDLOCK) WHERE p.kind=n.kind AND p.id=n.id);
 """
 
 
@@ -397,38 +594,168 @@ class SqlBackend:
             self._thread.start()
 
     @contextmanager
-    def transaction(self, lock: str | None = None):
-        connection = self._connect()
+    def transaction(self, lock: str | None = None, *, isolation_level: str | None = None):
+        if isolation_level not in (None, "SERIALIZABLE"):
+            raise ValueError(f"unsupported SQL transaction isolation level: {isolation_level}")
+        profile = _profile_sql_enabled()
+        connection_started = time.perf_counter()
+        lock_wait_started = None
+        lock_acquired_at = None
+        lock_released_at = None
+        lock_outcome = "pending" if lock else "not_requested"
         try:
-            cursor = connection.cursor()
-            cursor.execute("SET NOCOUNT ON; SET XACT_ABORT ON; SET LOCK_TIMEOUT 15000;")
+            connection = self._connect()
+        except Exception as exc:
+            if profile:
+                log.error(
+                    "sql_profile connection_acquire failed request_id=%s thread=%s error_type=%s",
+                    REQUEST_ID.get(),
+                    threading.get_ident(),
+                    type(exc).__name__,
+                )
+            raise
+        if profile:
+            log.info(
+                "sql_profile connection_acquire request_id=%s thread=%s duration_ms=%.1f",
+                REQUEST_ID.get(),
+                threading.get_ident(),
+                (time.perf_counter() - connection_started) * 1000,
+            )
+        cursor = None
+
+        def close_cursor() -> None:
+            nonlocal cursor
+            if cursor is None:
+                return
+            current, cursor = cursor, None
+            current.close()
+
+        cursor_close_error = None
+        try:
+            raw_cursor = connection.cursor()
+            cursor = _ProfileCursor(raw_cursor) if profile else raw_cursor
+            effective_isolation = isolation_level or "READ COMMITTED"
+            setup = (
+                f"SET TRANSACTION ISOLATION LEVEL {effective_isolation}; "
+                "SET NOCOUNT ON; SET XACT_ABORT ON; SET LOCK_TIMEOUT 15000;"
+            )
+            cursor.execute(setup)
             if lock:
+                lock_wait_started = time.perf_counter()
                 cursor.execute(
                     "DECLARE @r int; EXEC @r=sys.sp_getapplock @Resource=?, @LockMode='Exclusive', "
                     "@LockOwner='Transaction', @LockTimeout=15000; SELECT @r;",
                     lock,
                 )
-                if cursor.fetchone()[0] < 0:
+                lock_result = cursor.fetchone()[0]
+                if lock_result < 0:
+                    lock_outcome = "timeout"
                     raise StorageError("SQL coordination lock timed out")
+                lock_acquired_at = time.perf_counter()
+                lock_outcome = "held"
             yield cursor
-            connection.commit()
+            try:
+                close_cursor()
+            except Exception as close_error:
+                cursor_close_error = close_error
+                raise
+            commit_started = time.perf_counter()
+            try:
+                connection.commit()
+                if lock:
+                    lock_released_at = time.perf_counter()
+                    lock_outcome = "committed"
+            except Exception as exc:
+                if profile:
+                    log.error(
+                        "sql_profile commit failed request_id=%s thread=%s error_type=%s",
+                        REQUEST_ID.get(),
+                        threading.get_ident(),
+                        type(exc).__name__,
+                    )
+                raise
+            finally:
+                if profile:
+                    log.info(
+                        "sql_profile commit request_id=%s thread=%s duration_ms=%.1f",
+                        REQUEST_ID.get(),
+                        threading.get_ident(),
+                        (time.perf_counter() - commit_started) * 1000,
+                    )
         except BaseException as exc:
             if type(exc).__module__ == "pyodbc" and hasattr(connection, "invalidate"):
                 connection.invalidate()
+            if cursor_close_error is exc and hasattr(connection, "invalidate"):
+                connection.invalidate()
+            try:
+                close_cursor()
+            except Exception:
+                if hasattr(connection, "invalidate"):
+                    connection.invalidate()
+                log.exception("Azure SQL cursor close failed; connection discarded")
             try:
                 connection.rollback()
             except Exception as rollback_error:
-                log.error("Azure SQL rollback failed; connection discarded, no file fallback")
+                if lock:
+                    lock_outcome = "rollback_failed"
+                if hasattr(connection, "invalidate"):
+                    connection.invalidate()
+                log.exception("Azure SQL rollback failed; connection discarded, no file fallback")
                 raise StorageError("Authoritative SQL transaction rollback failed") from rollback_error
+            if lock and lock_released_at is None:
+                lock_released_at = time.perf_counter()
+                if lock_outcome == "held":
+                    lock_outcome = "rolled_back"
+                elif lock_outcome == "pending":
+                    lock_outcome = "failed"
+            if cursor_close_error is exc:
+                raise StorageError("Authoritative SQL cursor cleanup failed; no file fallback") from exc
             if type(exc).__module__ == "pyodbc":
                 raise StorageError("Authoritative Azure SQL transaction failed; no file fallback") from exc
             raise
         finally:
-            connection.close()
+            if profile and lock and lock_wait_started is not None:
+                completed_at = lock_released_at or time.perf_counter()
+                wait_ms = ((lock_acquired_at or completed_at) - lock_wait_started) * 1000
+                held_ms = (
+                    (lock_released_at - lock_acquired_at) * 1000
+                    if lock_acquired_at is not None and lock_released_at is not None
+                    else 0
+                )
+                log.info(
+                    "sql_profile applock request_id=%s thread=%s resource=%s wait_ms=%.1f "
+                    "held_ms=%.1f outcome=%s",
+                    REQUEST_ID.get(),
+                    threading.get_ident(),
+                    lock,
+                    wait_ms,
+                    held_ms,
+                    lock_outcome,
+                )
+            close_started = time.perf_counter()
+            try:
+                connection.close()
+            except Exception:
+                if profile:
+                    log.error(
+                        "sql_profile connection_return failed request_id=%s thread=%s",
+                        REQUEST_ID.get(),
+                        threading.get_ident(),
+                    )
+                raise
+            finally:
+                if profile:
+                    log.info(
+                        "sql_profile connection_return request_id=%s thread=%s duration_ms=%.1f",
+                        REQUEST_ID.get(),
+                        threading.get_ident(),
+                        (time.perf_counter() - close_started) * 1000,
+                    )
 
     def bootstrap(self) -> None:
         with self.transaction("privy.schema.v1") as cursor:
             cursor.execute(_SCHEMA)
+            cursor.execute(_READ_SCHEMA)
             cursor.execute("SELECT version FROM dbo.privy_schema")
             versions = [row[0] for row in cursor.fetchall()]
             if versions != [1]:
@@ -482,10 +809,9 @@ class SqlBackend:
             )
 
     def assert_owner_active(self, cursor) -> None:
-        if self._fenced or self._closed:
-            raise StorageError("this Azure SQL hub incarnation is no longer active")
+        self._assert_owner_current()
         cursor.execute(
-            "SELECT 1 FROM dbo.privy_coordination WHERE kind='hub' AND id=? "
+            "SELECT 1 FROM dbo.privy_coordination WITH (HOLDLOCK) WHERE kind='hub' AND id=? "
             "AND JSON_VALUE(payload,'$.active')='true'",
             self.owner,
         )
@@ -494,16 +820,30 @@ class SqlBackend:
             self._stop.set()
             raise StorageError("this Azure SQL hub incarnation was fenced; restart the hub")
 
+    def _assert_owner_current(self) -> None:
+        if self._fenced or self._closed:
+            raise StorageError("this Azure SQL hub incarnation is no longer active")
+
     def set_migration_status(self, status: dict[str, Any]) -> None:
         self._migration_status = dict(status)
 
     def check_config(self, name: str, payload: dict) -> None:
+        def normalized(value):
+            if name == "targets":
+                return {
+                    "targets": sorted(
+                        value["targets"],
+                        key=lambda target: (target["id"], target["namespace"], target["path"]),
+                    )
+                }
+            return value
+
         with self.transaction("privy.leases") as cursor:
             cursor.execute("SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id=?", name)
             row = cursor.fetchone()
             if row:
                 stored = json.loads(row[0])
-                if stored != payload:
+                if normalized(stored) != normalized(payload):
                     compatible = False
                     if name == "leases":
                         from privy.hub.leases import effective_lease_config
@@ -524,6 +864,12 @@ class SqlBackend:
                     json.dumps(payload, sort_keys=True),
                 )
 
+    def get_config(self, name: str) -> dict | None:
+        with self.transaction("privy.leases") as cursor:
+            cursor.execute("SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id=?", name)
+            row = cursor.fetchone()
+            return json.loads(row[0]) if row else None
+
     def enqueue(self, kind: str, key: str, payload: dict) -> None:
         self._enqueue(kind, key, payload)
 
@@ -531,6 +877,9 @@ class SqlBackend:
         if not kind or len(kind) > 32 or not key or len(key) > 400:
             raise StorageError("SQL record identity is invalid")
         result = self.outbox.append(kind, key, payload, self.owner)
+        read_model = getattr(self, "read_model", None)
+        if read_model is not None:
+            read_model.apply(kind, key, payload)
         self._wake.set()
         return result
 
@@ -544,8 +893,38 @@ class SqlBackend:
                 return
         raise StorageError("SQL synchronous write did not complete; retained in delivery journal")
 
+    def import_records(self, records: list[tuple[str, str, dict]]) -> set[tuple[str, str]]:
+        """Commit insert-only migration batches without competing with live delivery."""
+        if not records:
+            return set()
+        if len(records) > 500:
+            raise StorageError("SQL import batch must contain at most 500 records")
+        batch = {}
+        for kind, key, payload in records:
+            if kind not in ("job", "audit", "import") or not key or len(key) > 400:
+                raise StorageError("SQL import record identity is invalid")
+            at = payload.get("created_at", payload.get("at"))
+            if not isinstance(at, (int, float)) or not math.isfinite(at):
+                raise StorageError("SQL import record time must be finite")
+            batch[kind, key] = {
+                "kind": kind,
+                "id": key,
+                "payload": payload,
+                "owner": self.owner,
+                "at": at,
+                "target": payload.get("target"),
+                "lease_id": payload.get("lease_id"),
+                "client_id": payload.get("client_id"),
+            }
+        with self.transaction("privy.leases") as cursor:
+            self.assert_owner_active(cursor)
+            cursor.execute(_IMPORT_BATCH, json.dumps(list(batch.values()), ensure_ascii=True))
+            inserted = {(str(kind), str(key)) for kind, key in cursor.fetchall()}
+        return inserted
+
     def _drain(self) -> None:
         with self._flush_lock:
+            started = time.perf_counter()
             rows = self.outbox.pending(500)
             if not rows:
                 return
@@ -568,17 +947,107 @@ class SqlBackend:
                         "client_id": payload.get("client_id"),
                     }
                 )
-            with self.transaction("privy.leases") as cursor:
+            encoded = json.dumps(batch, ensure_ascii=True)
+            prepared = time.perf_counter()
+            with self.transaction() as cursor:
                 self.assert_owner_active(cursor)
-                cursor.execute(_FLUSH_BATCH, json.dumps(batch, ensure_ascii=True))
+                cursor.execute(_FLUSH_BATCH, encoded)
+            committed = time.perf_counter()
             self.outbox.ack_batch([row[0] for row in rows])
             self._last_error = None
+            if _profile_sql_enabled():
+                log.info(
+                    "sql_profile drain request_id=%s rows=%d prepare_ms=%.1f sql_ms=%.1f ack_ms=%.1f",
+                    REQUEST_ID.get(),
+                    len(rows),
+                    (prepared - started) * 1000,
+                    (committed - prepared) * 1000,
+                    (time.perf_counter() - committed) * 1000,
+                )
+
+    def read_changes(self, version: bytes, *, limit: int = 2000):
+        with self.transaction() as cursor:
+            # MIN_ACTIVE_ROWVERSION excludes uncommitted writes; advancing to
+            # @@DBTS could permanently miss an older transaction committing later.
+            cursor.execute("SELECT MIN_ACTIVE_ROWVERSION()")
+            upper = bytes(cursor.fetchone()[0])
+            cursor.execute(
+                "SELECT TOP (?) change_version,kind,id,payload FROM dbo.privy_records "
+                "WHERE kind<>'probe' AND kind<>'call' AND change_version>? AND change_version<? "
+                "ORDER BY change_version",
+                limit,
+                version,
+                upper,
+            )
+            rows = cursor.fetchall()
+        complete = len(rows) < limit
+        # The exclusive bound is the next possible committed version.
+        watermark = (int.from_bytes(upper, "big") - 1).to_bytes(8, "big") if complete else bytes(rows[-1][0])
+        return (
+            watermark,
+            [(str(kind), str(key), json.loads(payload)) for _, kind, key, payload in rows],
+            complete,
+        )
+
+    def read_record_keys(self):
+        with self.transaction() as cursor:
+            cursor.execute("SELECT kind,id FROM dbo.privy_records WHERE kind<>'probe' AND kind<>'call'")
+            return {(str(kind), str(key)) for kind, key in cursor.fetchall()}
+
+    def read_latest_probes(self):
+        with self.transaction() as cursor:
+            cursor.execute(
+                "WITH ranked AS (SELECT target,payload,ROW_NUMBER() OVER("
+                "PARTITION BY target ORDER BY at DESC,id DESC) AS n FROM dbo.privy_records WHERE kind='probe') "
+                "SELECT target,payload FROM ranked WHERE n=1"
+            )
+            return {str(target): json.loads(payload) for target, payload in cursor.fetchall()}
+
+    def read_output_snapshot(self, job_id: str):
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT COALESCE(TRY_CONVERT(bigint,JSON_VALUE(payload,'$.stdout_bytes')),0),"
+                "COALESCE(TRY_CONVERT(bigint,JSON_VALUE(payload,'$.stderr_bytes')),0),"
+                "COALESCE(TRY_CONVERT(bigint,JSON_VALUE(payload,'$.chunk_count')),0) "
+                "FROM dbo.privy_records WHERE kind='job' AND id=?; "
+                "WITH tail AS (SELECT TOP (4096) chunk_index,payload FROM dbo.privy_output "
+                "WHERE job_id=? ORDER BY chunk_index DESC), bounded AS ("
+                "SELECT chunk_index,payload,SUM(CONVERT(bigint,DATALENGTH(payload))) OVER("
+                "ORDER BY chunk_index DESC ROWS UNBOUNDED PRECEDING) AS bytes,"
+                "ROW_NUMBER() OVER(ORDER BY chunk_index DESC) AS n FROM tail) "
+                "SELECT payload FROM bounded WHERE bytes<=8388608 OR n=1 ORDER BY chunk_index",
+                job_id,
+                job_id,
+            )
+            metadata = cursor.fetchone()
+            if metadata is None or not cursor.nextset():
+                raise StorageError("SQL output snapshot metadata is unavailable")
+            rows = [json.loads(row[0]) for row in cursor.fetchall()]
+            if cursor.nextset():
+                raise StorageError("SQL output snapshot returned an unexpected result-set count")
+        return {
+            "rows": sorted(rows, key=lambda row: row["index"]),
+            "sizes": {"stdout": int(metadata[0]), "stderr": int(metadata[1]), "chunks": int(metadata[2])},
+        }
 
     def get(self, kind: str, key: str) -> dict | None:
         with self.transaction() as cursor:
             cursor.execute("SELECT payload FROM dbo.privy_records WHERE kind=? AND id=?", kind, key)
             row = cursor.fetchone()
             return json.loads(row[0]) if row else None
+
+    def get_many(self, kind: str, keys: list[str]) -> dict[str, dict]:
+        unique_keys = list(dict.fromkeys(keys))
+        if not unique_keys:
+            return {}
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT id,payload FROM dbo.privy_records WHERE kind=? "
+                "AND id IN (SELECT value FROM OPENJSON(?))",
+                kind,
+                json.dumps(unique_keys, ensure_ascii=True),
+            )
+            return {str(key): json.loads(payload) for key, payload in cursor.fetchall()}
 
     def list(
         self,
@@ -590,9 +1059,12 @@ class SqlBackend:
         target: str | None = None,
         lease_id: str | None = None,
         client_id: str | None = None,
+        states: set[str] | frozenset[str] | None = None,
     ) -> list[dict]:
         if not 1 <= limit <= 100_000:
             raise StorageError("SQL page size must be between 1 and 100000")
+        if states is not None and not states:
+            return []
         clauses, params = ["kind=?"], [kind]
         for column, value in (("target", target), ("lease_id", lease_id), ("client_id", client_id)):
             if value is not None:
@@ -604,6 +1076,10 @@ class SqlBackend:
         if after is not None:
             clauses.append("at>=?")
             params.append(after)
+        if states is not None:
+            state_values = tuple(sorted(states))
+            clauses.append("JSON_VALUE(payload,'$.state') IN (" + ",".join("?" for _ in state_values) + ")")
+            params.extend(state_values)
         with self.transaction() as cursor:
             cursor.execute(
                 f"SELECT TOP (?) payload FROM dbo.privy_records WHERE {' AND '.join(clauses)} ORDER BY at DESC,id DESC",
@@ -611,6 +1087,60 @@ class SqlBackend:
                 *params,
             )
             return [json.loads(row[0]) for row in cursor.fetchall()]
+
+    def count_jobs_by_target(self, *, lease_id: str | None = None) -> dict[str, int]:
+        clauses = ["kind='job'", "target IS NOT NULL"]
+        params = []
+        if lease_id is not None:
+            clauses.append("lease_id=?")
+            params.append(lease_id)
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT target,COUNT_BIG(*) FROM dbo.privy_records WHERE "
+                + " AND ".join(clauses)
+                + " GROUP BY target",
+                *params,
+            )
+            return {str(row[0]): int(row[1]) for row in cursor.fetchall() if row[0] is not None}
+
+    def count_jobs_by_lease(self) -> dict[str, int]:
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT lease_id,COUNT_BIG(*) FROM dbo.privy_records "
+                "WHERE kind='job' AND lease_id IS NOT NULL AND lease_id<>'' GROUP BY lease_id"
+            )
+            return {str(row[0]): int(row[1]) for row in cursor.fetchall() if row[0] is not None}
+
+    def count_job_records(
+        self,
+        *,
+        lease_id: str | None = None,
+        states: set[str] | frozenset[str] | None = None,
+        after: float | None = None,
+        before: float | None = None,
+    ) -> int:
+        if states is not None and not states:
+            return 0
+        clauses, params = ["kind='job'"], []
+        if lease_id is not None:
+            clauses.append("lease_id=?")
+            params.append(lease_id)
+        if after is not None:
+            clauses.append("at>=?")
+            params.append(after)
+        if before is not None:
+            clauses.append("at<?")
+            params.append(before)
+        if states is not None:
+            state_values = tuple(sorted(states))
+            clauses.append("JSON_VALUE(payload,'$.state') IN (" + ",".join("?" for _ in state_values) + ")")
+            params.extend(state_values)
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT COUNT_BIG(*) FROM dbo.privy_records WHERE " + " AND ".join(clauses),
+                *params,
+            )
+            return int(cursor.fetchone()[0])
 
     def count_jobs(self) -> dict:
         with self.transaction() as cursor:
@@ -624,7 +1154,336 @@ class SqlBackend:
                 "retained": sum(counts.values()),
             }
 
+    def probe_history(self, *, after=None, before=None):
+        clauses = ["kind='probe'"]
+        params = []
+        if after is not None:
+            clauses.append("at>=?")
+            params.append(after)
+        if before is not None:
+            clauses.append("at<?")
+            params.append(before)
+        with self.transaction() as cursor:
+            cursor.execute(
+                "SELECT target,at,id,probe_status,probe_latency_ms "
+                "FROM dbo.privy_records WHERE " + " AND ".join(clauses),
+                *params,
+            )
+            rows = cursor.fetchall()
+            latest = {}
+            for target, at, key, *_ in rows:
+                candidate = (float(at), str(key))
+                if target not in latest or candidate > latest[target]:
+                    latest[target] = candidate
+            latest_ids = [key for _, key in latest.values()]
+            payloads = {}
+            if latest_ids:
+                cursor.execute(
+                    "SELECT id,payload FROM dbo.privy_records WHERE kind='probe' "
+                    "AND id IN (SELECT value FROM OPENJSON(?))",
+                    json.dumps(latest_ids),
+                )
+                payload_rows = cursor.fetchall()
+                decode_started = time.perf_counter()
+                payloads = {str(key): json.loads(payload) for key, payload in payload_rows}
+                if _profile_sql_enabled():
+                    log.info(
+                        "sql_profile record_decode thread=%s kind=probe_latest rows=%d duration_ms=%.1f",
+                        threading.get_ident(),
+                        len(payload_rows),
+                        (time.perf_counter() - decode_started) * 1000,
+                    )
+
+        decode_started = time.perf_counter()
+        result = []
+        for target, at, key, status, latency_ms in rows:
+            row = {
+                "target": target,
+                "at": float(at),
+                "status": status,
+                "latency_ms": latency_ms,
+            }
+            if latest.get(target) == (float(at), str(key)) and str(key) in payloads:
+                row.update(payloads[str(key)])
+            result.append(row)
+        if _profile_sql_enabled():
+            log.info(
+                "sql_profile record_decode thread=%s kind=probe rows=%d latest_payloads=%d duration_ms=%.1f",
+                threading.get_ident(),
+                len(rows),
+                len(payloads),
+                (time.perf_counter() - decode_started) * 1000,
+            )
+        return result
+
+    def report_history(self, *, after=None, before=None):
+        """Read all dashboard history on one fresh connection and transaction."""
+        started = time.perf_counter()
+
+        def query(kind):
+            if kind == "probe":
+                clauses, params = ["kind='probe'"], []
+            else:
+                clauses, params = ["kind=?"], [kind]
+            if after is not None:
+                clauses.append("at>=?")
+                params.append(after)
+            if before is not None:
+                clauses.append("at<?")
+                params.append(before)
+            return " AND ".join(clauses), params
+
+        decoded = {}
+        with self.transaction() as cursor:
+
+            def execute_batch(statements, params):
+                cursor.execute(";\n".join(statements), *params)
+                result_sets = []
+                for index in range(len(statements)):
+                    result_sets.append(cursor.fetchall())
+                    has_next = bool(cursor.nextset())
+                    if has_next != (index + 1 < len(statements)):
+                        raise StorageError("Azure SQL report history returned an unexpected result-set count")
+                return result_sets
+
+            job_where, job_params = query("job")
+            purpose_where, purpose_params = query("purpose")
+            latest_before_sql = (
+                "WITH ranked AS (SELECT payload,ROW_NUMBER() OVER(PARTITION BY kind,target "
+                "ORDER BY at DESC,id DESC) AS n FROM dbo.privy_records "
+                "WHERE kind IN('job','purpose') AND at<?) SELECT payload FROM ranked WHERE n=1"
+            )
+            latest_before_params = [after] if after is not None else []
+            if after is None:
+                latest_before_sql = "SELECT payload FROM dbo.privy_records WHERE 1=0"
+            where, params = query("probe")
+            probe_sql = f"""
+                WITH summary AS (
+                    SELECT target,COUNT_BIG(*) AS sample_count,
+                        SUM(CONVERT(bigint,CASE WHEN probe_status='online' THEN 1 ELSE 0 END)) AS online_count,
+                        MAX(CASE WHEN probe_status='online' THEN at END) AS last_online,
+                        MIN(at) AS earliest_at
+                    FROM dbo.privy_records WHERE {where}
+                    GROUP BY target
+                )
+                SELECT summary.target,summary.sample_count,summary.online_count,
+                    summary.last_online,summary.earliest_at,latest.at,latest.payload,
+                    latest.probe_status,latest.probe_latency_ms
+                FROM summary
+                CROSS APPLY (
+                    SELECT TOP(1) p.at,p.payload,p.probe_status,p.probe_latency_ms
+                    FROM dbo.privy_records p
+                    WHERE {where} AND p.target=summary.target
+                    ORDER BY p.at DESC,p.id DESC
+                ) latest
+                """
+            status_where, status_params = query("probe")
+            status_sql = f"""
+                WITH ordered AS (
+                    SELECT target,at,id,probe_status,
+                        ROW_NUMBER() OVER(PARTITION BY target ORDER BY at,id) AS sample_rank,
+                        LAG(probe_status) OVER(PARTITION BY target ORDER BY at,id) AS previous_status
+                    FROM dbo.privy_records WHERE {status_where}
+                ), changed AS (
+                    SELECT *,CASE WHEN sample_rank=1
+                        OR (previous_status IS NULL AND probe_status IS NOT NULL)
+                        OR (previous_status IS NOT NULL AND probe_status IS NULL)
+                        OR previous_status<>probe_status THEN 1 ELSE 0 END AS status_changed
+                    FROM ordered
+                )
+                SELECT target,MAX(at),MAX(CASE WHEN sample_rank=1 THEN 1 ELSE 0 END)
+                FROM changed WHERE status_changed=1 GROUP BY target
+            """
+            target_where, target_params = query("probe")
+            target_where += " AND probe_status='online' AND probe_latency_ms IS NOT NULL"
+            target_p50_sql = f"""
+                WITH counts AS (
+                    SELECT target,COUNT_BIG(*) AS sample_count
+                    FROM dbo.privy_records WHERE {target_where}
+                    GROUP BY target
+                ), ranked AS (
+                    SELECT p.target,p.probe_latency_ms,
+                        ROW_NUMBER() OVER(PARTITION BY p.target ORDER BY p.probe_latency_ms,p.at,p.id) AS sample_rank,
+                        counts.sample_count
+                    FROM dbo.privy_records p
+                    JOIN counts ON counts.target=p.target
+                    WHERE {target_where}
+                )
+                SELECT target,MAX(probe_latency_ms)
+                FROM ranked
+                WHERE sample_rank=(sample_count-1)/2 +
+                    CASE WHEN (sample_count-1)%2=1
+                        AND ((sample_count-1)/2)%2=1 THEN 1 ELSE 0 END + 1
+                GROUP BY target
+            """
+            overall_where, overall_params = query("probe")
+            overall_where += " AND probe_status='online' AND probe_latency_ms IS NOT NULL"
+            overall_sql = f"""
+                WITH counts AS (
+                    SELECT COUNT_BIG(*) AS sample_count
+                    FROM dbo.privy_records WHERE {overall_where}
+                    HAVING COUNT_BIG(*) > 0
+                )
+                SELECT p50.probe_latency_ms,p95.probe_latency_ms
+                FROM counts
+                CROSS APPLY (
+                    SELECT probe_latency_ms FROM dbo.privy_records
+                    WHERE {overall_where}
+                        AND probe_status='online' AND probe_latency_ms IS NOT NULL
+                    ORDER BY probe_latency_ms,target,at,id
+                    OFFSET (counts.sample_count-1)/2 +
+                        CASE WHEN (counts.sample_count-1)%2=1
+                            AND ((counts.sample_count-1)/2)%2=1 THEN 1 ELSE 0 END ROWS
+                    FETCH NEXT 1 ROWS ONLY
+                ) p50
+                CROSS APPLY (
+                    SELECT probe_latency_ms FROM dbo.privy_records
+                    WHERE {overall_where}
+                        AND probe_status='online' AND probe_latency_ms IS NOT NULL
+                    ORDER BY probe_latency_ms,target,at,id
+                    OFFSET ((counts.sample_count-1)*19)/20 +
+                        CASE WHEN ((counts.sample_count-1)*19)%20>10
+                            OR (((counts.sample_count-1)*19)%20=10
+                                AND (((counts.sample_count-1)*19)/20)%2=1)
+                            THEN 1 ELSE 0 END ROWS
+                    FETCH NEXT 1 ROWS ONLY
+                ) p95
+            """
+            call_where, call_params = query("call")
+            calls_sql = (
+                "SELECT JSON_VALUE(payload,'$.surface'),COUNT_BIG(*),"
+                "SUM(CASE WHEN TRY_CONVERT(int,JSON_VALUE(payload,'$.status'))>=400 THEN 1 ELSE 0 END),"
+                f"MIN(at) FROM dbo.privy_records WHERE {call_where} "
+                "GROUP BY JSON_VALUE(payload,'$.surface')"
+            )
+            job_counts_sql = (
+                "SELECT JSON_VALUE(payload,'$.state'),COUNT_BIG(*) "
+                "FROM dbo.privy_records WHERE kind='job' GROUP BY JSON_VALUE(payload,'$.state')"
+            )
+            (
+                job_rows,
+                purpose_rows,
+                latest_before_rows,
+                probe_rows,
+                status_result,
+                target_p50_result,
+                overall_result,
+                call_rows,
+                job_count_rows,
+            ) = execute_batch(
+                [
+                    f"SELECT payload FROM dbo.privy_records WHERE {job_where}",
+                    f"SELECT payload FROM dbo.privy_records WHERE {purpose_where}",
+                    latest_before_sql,
+                    probe_sql,
+                    status_sql,
+                    target_p50_sql,
+                    overall_sql,
+                    calls_sql,
+                    job_counts_sql,
+                ],
+                [
+                    *job_params,
+                    *purpose_params,
+                    *latest_before_params,
+                    *params,
+                    *params,
+                    *status_params,
+                    *target_params,
+                    *target_params,
+                    *overall_params,
+                    *overall_params,
+                    *overall_params,
+                    *call_params,
+                ],
+            )
+        for name, kind, rows in (
+            ("jobs", "job", job_rows),
+            ("purposes", "purpose", purpose_rows),
+        ):
+            decode_started = time.perf_counter()
+            decoded[name] = [json.loads(row[0]) for row in rows]
+            if _profile_sql_enabled():
+                log.info(
+                    "sql_profile record_decode thread=%s kind=%s rows=%d duration_ms=%.1f",
+                    threading.get_ident(),
+                    kind,
+                    len(rows),
+                    (time.perf_counter() - decode_started) * 1000,
+                )
+        decoded["latest_before"] = [json.loads(row[0]) for row in latest_before_rows]
+        status_rows = {str(target): (float(since), bool(first)) for target, since, first in status_result}
+        latency_by_target = {
+            str(target): float(p50) if p50 is not None else None for target, p50 in target_p50_result
+        }
+        overall_row = overall_result[0] if overall_result else None
+        overall_p50, overall_p95 = overall_row if overall_row is not None else (None, None)
+        overall_p50 = float(overall_p50) if overall_p50 is not None else None
+        overall_p95 = float(overall_p95) if overall_p95 is not None else None
+        counts = {row[0]: int(row[1]) for row in job_count_rows}
+
+        by_target = {}
+        decoded["probes"] = []
+        sample_count = 0
+        for row in probe_rows:
+            target = str(row[0])
+            stats = {
+                "samples": int(row[1]),
+                "online": int(row[2]),
+                "latency_p50_ms": latency_by_target.get(target),
+                "last_online": float(row[3]) if row[3] is not None else None,
+                "earliest_at": float(row[4]),
+                "status_since": status_rows.get(target, (float(row[4]), True))[0],
+                "status_since_first_check": status_rows.get(target, (float(row[4]), True))[1],
+            }
+            by_target[target] = stats
+            sample_count += stats["samples"]
+            latest = json.loads(row[6])
+            latest.update(target=target, at=float(row[5]), status=row[7], latency_ms=row[8])
+            decoded["probes"].append(latest)
+
+        decoded["probe_stats"] = {
+            "by_target": by_target,
+            "samples": sample_count,
+            "latency_p50_ms": overall_p50,
+            "latency_p95_ms": overall_p95,
+        }
+        call_stats = {"total": 0, "by_surface": {}, "errors": 0, "earliest_at": None}
+        for surface, count, errors, earliest_at in call_rows:
+            count, errors = int(count), int(errors or 0)
+            call_stats["total"] += count
+            call_stats["by_surface"][surface] = count
+            call_stats["errors"] += errors
+            if earliest_at is not None:
+                first = float(earliest_at)
+                if call_stats["earliest_at"] is None or first < call_stats["earliest_at"]:
+                    call_stats["earliest_at"] = first
+        decoded["call_stats"] = call_stats
+        decoded["calls"] = []
+
+        decoded["job_counts"] = {
+            "queued": counts.get("queued", 0),
+            "running": counts.get("running", 0),
+            "retained": sum(counts.values()),
+        }
+
+        if _profile_sql_enabled():
+            log.info(
+                "sql_profile report_history thread=%s duration_ms=%.1f jobs=%d purposes=%d "
+                "probe_samples=%d probe_targets=%d calls=%d latest_before=%d",
+                threading.get_ident(),
+                (time.perf_counter() - started) * 1000,
+                len(decoded["jobs"]),
+                len(decoded["purposes"]),
+                decoded["probe_stats"]["samples"],
+                len(decoded["probes"]),
+                decoded["call_stats"]["total"],
+                len(decoded["latest_before"]),
+            )
+        return decoded
+
     def scan(self, kind: str, *, before=None, after=None, target=None, lease_id=None, client_id=None):
+        page_size = 5000
         clauses, params = ["kind=?"], [kind]
         for column, value in (("target", target), ("lease_id", lease_id), ("client_id", client_id)):
             if value is not None:
@@ -645,13 +1504,23 @@ class SqlBackend:
                 page_params.extend((at, at, key))
             with self.transaction() as cursor:
                 cursor.execute(
-                    f"SELECT TOP (1000) at,id,payload FROM dbo.privy_records "
+                    f"SELECT TOP ({page_size}) at,id,payload FROM dbo.privy_records "
                     f"WHERE {' AND '.join(page_clauses)} ORDER BY at DESC,id DESC",
                     *page_params,
                 )
                 page = cursor.fetchall()
-            yield from (json.loads(row[2]) for row in page)
-            if len(page) < 1000:
+            decode_started = time.perf_counter()
+            decoded = [json.loads(row[2]) for row in page]
+            if _profile_sql_enabled():
+                log.info(
+                    "sql_profile record_decode thread=%s kind=%s rows=%d duration_ms=%.1f",
+                    threading.get_ident(),
+                    kind,
+                    len(decoded),
+                    (time.perf_counter() - decode_started) * 1000,
+                )
+            yield from decoded
+            if len(page) < page_size:
                 return
             boundary = page[-1][0], page[-1][1]
 
@@ -686,6 +1555,97 @@ class SqlBackend:
             )
             return [json.loads(row[0]) for row in cursor.fetchall()]
 
+    def read_view_output(self, job_id: str, ranges) -> tuple[dict[str, int], dict[str, list[dict]]]:
+        selected = tuple(ranges)
+        if any(stream not in ("stdout", "stderr") for stream in selected):
+            raise ValueError("output streams must be stdout or stderr")
+        if not selected:
+            return {}, {}
+        values, params = [], []
+        for stream, (offset, total, limit) in ranges.items():
+            values.append("(?,CAST(? AS bigint),CAST(? AS bigint),CAST(? AS bigint))")
+            params.extend((stream, offset, total, max(0, limit)))
+        # Materialize offsets once so a concurrent claim cannot change the
+        # range between the cursor result and the output result.
+        query = (
+            "SET NOCOUNT ON; DECLARE @ranges TABLE(stream varchar(6),offset bigint,total bigint,lim bigint); "
+            "INSERT @ranges SELECT r.stream,COALESCE(r.offset,c.offset,0),r.total,r.lim "
+            f"FROM (VALUES {','.join(values)}) r(stream,offset,total,lim) "
+            "LEFT JOIN dbo.privy_cursors c ON c.job_id=? AND c.stream=r.stream AND r.offset IS NULL; "
+            "SELECT stream,offset FROM @ranges; "
+            "SELECT o.stream,o.payload FROM @ranges r "
+            "CROSS APPLY (SELECT CASE WHEN r.offset<0 THEN 0 WHEN r.offset>r.total THEN r.total "
+            "ELSE r.offset END AS begin_offset) b "
+            "JOIN dbo.privy_output o ON o.job_id=? AND o.stream=r.stream "
+            "AND o.end_offset>b.begin_offset AND o.start_offset<b.begin_offset+r.lim "
+            "AND o.start_offset<r.total AND r.lim>0 ORDER BY o.stream,o.start_offset"
+        )
+        chunks = {stream: [] for stream in selected}
+        with self.transaction() as cursor:
+            cursor.execute(query, *params, job_id, job_id)
+            offsets = {str(row[0]): int(row[1]) for row in cursor.fetchall()}
+            cursor.nextset()
+            for stream, payload in cursor.fetchall():
+                chunks[str(stream)].append(json.loads(payload))
+        return offsets, chunks
+
+    def advance_cursors(self, job_id: str, ends: dict[str, int]) -> dict[str, int]:
+        if any(stream not in ("stdout", "stderr") or end <= 0 for stream, end in ends.items()):
+            raise ValueError("cursor claims require stdout or stderr and positive ends")
+        if not ends:
+            return {}
+        statements, params = [], []
+        # All callers lock streams in the same order, including missing keys.
+        for stream in sorted(ends):
+            statements.append(
+                "SET @previous=NULL; "
+                "SELECT @previous=offset FROM dbo.privy_cursors WITH(UPDLOCK,HOLDLOCK) "
+                "WHERE job_id=? AND stream=?; "
+                "IF @previous IS NULL INSERT dbo.privy_cursors(job_id,stream,offset) VALUES(?,?,?); "
+                "ELSE UPDATE dbo.privy_cursors SET offset=CASE WHEN offset<? THEN ? ELSE offset END,"
+                "updated=SYSUTCDATETIME() WHERE job_id=? AND stream=?; "
+                "INSERT @claims VALUES(?,COALESCE(@previous,0)); "
+            )
+            params.extend(
+                (
+                    job_id,
+                    stream,
+                    job_id,
+                    stream,
+                    ends[stream],
+                    ends[stream],
+                    ends[stream],
+                    job_id,
+                    stream,
+                    stream,
+                )
+            )
+        query = (
+            "SET NOCOUNT ON; DECLARE @previous bigint; DECLARE @claims TABLE(stream varchar(6),offset bigint); "
+            + "".join(statements)
+            + "SELECT stream,offset FROM @claims"
+        )
+        with self.transaction() as cursor:
+            cursor.execute(query, *params)
+            return {str(row[0]): int(row[1]) for row in cursor.fetchall()}
+
+    def read_cursors(self, job_id: str, streams) -> dict[str, int]:
+        selected = tuple(dict.fromkeys(streams))
+        if any(stream not in ("stdout", "stderr") for stream in selected):
+            raise ValueError("cursor streams must be stdout or stderr")
+        offsets = dict.fromkeys(selected, 0)
+        if not selected:
+            return offsets
+        placeholders = ",".join("?" for _ in selected)
+        with self.transaction() as cursor:
+            cursor.execute(
+                f"SELECT stream,offset FROM dbo.privy_cursors WHERE job_id=? AND stream IN ({placeholders})",
+                job_id,
+                *selected,
+            )
+            offsets.update({str(row[0]): int(row[1]) for row in cursor.fetchall()})
+        return offsets
+
     def pieces(self, job_id: str, index: int, limit: int = 200) -> list[dict]:
         with self.transaction() as cursor:
             cursor.execute(
@@ -697,6 +1657,15 @@ class SqlBackend:
             return [json.loads(row[0]) for row in cursor.fetchall()]
 
     def advance_cursor(self, job_id: str, stream: str, end: int) -> int:
+        if end == 0:
+            with self.transaction() as cursor:
+                cursor.execute(
+                    "SELECT offset FROM dbo.privy_cursors WHERE job_id=? AND stream=?",
+                    job_id,
+                    stream,
+                )
+                row = cursor.fetchone()
+                return int(row[0]) if row else 0
         with self.transaction() as cursor:
             cursor.execute(
                 "SELECT offset FROM dbo.privy_cursors WITH(UPDLOCK,HOLDLOCK) WHERE job_id=? AND stream=?",
@@ -797,9 +1766,7 @@ class SqlBackend:
             log.warning("Could not mark Azure SQL hub incarnation stopped; heartbeat will expire")
 
     def owner_is_stale(self, owner: str) -> bool:
-        if owner == "unresolved-file-import":
-            return True
-        if not owner or len(owner) > 64:
+        if not owner or owner == "unresolved-file-import" or len(owner) > 64:
             return False
         with self.transaction() as cursor:
             cursor.execute(
@@ -811,7 +1778,7 @@ class SqlBackend:
             row = cursor.fetchone()
             return bool(row and row[0])
 
-    def existing(self, kind: str, keys: list[str], *, batch_size: int = 1000) -> set[str]:
+    def existing(self, kind: str, keys: list[str], *, batch_size: int = 10000) -> set[str]:
         existing = set()
         for start in range(0, len(keys), batch_size):
             batch = keys[start : start + batch_size]
@@ -824,57 +1791,68 @@ class SqlBackend:
                 existing.update(row[0] for row in cursor.fetchall())
         return existing
 
-    def collect(self, batch: int = 500) -> dict:
+    def collect(self, batch: int = 100) -> dict:
         if not 1 <= batch <= 1000:
             raise StorageError("GC batch must be between 1 and 1000")
-        counts = {}
-        with self.transaction("privy.gc") as cursor:
-            cursor.execute(
-                "DECLARE @r int; EXEC @r=sys.sp_getapplock @Resource='privy.leases', @LockMode='Exclusive', "
-                "@LockOwner='Transaction', @LockTimeout=15000; SELECT @r;"
-            )
-            if cursor.fetchone()[0] < 0:
-                raise StorageError("SQL lease cleanup coordination lock timed out")
-            # Never collect a running/queued job, its output, or its control records.
-            cursor.execute("DROP TABLE IF EXISTS #expired; CREATE TABLE #expired(id nvarchar(400) NOT NULL)")
-            cursor.execute(
-                "INSERT #expired SELECT TOP (?) r.id FROM dbo.privy_records r WHERE r.kind='job' "
-                "AND r.at < DATEDIFF_BIG(second,'1970-01-01',SYSUTCDATETIME())-604800 "
-                "AND JSON_VALUE(r.payload,'$.state') IN ('succeeded','failed','timed_out','cancelled','error') "
-                "AND NOT EXISTS(SELECT 1 FROM dbo.privy_coordination c CROSS APPLY OPENJSON(c.payload,'$.running_jobs') pin "
-                "WHERE (c.kind='lease' AND pin.value=r.id) OR (c.kind='use' AND pin.[key] COLLATE DATABASE_DEFAULT=r.id)) ORDER BY r.at",
-                batch,
-            )
-            cursor.execute(
-                "DELETE TOP (?) FROM dbo.privy_output WHERE job_id IN(SELECT id FROM #expired)", batch
-            )
-            counts["output"] = cursor.rowcount
-            cursor.execute("DELETE FROM #expired WHERE id IN(SELECT job_id FROM dbo.privy_output)")
-            cursor.execute("DELETE FROM dbo.privy_cursors WHERE job_id IN(SELECT id FROM #expired)")
-            cursor.execute("DELETE FROM dbo.privy_cancels WHERE job_id IN(SELECT id FROM #expired)")
-            cursor.execute(
-                "DELETE FROM dbo.privy_records WHERE kind='job' AND id IN(SELECT id FROM #expired)"
-            )
-            counts["jobs"] = cursor.rowcount
-            cursor.execute(
-                "DELETE TOP (?) r FROM dbo.privy_records r WHERE r.kind<>'job' "
-                "AND r.at<DATEDIFF_BIG(second,'1970-01-01',SYSUTCDATETIME())-604800 "
-                "AND NOT EXISTS(SELECT 1 FROM dbo.privy_records j WHERE j.kind='job' AND j.id=JSON_VALUE(r.payload,'$.job_id')) "
-                "AND NOT EXISTS(SELECT 1 FROM OPENJSON(r.payload,'$.job_ids') child JOIN dbo.privy_records j ON j.kind='job' AND j.id=child.value)",
-                batch,
-            )
-            counts["history"] = cursor.rowcount
-            cursor.execute(
-                "DELETE TOP (?) FROM dbo.privy_coordination WHERE kind='lease' AND updated<DATEADD(day,-7,SYSUTCDATETIME()) "
-                "AND JSON_VALUE(payload,'$.state')<>'active' AND JSON_QUERY(payload,'$.running_jobs')='[]'",
-                batch,
-            )
-            counts["leases"] = cursor.rowcount
-            cursor.execute(
-                "DELETE TOP (?) FROM dbo.privy_coordination WHERE kind='hub' AND updated<DATEADD(day,-7,SYSUTCDATETIME())",
-                batch,
-            )
-            cursor.execute("DROP TABLE #expired")
+        query = (
+            "DECLARE @batch int=?; "
+            "DECLARE @now datetime2=SYSUTCDATETIME(); "
+            "DECLARE @cutoff float=DATEDIFF_BIG(second,'1970-01-01',@now)-604800; "
+            "DECLARE @output int=0, @jobs int=0, @history int=0, @leases int=0; "
+            "IF EXISTS(SELECT 1 FROM dbo.privy_records WHERE kind='job' AND at<@cutoff) "
+            "OR EXISTS(SELECT 1 FROM dbo.privy_records WHERE kind<>'job' AND at<@cutoff) "
+            "OR EXISTS(SELECT 1 FROM dbo.privy_coordination WHERE kind IN ('lease','hub') "
+            "AND updated<DATEADD(day,-7,@now)) BEGIN "
+            "DECLARE @gc_lock int; "
+            "EXEC @gc_lock=sys.sp_getapplock @Resource='privy.gc', @LockMode='Exclusive', "
+            "@LockOwner='Transaction', @LockTimeout=0; "
+            "IF @gc_lock>=0 AND ( "
+            "EXISTS(SELECT 1 FROM dbo.privy_records WHERE kind='job' AND at<@cutoff) "
+            "OR EXISTS(SELECT 1 FROM dbo.privy_records WHERE kind<>'job' AND at<@cutoff) "
+            "OR EXISTS(SELECT 1 FROM dbo.privy_coordination WHERE kind IN ('lease','hub') "
+            "AND updated<DATEADD(day,-7,@now))) BEGIN "
+            "DECLARE @lease_lock int; "
+            "EXEC @lease_lock=sys.sp_getapplock @Resource='privy.leases', @LockMode='Exclusive', "
+            "@LockOwner='Transaction', @LockTimeout=0; "
+            "IF @lease_lock>=0 BEGIN "
+            "CREATE TABLE #expired(id nvarchar(400) NOT NULL PRIMARY KEY); "
+            "INSERT #expired SELECT TOP (@batch) r.id FROM dbo.privy_records r WHERE r.kind='job' "
+            "AND r.at<@cutoff "
+            "AND JSON_VALUE(r.payload,'$.state') IN ('succeeded','failed','timed_out','cancelled','error') "
+            "AND NOT EXISTS(SELECT 1 FROM dbo.privy_coordination c "
+            "CROSS APPLY OPENJSON(c.payload,'$.running_jobs') pin "
+            "WHERE (c.kind='lease' AND pin.value=r.id) "
+            "OR (c.kind='use' AND pin.[key] COLLATE DATABASE_DEFAULT=r.id)) ORDER BY r.at; "
+            "DELETE TOP (@batch) FROM dbo.privy_output WHERE job_id IN(SELECT id FROM #expired); "
+            "SET @output=@@ROWCOUNT; "
+            "DELETE e FROM #expired e WHERE EXISTS("
+            "SELECT 1 FROM dbo.privy_output o WHERE o.job_id=e.id); "
+            "DELETE FROM dbo.privy_cursors WHERE job_id IN(SELECT id FROM #expired); "
+            "DELETE FROM dbo.privy_cancels WHERE job_id IN(SELECT id FROM #expired); "
+            "DELETE FROM dbo.privy_records WHERE kind='job' AND id IN(SELECT id FROM #expired); "
+            "SET @jobs=@@ROWCOUNT; "
+            "DELETE TOP (@batch) r FROM dbo.privy_records r WHERE r.kind<>'job' AND r.at<@cutoff "
+            "AND NOT EXISTS(SELECT 1 FROM dbo.privy_records j WHERE j.kind='job' "
+            "AND j.id=JSON_VALUE(r.payload,'$.job_id')) "
+            "AND NOT EXISTS(SELECT 1 FROM OPENJSON(r.payload,'$.job_ids') child "
+            "JOIN dbo.privy_records j ON j.kind='job' AND j.id=child.value); "
+            "SET @history=@@ROWCOUNT; "
+            "DELETE TOP (@batch) FROM dbo.privy_coordination WHERE kind='lease' "
+            "AND updated<DATEADD(day,-7,@now) AND JSON_VALUE(payload,'$.state')<>'active' "
+            "AND JSON_QUERY(payload,'$.running_jobs')='[]'; "
+            "SET @leases=@@ROWCOUNT; "
+            "DELETE TOP (@batch) FROM dbo.privy_coordination WHERE kind='hub' "
+            "AND updated<DATEADD(day,-7,@now); "
+            "END END END; "
+            "SELECT @output,@jobs,@history,@leases;"
+        )
+        counts = {"output": 0, "jobs": 0, "history": 0, "leases": 0}
+        with self.transaction() as cursor:
+            cursor.execute(query, batch)
+            row = cursor.fetchone()
+            if row is None or len(row) != 4:
+                raise StorageError("SQL GC batch returned invalid deletion counts")
+            counts = dict(zip(counts, (int(value) for value in row)))
         return counts
 
     def flush(self, timeout: float = 10) -> bool:
@@ -884,8 +1862,9 @@ class SqlBackend:
                 return False
             try:
                 self._drain()
-            except Exception:
-                self._last_error = "SQL delivery unavailable; journal retained for replay"
+            except Exception as exc:
+                self._last_error = _delivery_failure(exc)
+                log.error("%s", self._last_error)
                 self._wake.set()
                 return False
         return True
@@ -912,29 +1891,73 @@ class SqlBackend:
                     self.collect()
                     maintenance = time.monotonic() + 30
                     self._last_error = None
-            except Exception:
+                if self.outbox.pending(1):
+                    continue
+            except Exception as exc:
                 if self._last_error is None:
-                    log.error("SQL delivery/maintenance failed; journal retained, no file leasing fallback")
-                self._last_error = "SQL delivery unavailable; journal retained for replay"
+                    self._last_error = _delivery_failure(exc)
+                    log.error("%s; no file leasing fallback", self._last_error)
+                else:
+                    self._last_error = _delivery_failure(exc)
                 self._stop.wait(1)
             self._wake.wait(0.25)
             self._wake.clear()
 
-    def close(self) -> None:
+    def stop_worker(self) -> None:
         self._stop.set()
         self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=35)
             if self._thread.is_alive():
-                raise StorageError("SQL delivery thread did not stop; journal remains open")
-        if not self.flush():
-            log.error("SQL journal has pending writes on shutdown; next start will replay them")
-        self.mark_stopped()
+                raise StorageError("SQL delivery thread did not stop; backend resources remain in use")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.stop_worker()
+
+        failures = []
+        read_model = getattr(self, "read_model", None)
+        if read_model is not None:
+            try:
+                read_model.close()
+            except Exception as exc:
+                failures.append(("read model", exc))
+                if not getattr(read_model, "closed", True):
+                    raise StorageError(
+                        "SQL read workers did not stop; backend resources remain in use"
+                    ) from exc
+
+        try:
+            if not self.flush():
+                log.error("SQL journal has pending writes on shutdown; next start will replay them")
+                failures.append(("journal flush", StorageError("pending writes will replay on next start")))
+        except Exception as exc:
+            failures.append(("journal flush", exc))
+            log.exception("SQL journal flush failed during shutdown; replay will be attempted on next start")
+        try:
+            self.mark_stopped()
+        except Exception as exc:
+            failures.append(("owner shutdown", exc))
+            log.exception("Could not mark SQL hub stopped during shutdown")
+
+        cleanup = (
+            ("outbox", self.outbox.close),
+            ("connection pool", self._connect.close if hasattr(self._connect, "close") else None),
+            ("home lock", self._home_lock.close),
+        )
+        for name, action in cleanup:
+            if action is None:
+                continue
+            try:
+                action()
+            except Exception as exc:
+                failures.append((name, exc))
+                log.exception("SQL backend %s cleanup failed", name)
         self._closed = True
-        self.outbox.close()
-        if hasattr(self._connect, "close"):
-            self._connect.close()
-        self._home_lock.close()
+        if failures:
+            summary = ", ".join(f"{name}: {type(exc).__name__}" for name, exc in failures)
+            raise StorageError(f"SQL backend shutdown completed with errors ({summary})") from failures[0][1]
 
 
 class SqlLeaseLock:
@@ -944,6 +1967,113 @@ class SqlLeaseLock:
         self.store, self.backend = store, backend
         self._lock = threading.RLock()
         self._local = threading.local()
+
+    def _read_snapshot(self, cursor: Any) -> dict[str, Any]:
+        assert_active = getattr(self.backend, "assert_owner_active", None)
+        assert_current = getattr(self.backend, "_assert_owner_current", None)
+        owner = getattr(self.backend, "owner", None)
+        if assert_current is not None:
+            assert_current()
+        elif assert_active is not None:
+            assert_active(cursor)
+        cursor.execute(
+            (
+                "SELECT CASE WHEN EXISTS(SELECT 1 FROM dbo.privy_coordination "
+                "WHERE kind='hub' AND id=? AND JSON_VALUE(payload,'$.active')='true') "
+                "THEN 1 ELSE 0 END;"
+                if owner is not None
+                else ""
+            )
+            + "SELECT DATEDIFF_BIG(millisecond,'1970-01-01',SYSUTCDATETIME())/1000.0;"
+            "SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id='targets';"
+            "SELECT kind,id,payload FROM dbo.privy_coordination "
+            "WHERE kind IN('client','lease','use') ORDER BY ordinal",
+            *((owner,) if owner is not None else ()),
+        )
+        now_row = cursor.fetchone()
+        if owner is not None:
+            if now_row is None:
+                raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
+            if not now_row[0]:
+                if assert_active is not None:
+                    assert_active(cursor)
+                raise StorageError("this Azure SQL hub incarnation was fenced; restart the hub")
+            if not cursor.nextset():
+                raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
+            now_row = cursor.fetchone()
+        if now_row is None or not cursor.nextset():
+            raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
+        now = float(now_row[0])
+        row = cursor.fetchone()
+        targets = {
+            "targets": [
+                {"id": target.id, "namespace": target.namespace, "path": target.path}
+                for target in self.store.registry.snapshot().targets
+            ]
+        }
+        if row is None or sorted(json.loads(row[0])["targets"], key=lambda t: t["id"]) != sorted(
+            targets["targets"], key=lambda t: t["id"]
+        ):
+            raise StorageError("Local target configuration changed or differs from shared SQL configuration")
+        if not cursor.nextset():
+            raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
+        records = {"client": {}, "lease": {}, "use": {}}
+        rows = cursor.fetchall()
+        decode_started = time.perf_counter()
+        for kind, key, raw in rows:
+            records[kind][key] = json.loads(raw)
+        if cursor.nextset():
+            raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
+        if _profile_sql_enabled():
+            log.info(
+                "sql_profile coordination_decode request_id=%s thread=%s rows=%d clients=%d leases=%d "
+                "uses=%d duration_ms=%.1f",
+                REQUEST_ID.get(),
+                threading.get_ident(),
+                len(rows),
+                len(records["client"]),
+                len(records["lease"]),
+                len(records["use"]),
+                (time.perf_counter() - decode_started) * 1000,
+            )
+        return {
+            "now": now,
+            "clients": records["client"],
+            "leases": records["lease"],
+            "uses": records["use"],
+        }
+
+    def _load_snapshot(self, cursor: Any) -> None:
+        snapshot = self._read_snapshot(cursor)
+        self._local.now = snapshot["now"]
+        self.store._clients = snapshot["clients"]
+        self.store._leases = snapshot["leases"]
+        self.store._uses = snapshot["uses"]
+        self._local.before = copy.deepcopy(
+            {
+                "client": snapshot["clients"],
+                "lease": snapshot["leases"],
+                "use": snapshot["uses"],
+            }
+        )
+
+    def _load_read_snapshot(self):
+        with self.backend.transaction(isolation_level="SERIALIZABLE") as cursor:
+            snapshot = self._read_snapshot(cursor)
+        snapshot["_read_at"] = time.monotonic()
+        return snapshot
+
+    @contextmanager
+    def read_snapshot(self):
+        """Return a detached SQL-time view; mutations never use this cache."""
+        model = getattr(self.backend, "read_model", None)
+        snapshot = (
+            model.reads.get(("coordination",), self._load_read_snapshot)
+            if model is not None
+            else self._load_read_snapshot()
+        )
+        snapshot["now"] += max(0, time.monotonic() - snapshot.pop("_read_at"))
+        yield snapshot
 
     def __enter__(self):
         self._lock.acquire()
@@ -957,35 +2087,15 @@ class SqlLeaseLock:
             cursor = transaction.__enter__()
             self._local.transaction = transaction
             self._local.cursor = cursor
-            assert_active = getattr(self.backend, "assert_owner_active", None)
-            if assert_active is not None:
-                assert_active(cursor)
-            cursor.execute("SELECT DATEDIFF_BIG(millisecond,'1970-01-01',SYSUTCDATETIME())/1000.0")
-            self._local.now = float(cursor.fetchone()[0])
-            cursor.execute("SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id='targets'")
-            row = cursor.fetchone()
-            targets = {
-                "targets": [
-                    {"id": t.id, "namespace": t.namespace, "path": t.path}
-                    for t in self.store.registry.snapshot().targets
-                ]
-            }
-            if row is None or json.loads(row[0]) != targets:
-                raise StorageError(
-                    "Local target configuration changed or differs from shared SQL configuration"
+            snapshot_started = time.perf_counter()
+            self._load_snapshot(cursor)
+            if _profile_sql_enabled():
+                log.info(
+                    "sql_profile lease_snapshot_materialize request_id=%s thread=%s duration_ms=%.1f",
+                    REQUEST_ID.get(),
+                    threading.get_ident(),
+                    (time.perf_counter() - snapshot_started) * 1000,
                 )
-            cursor.execute(
-                "SELECT kind,id,payload FROM dbo.privy_coordination WHERE kind IN('client','lease','use') ORDER BY ordinal"
-            )
-            state = {"client": {}, "lease": {}, "use": {}}
-            for kind, key, raw in cursor.fetchall():
-                state[kind][key] = json.loads(raw)
-            self.store._clients, self.store._leases, self.store._uses = (
-                state["client"],
-                state["lease"],
-                state["use"],
-            )
-            self._local.before = copy.deepcopy(state)
             return self
         except BaseException as exc:
             try:
@@ -1031,7 +2141,21 @@ class SqlLeaseLock:
                                 kind,
                                 key,
                             )
-            return self._local.transaction.__exit__(typ, value, trace)
+            result = self._local.transaction.__exit__(typ, value, trace)
+            model = getattr(self.backend, "read_model", None)
+            if typ is None and model is not None:
+                model.reads.publish(
+                    ("coordination",),
+                    {
+                        "clients": self.store._clients,
+                        "leases": self.store._leases,
+                        "uses": self.store._uses,
+                        "now": self._local.now,
+                        "_read_at": time.monotonic(),
+                    },
+                    self._load_read_snapshot,
+                )
+            return result
         except BaseException as exc:
             if typ is None:
                 self._local.transaction.__exit__(type(exc), exc, exc.__traceback__)

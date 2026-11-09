@@ -143,11 +143,25 @@ class LeaseStore:
         self._uses: dict[str, dict[str, Any]] = {}
         self._rules: list[tuple[dict[str, Any], re.Pattern[str]]] = []
         self.sql_backend = sql_backend
+        stored_config = sql_backend.get_config("leases") if sql_backend is not None else None
+        if stored_config is not None:
+            stored_config = copy.deepcopy(stored_config)
+            defaults = stored_config["defaults"]
+            for name in ("ttl", "max_ttl", "manual_max_ttl", "cooldown", "client_idle_expiry"):
+                if name + "_s" in defaults:
+                    defaults[name] = defaults.pop(name + "_s")
         if self.config_path is not None and not self.config_path.exists():
-            _write_private(self.config_path, DEFAULT_CONFIG)
+            _write_private(
+                self.config_path,
+                yaml.safe_dump(stored_config, sort_keys=False) if stored_config else DEFAULT_CONFIG,
+            )
         try:
-            text = self.config_path.read_text(encoding="utf-8-sig") if self.config_path else DEFAULT_CONFIG
-            self.config = yaml.safe_load(text)
+            text = (
+                (self.config_path.read_text(encoding="utf-8-sig") if self.config_path else DEFAULT_CONFIG)
+                if stored_config is None
+                else ""
+            )
+            self.config = stored_config if stored_config is not None else yaml.safe_load(text)
             self._validate_config()
         except (OSError, ValueError, TypeError, KeyError, yaml.YAMLError, re.error) as exc:
             raise ValueError(f"Invalid leases.yaml ({self.config_path or 'defaults'}): {exc}") from exc
@@ -256,10 +270,6 @@ class LeaseStore:
             self._leases = state["leases"]
             self._uses = state["last_use"]
             self._validate_state()
-            if any(lease["running_jobs"] and lease["state"] != "active" for lease in self._leases.values()):
-                raise StorageError(
-                    "File import has released/expired pinned jobs; verify remote completion before importing"
-                )
             imported = copy.deepcopy((self._clients, self._leases, self._uses))
         except (ValueError, KeyError, TypeError, LeaseError) as exc:
             raise ValueError(f"Invalid SQL import state ({path}): {exc}") from exc
@@ -268,23 +278,56 @@ class LeaseStore:
             cursor = self._lock._local.cursor
             cursor.execute("SELECT payload FROM dbo.privy_coordination WHERE kind='import' AND id=?", digest)
             if cursor.fetchone():
+                self._retire_import(path, digest)
                 return
+            aliases = {}
+            for key, payload in imported[0].items():
+                active_imports = any(
+                    lease_id not in self._leases
+                    and lease["client_id"] == key
+                    and (lease["state"] == "active" or lease["running_jobs"])
+                    for lease_id, lease in imported[1].items()
+                )
+                if (
+                    key in self._clients
+                    and self._clients[key].get("session_id") != payload.get("session_id")
+                    and active_imports
+                ):
+                    raise StorageError("Local active lease client identity differs from shared SQL identity")
+                matches = [
+                    client_id
+                    for client_id, client in self._clients.items()
+                    if payload.get("session_id") and client.get("session_id") == payload["session_id"]
+                ]
+                if len(matches) > 1:
+                    raise StorageError("Shared SQL contains ambiguous duplicate client sessions")
+                if matches and matches[0] != key:
+                    if active_imports:
+                        raise StorageError(
+                            "Local active lease has a different shared session owner; resolve ownership before importing"
+                        )
+                    aliases[key] = matches[0]
+            new_leases = []
             for current, source in zip((self._clients, self._leases, self._uses), imported):
                 for key, payload in source.items():
-                    if key in current and current[key] != payload:
-                        raise StorageError("Local lease-state import conflicts with shared SQL records")
-                    if current is self._clients and any(
-                        payload.get("session_id")
-                        and c.get("session_id") == payload["session_id"]
-                        and c["client_id"] != key
-                        for c in current.values()
-                    ):
-                        raise StorageError("Local client session import conflicts with shared SQL clients")
+                    if current is self._clients and key in aliases:
+                        continue
+                    if current is self._leases and key not in current:
+                        payload["client_id"] = aliases.get(payload["client_id"], payload["client_id"])
+                        new_leases.append(payload)
+                    if key in current:
+                        if current is self._uses and payload["at"] > current[key]["at"]:
+                            current[key] = payload
+                        continue
                     current[key] = payload
             self._validate_state()
             # File-owned pins are unresolved, not evidence that remote execution stopped.
-            for lease in self._leases.values():
+            for lease in new_leases:
                 if lease["running_jobs"]:
+                    if lease["state"] != "active":
+                        raise StorageError(
+                            "File import has released/expired pinned jobs; verify remote completion before importing"
+                        )
                     lease.setdefault("job_owners", {}).update(
                         (job, "unresolved-file-import") for job in lease["running_jobs"]
                     )
@@ -293,6 +336,18 @@ class LeaseStore:
                 digest,
                 json.dumps({"version": 1}),
             )
+        self._retire_import(path, digest)
+
+    @staticmethod
+    def _retire_import(path: Path, digest: str) -> None:
+        from privy.hub.sql_store import StorageError
+
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise StorageError("Legacy lease state changed before retirement; preserve it and retry startup")
+        snapshot = path.with_name(path.name + ".imported-snapshot")
+        if snapshot.exists():
+            snapshot = path.with_name(path.name + f".{digest}.imported-snapshot")
+        path.replace(snapshot)
 
     def _validate_config(self) -> None:
         config = self.config
@@ -436,32 +491,61 @@ class LeaseStore:
             raise LeaseError(f"unknown lease {lease_id!r}", status=404, code="unknown_lease")
         return lease
 
-    def _client_view(self, client: dict[str, Any]) -> dict[str, Any]:
+    def _client_view(
+        self,
+        client: dict[str, Any],
+        *,
+        snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        leases = snapshot["leases"] if snapshot is not None else self._leases
+        now = snapshot["now"] if snapshot is not None else None
         return {k: copy.deepcopy(v) for k, v in client.items() if not k.endswith("_ts")} | {
             "registered_at": utc_iso(client["registered_ts"]),
             "last_seen_at": utc_iso(client["last_seen_ts"]),
             "leases": [
                 item["lease_id"]
-                for item in self._leases.values()
-                if item["client_id"] == client["client_id"] and item["state"] == "active"
+                for item in leases.values()
+                if item["client_id"] == client["client_id"]
+                and item["state"] == "active"
+                and (snapshot is None or item["running_jobs"] or item["expires_ts"] > now)
             ],
         }
 
-    def _view(self, lease: dict[str, Any], *, events: bool = True) -> dict[str, Any]:
+    def _view(
+        self,
+        lease: dict[str, Any],
+        *,
+        events: bool = True,
+        snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         view = {
             k: copy.deepcopy(v)
             for k, v in lease.items()
             if not k.endswith("_ts") and k != "client_record" and (events or k != "events")
         }
+        uses = snapshot["uses"] if snapshot is not None else self._uses
+        use = uses.get(lease["group"], {})
+        last_used = lease.get("last_used_ts", 0)
+        if use.get("by", {}).get("lease_id") == lease["lease_id"]:
+            last_used = max(last_used, use.get("at", 0))
+        if "last_used_ts" not in lease:
+            for event in lease.get("events", []):
+                if event["event"] in ("pinned", "unpinned"):
+                    last_used = max(
+                        last_used, dt.datetime.fromisoformat(event["at"].replace("Z", "+00:00")).timestamp()
+                    )
         view.update(
+            last_use_known="last_used_ts" in lease or last_used > 0,
+            last_used_at=utc_iso(last_used) if last_used >= lease["acquired_ts"] else None,
             acquired_at=utc_iso(lease["acquired_ts"]),
             expires_at=utc_iso(lease["expires_ts"]),
             renewed_at=utc_iso(lease["renewed_ts"]),
             jobs_url=f"/v1/jobs?lease_id={lease['lease_id']}",
         )
-        client = self._clients.get(lease["client_id"])
+        clients = snapshot["clients"] if snapshot is not None else self._clients
+        client = clients.get(lease["client_id"])
         view["holder"] = (
-            self._client_view(client)
+            self._client_view(client, snapshot=snapshot)
             if client
             else {"client_id": lease["client_id"], "name": lease["holder_name"]}
         )
@@ -505,12 +589,22 @@ class LeaseStore:
             return {**self._client_view(client), "created": True}
 
     def list_clients(self, active: bool = False) -> list[dict[str, Any]]:
+        if getattr(self.sql_backend, "read_model", None) is not None:
+            with self._lock.read_snapshot() as snapshot:
+                views = [self._client_view(c, snapshot=snapshot) for c in snapshot["clients"].values()]
+                return [v for v in views if v["leases"]] if active else views
         with self._lock:
             self._sweep()
             views = [self._client_view(c) for c in self._clients.values()]
             return [v for v in views if v["leases"]] if active else views
 
     def get_client(self, client_id: str) -> dict[str, Any]:
+        if getattr(self.sql_backend, "read_model", None) is not None:
+            with self._lock.read_snapshot() as snapshot:
+                client = snapshot["clients"].get(client_id)
+                if client is None:
+                    raise LeaseError(f"unknown client {client_id!r}", status=404, code="unknown_client")
+                return self._client_view(client, snapshot=snapshot)
         with self._lock:
             self._sweep()
             return self._client_view(self._client(client_id))
@@ -557,14 +651,44 @@ class LeaseStore:
     def _latest(self, group: str) -> dict[str, Any] | None:
         return next((item for item in reversed(self._leases.values()) if item["group"] == group), None)
 
-    def _group_view(self, group: dict[str, Any], *, probe: bool = False) -> dict[str, Any]:
+    def _group_view(
+        self,
+        group: dict[str, Any],
+        *,
+        probe: bool = False,
+        snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         key = group["group"]
-        lease = self._active(key)
-        use = self._uses.get(key, {})
-        allocation = self._latest(key)
-        latest = allocation.get("expired_ts", 0) if allocation and allocation["state"] == "expired" else 0
+        leases = snapshot["leases"] if snapshot is not None else self._leases
+        uses = snapshot["uses"] if snapshot is not None else self._uses
+        now = snapshot["now"] if snapshot is not None else self._clock()
+        lease = next(
+            (
+                item
+                for item in leases.values()
+                if item["group"] == key
+                and item["state"] == "active"
+                and (item["running_jobs"] or item["expires_ts"] > now)
+            ),
+            None,
+        )
+        use = uses.get(key, {})
+        allocation = next(
+            (item for item in reversed(leases.values()) if item["group"] == key),
+            None,
+        )
+        expired_at = 0
+        if allocation:
+            if allocation["state"] == "expired":
+                expired_at = allocation.get("expired_ts", 0)
+            elif (
+                allocation["state"] == "active"
+                and not allocation["running_jobs"]
+                and allocation["expires_ts"] <= now
+            ):
+                expired_at = allocation["expires_ts"]
         released = allocation.get("released_ts", 0) if allocation and allocation["state"] == "released" else 0
-        last = max(use.get("at", 0), latest)
+        last = max(use.get("at", 0), expired_at)
         leasable = last + self.cooldown if last > released else 0
         online = True
         for layer in group["require_online"]:
@@ -578,29 +702,28 @@ class LeaseStore:
                 online = False
                 break
         state = (
-            "leased"
-            if lease
-            else "unavailable"
-            if not online
-            else "cooling"
-            if leasable > self._clock()
-            else "free"
+            "leased" if lease else "unavailable" if not online else "cooling" if leasable > now else "free"
         )
         if self.sql_backend is not None and use.get("running_jobs") and not lease:
             state = "unavailable"
         return {
             **copy.deepcopy(group),
             "state": state,
-            "lease": self._view(lease, events=False) if lease else None,
+            "lease": self._view(lease, events=False, snapshot=snapshot) if lease else None,
             "leasable_at": utc_iso(lease["expires_ts"] if lease else leasable)
             if (lease or leasable)
             else None,
             "last_used_at": utc_iso(use.get("at")),
             "last_used_by": use.get("by"),
-            "retry_after_s": max(0, int((lease["expires_ts"] if lease else leasable) - self._clock()) + 1),
+            "retry_after_s": max(0, int((lease["expires_ts"] if lease else leasable) - now) + 1),
         }
 
     def groups(self, *, probe: bool = False) -> list[dict[str, Any]]:
+        read_snapshot = getattr(self._lock, "read_snapshot", None)
+        if callable(read_snapshot):
+            with read_snapshot() as snapshot:
+                groups, _ = self._membership()
+                return [self._group_view(g, probe=probe, snapshot=snapshot) for g in groups.values()]
         with self._lock:
             self._sweep()
             groups, _ = self._membership()
@@ -619,6 +742,37 @@ class LeaseStore:
                 "lease_state": view["state"],
                 "leasable_at": view["leasable_at"],
             }
+
+    def target_summaries(self, target_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        requested = list(dict.fromkeys(target_ids))
+        if not requested:
+            return {}
+
+        def summarize(snapshot: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+            groups, targets = self._membership()
+            group_views: dict[str, dict[str, Any]] = {}
+            summaries: dict[str, dict[str, Any]] = {}
+            for target_id in requested:
+                key, layer = targets[target_id]
+                if key not in group_views:
+                    group_views[key] = self._group_view(groups[key], snapshot=snapshot)
+                view = group_views[key]
+                summaries[target_id] = {
+                    "group": key,
+                    "layer": layer,
+                    "lease": copy.deepcopy(view["lease"]),
+                    "lease_state": view["state"],
+                    "leasable_at": view["leasable_at"],
+                }
+            return summaries
+
+        read_snapshot = getattr(self._lock, "read_snapshot", None)
+        if callable(read_snapshot):
+            with read_snapshot() as snapshot:
+                return summarize(snapshot)
+        with self._lock:
+            self._sweep()
+            return summarize()
 
     def _ttl(self, ttl: str | None, *, manual: bool = False) -> tuple[str, float]:
         ttl = self.config["defaults"]["ttl"] if ttl is None else ttl
@@ -649,6 +803,15 @@ class LeaseStore:
             purpose = normalize_purpose(purpose)
         except ValueError as exc:
             raise LeaseError(str(exc)) from exc
+        if self.sql_backend is not None:
+            groups, _ = self._membership()
+            required = {
+                group["members"][layer]
+                for group in groups.values()
+                for layer in group["require_online"]
+                if layer in group["members"]
+            }
+            self.registry.probe_many([self.registry.resolve(target_id) for target_id in required])
         with self._lock:
             self._sweep()
             client = self._client(client_id)
@@ -685,7 +848,7 @@ class LeaseStore:
             candidates = [selected] if selected else list(groups.values())
             views = []
             for candidate in candidates:
-                view = self._group_view(candidate, probe=True)
+                view = self._group_view(candidate, probe=self.sql_backend is None)
                 views.append(view)
                 previous = self._latest(candidate["group"])
                 reclaim = previous and previous["state"] == "expired" and previous["client_id"] == client_id
@@ -706,6 +869,7 @@ class LeaseStore:
                         "ttl_s": seconds,
                         "manual": manual,
                         "acquired_ts": now,
+                        "last_used_ts": 0,
                         "renewed_ts": now,
                         "expires_ts": now + seconds,
                         "running_jobs": [],
@@ -756,6 +920,17 @@ class LeaseStore:
         filters = [label] if isinstance(label, str) else list(label or [])
         if any("=" not in item or not item.split("=", 1)[0] for item in filters):
             raise LeaseError("label filters must be key=value")
+        if getattr(self.sql_backend, "read_model", None) is not None:
+            with self._lock.read_snapshot() as snapshot:
+                self._expire_read_snapshot(snapshot)
+                return [
+                    self._view(item, snapshot=snapshot)
+                    for item in snapshot["leases"].values()
+                    if (not client_id or item["client_id"] == client_id)
+                    and (not group or item["group"] == group)
+                    and (state == "all" or item["state"] == state)
+                    and all(item["labels"].get(k) == v for k, v in (f.split("=", 1) for f in filters))
+                ]
         with self._lock:
             self._sweep()
             return [
@@ -768,9 +943,27 @@ class LeaseStore:
             ]
 
     def get_lease(self, lease_id: str) -> dict[str, Any]:
+        if getattr(self.sql_backend, "read_model", None) is not None:
+            with self._lock.read_snapshot() as snapshot:
+                self._expire_read_snapshot(snapshot)
+                lease = snapshot["leases"].get(lease_id)
+                if lease is None:
+                    raise LeaseError(f"unknown lease {lease_id!r}", status=404, code="unknown_lease")
+                return self._view(lease, snapshot=snapshot)
         with self._lock:
             self._sweep()
             return self._view(self._lease(lease_id))
+
+    @staticmethod
+    def _expire_read_snapshot(snapshot):
+        for lease in snapshot["leases"].values():
+            if (
+                lease["state"] == "active"
+                and not lease["running_jobs"]
+                and lease["expires_ts"] <= snapshot["now"]
+            ):
+                lease["state"] = "expired"
+                lease["expired_ts"] = lease["expires_ts"]
 
     def _renew(self, lease: dict[str, Any]) -> None:
         if lease["state"] == "released":
@@ -821,7 +1014,14 @@ class LeaseStore:
             self._renew(lease)
             return self._view(lease)
 
-    def release(self, lease_id: str, client_id: str | None = None, force: bool = False) -> dict[str, Any]:
+    def release(
+        self,
+        lease_id: str,
+        client_id: str | None = None,
+        force: bool = False,
+        *,
+        require_unpinned: bool = False,
+    ) -> dict[str, Any]:
         with self._lock:
             self._sweep()
             lease = self._lease(lease_id)
@@ -829,6 +1029,24 @@ class LeaseStore:
                 raise LeaseError(
                     "only the holder may release this lease", status=403, code="not_lease_holder"
                 )
+            if require_unpinned:
+                running_jobs = lease.get("running_jobs")
+                job_owners = lease.get("job_owners", {})
+                if (
+                    not isinstance(running_jobs, list)
+                    or not isinstance(job_owners, dict)
+                    or running_jobs
+                    or job_owners
+                ):
+                    raise LeaseError(
+                        "lease has running or unresolved job pins; refresh and retry after they finish",
+                        status=409,
+                        code="lease_pinned",
+                        details={
+                            "running_jobs": running_jobs if isinstance(running_jobs, list) else None,
+                            "job_owners": sorted(job_owners) if isinstance(job_owners, dict) else None,
+                        },
+                    )
             if self.sql_backend is not None and lease["running_jobs"]:
                 if not force:
                     raise LeaseError(
@@ -896,6 +1114,7 @@ class LeaseStore:
             if lease_id:
                 self.validate_targets(lease_id, [target])
                 lease = self._lease(lease_id)
+                lease["last_used_ts"] = self._clock()
             self._uses[key] = {
                 **self._uses.get(key, {}),
                 "at": self._clock(),
@@ -909,6 +1128,59 @@ class LeaseStore:
                 self._event(active, "warning", target=target, origin=origin)
             self._save()
             return result
+
+    def read_use(self, target: str, lease_id: str | None = None, *, origin: str = "rest") -> dict[str, Any]:
+        """Renew lease-backed reads authoritatively; defer only advisory unleased accounting."""
+        model = getattr(self.sql_backend, "read_model", None)
+        if model is None or lease_id is not None:
+            return self.use(target, lease_id, origin=origin)
+        with self._lock.read_snapshot() as snapshot:
+            _, membership = self._membership()
+            key, _ = membership[target]
+            lease = self._read_lease(snapshot, lease_id) if lease_id else None
+            if lease is not None:
+                if lease["group"] != key or target not in lease["members"].values():
+                    raise LeaseError(
+                        "target is outside this lease's group", status=409, code="target_not_in_lease"
+                    )
+            result = {"purpose": lease["purpose"] if lease else None}
+            active = next(
+                (
+                    item
+                    for item in snapshot["leases"].values()
+                    if item["group"] == key
+                    and item["state"] == "active"
+                    and (item["running_jobs"] or item["expires_ts"] > snapshot["now"])
+                ),
+                None,
+            )
+            if active and not lease_id:
+                view = self._view(active, snapshot=snapshot)
+                result["lease_warning"] = {k: view[k] for k in ("lease_id", "group", "holder", "expires_at")}
+        model.defer_use(self, target, lease_id, origin)
+        return result
+
+    def read_touch(self, lease_id: str) -> None:
+        # Renewal is lease authority, not advisory read accounting.
+        self.touch(lease_id)
+
+    def _read_lease(self, snapshot: dict[str, Any], lease_id: str) -> dict[str, Any]:
+        lease = snapshot["leases"].get(lease_id)
+        if lease is None:
+            raise LeaseError(f"unknown lease {lease_id!r}", status=404, code="unknown_lease")
+        if lease["state"] == "released":
+            raise LeaseError("lease was released", status=409, code="lease_released")
+        latest = next(
+            (item for item in reversed(snapshot["leases"].values()) if item["group"] == lease["group"]), None
+        )
+        if latest is not None and latest["lease_id"] != lease_id:
+            raise LeaseError(
+                "this lease was superseded by a newer group allocation",
+                status=409,
+                code="lease_lost",
+                details={"lease_id": lease_id, "holder": self._view(latest, snapshot=snapshot)["holder"]},
+            )
+        return lease
 
     def job_started(self, job: Any) -> None:
         with self._lock:
@@ -951,6 +1223,7 @@ class LeaseStore:
                         code="job_owner_mismatch",
                         status=409,
                     )
+                lease["last_used_ts"] = self._clock()
                 if job.id in lease["running_jobs"]:
                     lease["running_jobs"].remove(job.id)
                     if self.sql_backend is not None:

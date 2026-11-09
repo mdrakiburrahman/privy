@@ -15,10 +15,11 @@ import uuid
 import pytest
 from hub_fakes import FakeListener, Hub, blocking_run, exec_result
 
-from privy.hub.jobs import CANCELLED, RUNNING, SUCCEEDED, HubJob, utc_iso
+from privy.hub.jobs import CANCELLED, RUNNING, SUCCEEDED, HubJob, JobManager, utc_iso
 from privy.hub.listener_facts import ListenerInfoStore
 from privy.hub.metrics import ReportSelection
 from privy.hub.registry import ONLINE, ProbeResult
+from privy.hub.rest import RestApi
 from privy.hub.service import HubError, HubService
 from privy.hub.shared_jobs import SharedAuditLog, SharedJob, SharedJobManager, job_record
 from privy.hub.shared_metrics import SharedHubMetrics, SharedMetrics
@@ -32,7 +33,9 @@ class Backend:
         self.events = []
         self.lock = threading.RLock()
         self.output_reads = 0
+        self.cursor_read_calls = 0
         self.query_count = 0
+        self.list_calls = []
 
     def put(self, kind, key, payload):
         with self.lock:
@@ -46,8 +49,22 @@ class Backend:
         with self.lock:
             return copy.deepcopy(self.records.get((kind, key)))
 
-    def list(self, kind, *, limit=200, before=None, after=None, target=None, lease_id=None, client_id=None):
+    def list(
+        self,
+        kind,
+        *,
+        limit=200,
+        before=None,
+        after=None,
+        target=None,
+        lease_id=None,
+        client_id=None,
+        states=None,
+    ):
         self.query_count += 1
+        self.list_calls.append(
+            {"kind": kind, "limit": limit, "target": target, "lease_id": lease_id, "states": states}
+        )
         with self.lock:
             rows = [copy.deepcopy(v) for (k, _), v in self.records.items() if k == kind]
         for name, wanted in (("target", target), ("lease_id", lease_id), ("client_id", client_id)):
@@ -58,7 +75,32 @@ class Backend:
             rows = [r for r in rows if r.get("created_at", r.get("at", 0)) < before]
         if after is not None:
             rows = [r for r in rows if r.get("created_at", r.get("at", 0)) >= after]
+        if states is not None:
+            rows = [r for r in rows if r.get("state") in states]
         return rows[:limit]
+
+    def count_jobs_by_target(self, *, lease_id=None):
+        counts = {}
+        with self.lock:
+            rows = [copy.deepcopy(v) for (kind, _), v in self.records.items() if kind == "job"]
+        for row in rows:
+            if lease_id is None or row.get("lease_id") == lease_id:
+                target = row.get("target")
+                if target is not None:
+                    counts[target] = counts.get(target, 0) + 1
+        return counts
+
+    def count_job_records(self, *, lease_id=None, states=None, after=None, before=None):
+        with self.lock:
+            rows = [copy.deepcopy(v) for (kind, _), v in self.records.items() if kind == "job"]
+        return sum(
+            1
+            for row in rows
+            if (lease_id is None or row.get("lease_id") == lease_id)
+            and (states is None or row.get("state") in states)
+            and (after is None or row.get("created_at", row.get("at", 0)) >= after)
+            and (before is None or row.get("created_at", row.get("at", 0)) < before)
+        )
 
     def count_jobs(self):
         states = [r["state"] for (kind, _), r in self.records.items() if kind == "job"]
@@ -78,6 +120,11 @@ class Backend:
             [r for r in self.list("output", target=job_id, limit=100000) if r["index"] >= index],
             key=lambda r: r["index"],
         )[:limit]
+
+    def read_cursors(self, job_id, streams):
+        self.cursor_read_calls += 1
+        with self.lock:
+            return {stream: self.records.get(("cursor", f"{job_id}:{stream}"), 0) for stream in streams}
 
     def advance_cursor(self, job_id, stream, end):
         with self.lock:
@@ -186,19 +233,26 @@ def test_admission_is_pinned_and_synchronously_persisted_before_execution(tmp_pa
         jobs.close()
 
 
-def test_failed_admission_never_launches_and_conservatively_retains_pin(tmp_path):
+def test_failed_admission_never_launches_and_retains_pin_until_completion_retry(tmp_path):
     backend = Backend()
     hub = Hub(tmp_path)
     pins = []
-    jobs = manager(hub, backend, on_job=lambda job: pins.append(job.id))
+    jobs = manager(hub, backend, cancel_poll_s=10, on_job=lambda job: pins.append(job.id))
     jobs.on_finish = lambda job: pins.remove(job.id)
     backend.put = lambda *args: (_ for _ in ()).throw(RuntimeError("SQL unavailable"))
+    enqueue = backend.enqueue
+    backend.enqueue = backend.put
     try:
         with pytest.raises(RuntimeError, match="SQL unavailable"):
             start(jobs, hub)
         assert len(pins) == 1
         assert not hub.listeners
         assert jobs._jobs == {}
+        job_id = pins[0]
+        backend.enqueue = enqueue
+        jobs._retry_finishes()
+        assert not pins and not jobs._pending_finishes
+        assert backend.get("job", job_id)["state"] == "error"
     finally:
         jobs.close()
 
@@ -245,6 +299,50 @@ def test_list_summaries_use_one_snapshot_without_per_job_queries(tmp_path):
         assert len([job.summary(include_created=True) for job in page]) == 200
         assert backend.query_count == queried
         assert backend.output_reads == 0
+    finally:
+        jobs.close()
+
+
+def test_shared_summary_reads_once_and_zero_wait_does_not_refresh(tmp_path):
+    hub = Hub(tmp_path)
+    backend = Backend()
+    jobs = manager(hub, backend)
+    job = start(jobs, hub)
+    try:
+        proxy = SharedJob(backend, backend.get("job", job.id))
+        before = backend.query_count
+        proxy.summary()
+        assert backend.query_count == before + 1
+        before = backend.query_count
+        jobs.wait(proxy, 0)
+        assert backend.query_count == before
+    finally:
+        jobs.close()
+
+
+def test_shared_view_batches_cursor_reads_and_output_can_reuse_job_snapshot(tmp_path):
+    hub = Hub(tmp_path)
+    backend = Backend()
+    jobs = manager(hub, backend)
+    job = HubJob(
+        job_type="exec",
+        target=hub.registry.resolve("dev/box1_windows"),
+        spec={"language": "bash", "code": "x"},
+        origin="test",
+        output_limit=100,
+    )
+    try:
+        jobs._admit(job)
+        jobs._append_output(job, "stdout", b"abcdef")
+        proxy = SharedJob(backend, backend.get("job", job.id))
+        before = backend.cursor_read_calls
+        view = proxy.view(max_output_bytes=100, advance=False, refresh=False)
+        assert view["stdout"] == "abcdef"
+        assert backend.cursor_read_calls == before + 1
+        before = backend.query_count
+        result = proxy.read_output("stdout", 0, 100, refresh=False)
+        assert result["data"] == "abcdef"
+        assert backend.query_count == before + 1
     finally:
         jobs.close()
 
@@ -522,7 +620,7 @@ def test_async_summary_does_not_move_cursor_over_uncommitted_output(tmp_path):
         proxy = SharedJob(backend, backend.get("job", job.id))
         view = proxy.view(max_output_bytes=3)
         assert view["stdout"] == "" and view["stdout_offset"] == 0
-        assert backend.records["cursor", f"{job.id}:stdout"] == 0
+        assert backend.records.get(("cursor", f"{job.id}:stdout"), 0) == 0
         pieces, index, complete = proxy.next_pieces(0, 0)
         assert pieces == [] and index == 0 and not complete
     finally:
@@ -598,6 +696,54 @@ def test_service_reports_sql_status_and_storage_errors_as_503(tmp_path):
         assert error.value.status == 503 and error.value.code == "storage_unavailable"
         assert "credential-bearing" not in str(error.value)
     finally:
+        jobs.close()
+
+
+@pytest.mark.parametrize("operation", ["run", "broadcast"])
+@pytest.mark.parametrize("failure", ["get", "read_cursors", "output", "advance_cursor"])
+def test_sql_read_failure_after_launch_returns_admitted_job_id(tmp_path, monkeypatch, operation, failure):
+    hub = Hub(tmp_path)
+    backend = Backend()
+    jobs = manager(hub, backend, cancel_poll_s=10)
+    service = HubService(registry=hub.registry, jobs=jobs, version="test")
+    launch = JobManager._launch
+    original = getattr(backend, failure)
+    launched = []
+
+    def fail(*args, **kwargs):
+        raise StorageError("SQL unavailable after worker launch")
+
+    def launch_then_fail(self, job, body):
+        result = launch(self, job, body)
+        launched.append(job.id)
+        monkeypatch.setattr(backend, failure, fail)
+        return result
+
+    monkeypatch.setattr(JobManager, "_launch", launch_then_fail)
+    args = {"code": "hello", "language": "bash", "wait_s": 1}
+    args.update(
+        {"target": "dev/box1_windows"}
+        if operation == "run"
+        else {"targets": ["dev/box1_windows"], "only_online": False}
+    )
+    try:
+        response = RestApi(service).handle(
+            "POST",
+            "/v1/jobs" if operation == "run" else "/v1/broadcasts",
+            {},
+            {"Content-Type": "application/json"},
+            json.dumps(args).encode(),
+        )
+        assert response.status == 200
+        data = json.loads(response.body())
+        views = [data] if operation == "run" else data["jobs"]
+        assert [view["job_id"] for view in views] == launched
+        assert views[0]["stdout"] == "ran bash: hello\n"
+        assert len(hub.listeners["dev/box1_windows"].requests) == 1
+        if failure != "get":
+            assert backend.get("job", launched[0])["state"] == SUCCEEDED
+    finally:
+        monkeypatch.setattr(backend, failure, original)
         jobs.close()
 
 
@@ -809,6 +955,135 @@ def test_audit_import_marks_only_after_durable_flush_and_retries(tmp_path):
         assert len(markers) == 1
         assert markers[0]["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
         assert len(backend.list("audit")) == 1
+    finally:
+        jobs.close()
+
+
+def test_audit_import_resume_skips_already_delivered_audit_rows(tmp_path):
+    hub = Hub(tmp_path)
+    backend = Backend()
+    jobs = manager(hub, backend)
+    now = time.time()
+    path = audit_fixture(
+        tmp_path / "legacy.jsonl",
+        [
+            {
+                "ts": utc_iso(now - 1),
+                "event": "job.start",
+                "job_id": "resume",
+                "target": "dev/box1_windows",
+                "type": "exec",
+            },
+            {"ts": utc_iso(now), "event": "job.finish", "job_id": "resume", "state": SUCCEEDED},
+        ],
+    )
+    backend.flush = lambda timeout=10: False
+    try:
+        with pytest.raises(StorageError, match="durable delivery"):
+            jobs.import_audit(path, now=now)
+        delivered = list(backend.events)
+        assert len(delivered) == 3
+        backend.flush = lambda timeout=10: True
+        assert jobs.import_audit(path, now=now) == 0
+        assert backend.events[:-1] == delivered
+        assert backend.events[-1][0] == "import"
+    finally:
+        jobs.close()
+
+
+class BulkImportBackend(Backend):
+    def __init__(self):
+        super().__init__()
+        self.batches = []
+        self.fail_after = None
+
+    def existing(self, kind, keys):
+        return {key for key in keys if (kind, key) in self.records}
+
+    def import_records(self, records):
+        if self.fail_after is not None and len(self.batches) >= self.fail_after:
+            raise StorageError("interrupted SQL batch")
+        self.batches.append(copy.deepcopy(records))
+        inserted = set()
+        for kind, key, payload in records:
+            if (kind, key) not in self.records:
+                self.put(kind, key, payload)
+                inserted.add((kind, key))
+        return inserted
+
+    def enqueue(self, kind, key, payload):
+        pytest.fail("bulk import must not enqueue on the interactive delivery journal")
+
+
+def test_audit_bulk_import_resumes_committed_batches_and_marker_is_last(tmp_path):
+    hub = Hub(tmp_path)
+    backend = BulkImportBackend()
+    jobs = manager(hub, backend)
+    now = time.time()
+    path = audit_fixture(
+        tmp_path / "legacy.jsonl",
+        [
+            {
+                "ts": utc_iso(now - 1),
+                "event": "job.start",
+                "job_id": f"job-{i}",
+                "target": "dev/box1_windows",
+                "type": "exec",
+            }
+            for i in range(600)
+        ],
+    )
+    backend.fail_after = 1
+    try:
+        with pytest.raises(StorageError, match="interrupted SQL batch"):
+            jobs.import_audit(path, now=now)
+        committed = set(backend.records)
+        assert len(committed) == 500 and backend.list("import") == []
+        backend.fail_after = None
+        assert jobs.import_audit(path, now=now) == 350
+        resumed = backend.batches[1:]
+        assert all(len(batch) <= 500 for batch in resumed)
+        assert not any((kind, key) in committed for batch in resumed for kind, key, _ in batch)
+        assert len(backend.list("job", limit=1000)) == 600
+        assert len(backend.list("audit", limit=1000)) == 600
+        assert len(resumed[-1]) == 1 and resumed[-1][0][0] == "import"
+        queries, batches = backend.query_count, len(backend.batches)
+        assert jobs.import_audit(path, now=now + 1) == 0
+        assert backend.query_count == queries + 1 and len(backend.batches) == batches
+    finally:
+        jobs.close()
+
+
+def test_audit_bulk_import_refuses_marker_when_source_changes_during_last_commit(tmp_path):
+    hub = Hub(tmp_path)
+    backend = BulkImportBackend()
+    jobs = manager(hub, backend)
+    now = time.time()
+    path = audit_fixture(
+        tmp_path / "legacy.jsonl",
+        [
+            {
+                "ts": utc_iso(now),
+                "event": "job.start",
+                "job_id": "mutated",
+                "target": "dev/box1_windows",
+                "type": "exec",
+            }
+        ],
+    )
+    commit = backend.import_records
+
+    def mutate(records):
+        result = commit(records)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write("{}\n")
+        return result
+
+    backend.import_records = mutate
+    try:
+        with pytest.raises(StorageError, match="changed during import"):
+            jobs.import_audit(path, now=now)
+        assert backend.list("import") == []
     finally:
         jobs.close()
 
@@ -1060,6 +1335,7 @@ def test_shared_window_report_uses_sql_lower_bound_and_reuses_purpose_snapshot(t
         backend.list = track
         report = SharedMetrics(backend, clock=lambda: now).report([target], {}, range_name="1h")
         assert report["jobs"]["total"] == 1 and report["kept_jobs"] == 2
+        assert report["restored_jobs"] == 1
         assert report["targets"][0]["purpose"]["latest"] == "same work"
         job_pages = [kwargs for kind, kwargs in observed if kind == "job" and kwargs["limit"] == 200]
         assert len(job_pages) == 1 and job_pages[0]["after"] is not None
@@ -1126,16 +1402,23 @@ class ProcessBackend(Backend):
     def check_config(self, name, payload):
         self.coordination["config", name] = json.dumps(payload)
 
+    def get_config(self, name):
+        raw = self.coordination.get(("config", name))
+        return json.loads(raw) if raw is not None else None
+
     def set_migration_status(self, status):
         self.migration_status = dict(status)
 
     @contextlib.contextmanager
-    def transaction(self, lock=None):
+    def transaction(self, lock=None, **kwargs):
         with self.lock:
             yield ProcessCursor(self)
 
     def close(self):
         return self.flush()
+
+    def stop_worker(self):
+        pass
 
     def health(self):
         return self.status()
@@ -1156,13 +1439,32 @@ class ProcessCursor:
     def __init__(self, backend):
         self.backend = backend
         self.rows = []
+        self.result_sets = []
+        self.result_set_index = 0
 
     def execute(self, sql, *args):
         self.rows = []
-        if "DATEDIFF_BIG" in sql:
+        self.result_sets = []
+        self.result_set_index = 0
+        if "SELECT CASE WHEN EXISTS" in sql:
+            self.result_sets = [
+                [(1,)],
+                [(time.time(),)],
+                [(self.backend.coordination["config", "targets"],)],
+                [
+                    (kind, key, raw)
+                    for (kind, key), raw in self.backend.coordination.items()
+                    if kind in ("client", "lease", "use")
+                ],
+            ]
+            self.rows = self.result_sets[0]
+        elif "DATEDIFF_BIG" in sql:
             self.rows = [(time.time(),)]
         elif "SELECT payload" in sql and "id='targets'" in sql:
             self.rows = [(self.backend.coordination["config", "targets"],)]
+        elif "SELECT payload" in sql and "kind='import'" in sql:
+            raw = self.backend.coordination.get(("import", args[0]))
+            self.rows = [(raw,)] if raw is not None else []
         elif "SELECT kind,id,payload" in sql:
             self.rows = [
                 (kind, key, raw)
@@ -1170,7 +1472,7 @@ class ProcessCursor:
                 if kind in ("client", "lease", "use")
             ]
         elif sql.startswith("INSERT dbo.privy_coordination"):
-            kind, key, raw = args
+            kind, key, raw = ("import", *args) if "VALUES('import'" in sql else args
             self.backend.coordination[kind, key] = raw
         elif sql.startswith("UPDATE dbo.privy_coordination"):
             raw, kind, key = args
@@ -1186,6 +1488,263 @@ class ProcessCursor:
 
     def fetchall(self):
         return self.rows
+
+    def nextset(self):
+        if self.result_set_index + 1 >= len(self.result_sets):
+            return False
+        self.result_set_index += 1
+        self.rows = self.result_sets[self.result_set_index]
+        return True
+
+
+def test_sql_force_release_requires_unpinned_state_in_lease_transaction(tmp_path):
+    from privy.hub.leases import LeaseError, LeaseStore
+
+    hub = Hub(tmp_path, {"dev/box1_windows": FakeListener(hostname="BOX1")})
+    backend = ProcessBackend(None, tmp_path)
+    leases = LeaseStore(hub.registry, home=tmp_path, sql_backend=backend)
+    owner = leases.register_client("Bulk admin", session_id="sql-bulk-admin")["client_id"]
+    lease_id = leases.acquire(owner, target="dev/box1")["lease_id"]
+    assert leases.get_lease(lease_id)["running_jobs"] == []
+
+    with leases._lock:
+        leases._lease(lease_id)["job_owners"] = {"unknown-job": "unresolved-file-import"}
+
+    with pytest.raises(LeaseError) as error:
+        leases.release(lease_id, force=True, require_unpinned=True)
+
+    assert error.value.code == "lease_pinned"
+    with leases._lock:
+        lease = leases._lease(lease_id)
+        assert lease["state"] == "active"
+        assert lease["running_jobs"] == []
+        assert lease["job_owners"] == {"unknown-job": "unresolved-file-import"}
+
+
+@pytest.mark.parametrize("stale_policy", [False, True])
+def test_sql_policy_restores_missing_home_and_ignores_stale_local_policy(tmp_path, stale_policy):
+    import yaml
+
+    from privy.hub.leases import DEFAULT_CONFIG, LeaseStore, effective_lease_config
+
+    hub = Hub(tmp_path)
+    policy = yaml.safe_load(DEFAULT_CONFIG)
+    policy["defaults"]["ttl"] = "17m"
+    policy["defaults"]["max_leases_per_client"] = 7
+    backend = ProcessBackend(None, tmp_path)
+    backend.coordination["config", "leases"] = json.dumps(effective_lease_config(policy))
+    if stale_policy:
+        (tmp_path / "leases.yaml").write_text("invalid: [", encoding="utf-8")
+    leases = LeaseStore(hub.registry, home=tmp_path, sql_backend=backend)
+    assert leases.default_ttl == 17 * 60 and leases.client_limit == 7
+    if not stale_policy:
+        assert yaml.safe_load((tmp_path / "leases.yaml").read_text())["defaults"]["ttl"] == 17 * 60
+    assert json.loads(backend.coordination["config", "leases"]) == effective_lease_config(policy)
+
+
+def test_sql_legacy_session_reconciliation_preserves_shared_active_owner_and_retires_file(tmp_path):
+    from privy.hub.leases import LeaseStore
+
+    hub = Hub(tmp_path)
+    local = LeaseStore(hub.registry, home=tmp_path)
+    hub.service.invoke("list_targets", {}, origin="test")
+    client_id = local.register_client("old computer", session_id="same-session")["client_id"]
+    lease_id = local.acquire(client_id, target="dev/box1")["lease_id"]
+    local.release(lease_id, client_id)
+    historical_id = uuid.uuid4().hex
+    local._leases[historical_id] = dict(local._leases[lease_id], lease_id=historical_id)
+    local._save()
+    raw = local.state_path.read_bytes()
+    shared_client = dict(local._clients[client_id], client_id="canonical", name="new computer", host="other")
+    shared_lease = dict(
+        local._leases[lease_id],
+        client_id="canonical",
+        state="active",
+        running_jobs=["shared-job"],
+        job_owners={"shared-job": "shared-owner"},
+    )
+    backend = ProcessBackend(None, tmp_path)
+    backend.coordination["client", "canonical"] = json.dumps(shared_client)
+    backend.coordination["lease", lease_id] = json.dumps(shared_lease)
+    restored = LeaseStore(hub.registry, home=tmp_path, sql_backend=backend)
+    assert restored._clients == {"canonical": shared_client}
+    assert restored._leases[lease_id] == shared_lease
+    assert restored._leases[historical_id]["client_id"] == "canonical"
+    snapshot = local.state_path.with_name("leases-state.json.imported-snapshot")
+    assert snapshot.read_bytes() == raw and not local.state_path.exists()
+    before = copy.deepcopy(backend.coordination)
+    local.state_path.write_bytes(raw)
+    LeaseStore(hub.registry, home=tmp_path, sql_backend=backend)
+    assert backend.coordination == before
+    assert snapshot.read_bytes() == raw and not local.state_path.exists()
+
+
+@pytest.mark.parametrize("duplicate_shared_session", [False, True])
+def test_sql_legacy_active_session_alias_requires_explicit_owner_resolution(
+    tmp_path, duplicate_shared_session
+):
+    from privy.hub.leases import LeaseStore
+
+    hub = Hub(tmp_path)
+    local = LeaseStore(hub.registry, home=tmp_path)
+    hub.service.invoke("list_targets", {}, origin="test")
+    client_id = local.register_client("old", session_id="same-session")["client_id"]
+    local.acquire(client_id, target="dev/box1")
+    raw = local.state_path.read_bytes()
+    backend = ProcessBackend(None, tmp_path)
+    canonical = dict(local._clients[client_id], client_id="canonical")
+    backend.coordination["client", "canonical"] = json.dumps(canonical)
+    if duplicate_shared_session:
+        backend.coordination["client", "other"] = json.dumps(dict(canonical, client_id="other"))
+    message = (
+        "ambiguous duplicate client sessions"
+        if duplicate_shared_session
+        else "different shared session owner"
+    )
+    with pytest.raises(StorageError, match=message):
+        LeaseStore(hub.registry, home=tmp_path, sql_backend=backend)
+    assert local.state_path.read_bytes() == raw
+    assert json.loads(backend.coordination["client", "canonical"]) == canonical
+    assert not any(kind == "lease" for kind, _ in backend.coordination)
+
+
+def test_sql_acquire_probes_relays_without_holding_coordination_transaction(tmp_path, monkeypatch):
+    from privy.hub.leases import LeaseStore
+
+    hub = Hub(tmp_path)
+    backend = ProcessBackend(None, tmp_path)
+    leases = LeaseStore(hub.registry, home=tmp_path, sql_backend=backend)
+    client_id = leases.register_client("test", session_id="session")["client_id"]
+    probe = hub.registry.probe
+    observed = []
+
+    def outside_transaction(target, *args, **kwargs):
+        assert getattr(leases._lock._local, "depth", 0) == 0
+        observed.append(target.id)
+        return probe(target, *args, **kwargs)
+
+    monkeypatch.setattr(hub.registry, "probe", outside_transaction)
+    lease = leases.acquire(client_id, target="dev/box1")
+    assert lease["state"] == "active" and "dev/box1_windows" in observed
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_background_audit_import_retires_only_unchanged_durable_source(tmp_path, changed):
+    hub = Hub(tmp_path)
+    backend = ProcessBackend(None, tmp_path)
+    jobs = manager(hub, backend)
+    path = audit_fixture(
+        tmp_path / "audit.jsonl",
+        [{"ts": utc_iso(time.time()), "event": "job.start", "job_id": "old", "target": "dev/box1_windows"}],
+    )
+    raw = path.read_bytes()
+    import_audit = jobs.import_audit
+
+    def import_then_change(*args, **kwargs):
+        result = import_audit(*args, **kwargs)
+        if changed:
+            path.write_bytes(raw + b"\n")
+        return result
+
+    jobs.import_audit = import_then_change
+    try:
+        jobs.start_audit_import(path)
+        jobs._audit_import_thread.join(5)
+        assert not jobs.audit_import_running
+        assert backend.get("job", "old") is not None
+        assert backend.migration_status["state"] == ("failed" if changed else "complete")
+        if changed:
+            assert path.read_bytes() == raw + b"\n"
+        else:
+            assert not path.exists()
+            assert path.with_name("audit.jsonl.imported-snapshot").read_bytes() == raw
+    finally:
+        jobs.close()
+
+
+@pytest.mark.parametrize("stage", ["config", "bind", "state"])
+def test_failed_sql_start_stops_cancel_monitor_before_backend_close(tmp_path, monkeypatch, stage):
+    from privy.hub.app import build_hub
+
+    hub = Hub(tmp_path)
+    (tmp_path / "appsettings.yaml").write_text(
+        "version: 1\nstorage:\n  mode: azure_sql\n  server: example.database.windows.net\n  database: privy\n",
+        encoding="utf-8",
+    )
+    instances = []
+
+    class FailedBackend(ProcessBackend):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.closed = False
+            instances.append(self)
+
+        def get_config(self, name):
+            if stage == "config":
+                raise StorageError("original startup failure")
+            return super().get_config(name)
+
+        def close(self):
+            assert not any(t.name == "privy-shared-cancel" and t.is_alive() for t in threading.enumerate())
+            self.closed = True
+
+    monkeypatch.setattr("privy.hub.sql_store.SqlBackend", FailedBackend)
+    if stage != "config":
+
+        def fail(*args, **kwargs):
+            raise StorageError("original startup failure")
+
+        monkeypatch.setattr("privy.hub.app." + ("HubHTTPServer" if stage == "bind" else "write_state"), fail)
+    with pytest.raises(StorageError, match="original startup failure"):
+        build_hub(home=tmp_path, port=0, version="test", client_factory=hub._client)
+    assert instances[0].closed
+
+
+def test_sql_http_drain_sends_zero_pending_response_then_stops_serving(tmp_path, monkeypatch):
+    import requests
+
+    from privy.hub.app import build_hub
+
+    hub = Hub(tmp_path)
+    (tmp_path / "appsettings.yaml").write_text(
+        "version: 1\nstorage:\n  mode: azure_sql\n  server: example.database.windows.net\n  database: privy\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("privy.hub.sql_store.SqlBackend", ProcessBackend)
+    runtime = build_hub(home=tmp_path, port=0, version="test", client_factory=hub._client)
+    runtime.storage.status = lambda: {"pending_writes": 0, "mode": "azure_sql"}
+    serving = threading.Thread(target=runtime.serve_forever)
+    serving.start()
+    try:
+        response = requests.post(runtime.url + "/v1/admin/drain", timeout=5)
+        assert response.status_code == 200
+        assert response.json() == {"status": "drained", "pending_writes": 0}
+        serving.join(5)
+        assert not serving.is_alive()
+    finally:
+        if serving.is_alive():
+            runtime.server.shutdown()
+        runtime.close()
+    runtime.close()
+
+
+@pytest.mark.parametrize(
+    "owner,state,acknowledged", [("one", "error", True), ("one", "queued", False), ("old", "error", False)]
+)
+def test_absent_cancel_is_acknowledged_only_for_durable_current_owner_terminal_job(
+    tmp_path, owner, state, acknowledged
+):
+    hub = Hub(tmp_path)
+    backend = Backend(owner="one")
+    jobs = manager(hub, backend, cancel_poll_s=10)
+    backend.records["job", "absent"] = {"owner": owner, "state": state}
+    backend.request_cancel("absent")
+    backend.pending_cancels = lambda: ["absent"]
+    try:
+        jobs._process_cancels()
+        assert backend.records["cancel", "absent"]["acknowledged"] is acknowledged
+    finally:
+        jobs.close()
 
 
 @pytest.mark.parametrize("missing_dependency", ["sql_modules", "odbc_driver"])
@@ -1278,3 +1837,25 @@ def test_sql_process_harness_starts_and_serves_with_fake_backend(missing_depende
         reader.join(timeout=5)
         process.stdout.close()
         shutil.rmtree(home)
+
+
+def test_shared_metrics_page_reads_are_bounded_and_filterable():
+    backend = Backend()
+    metrics = SharedMetrics(backend)
+
+    assert metrics.entries("target-a", lease_id="lease-a", limit=3, states=frozenset({"failed"})) == []
+    assert backend.list_calls == [
+        {
+            "kind": "job",
+            "limit": 3,
+            "target": "target-a",
+            "lease_id": "lease-a",
+            "states": frozenset({"failed"}),
+        }
+    ]
+
+    backend.put("job", "one", {"target": "target-a", "lease_id": "lease-a", "state": "failed"})
+    backend.put("job", "two", {"target": "target-a", "lease_id": "lease-b", "state": "succeeded"})
+    backend.put("job", "three", {"target": "target-b", "lease_id": "lease-a", "state": "failed"})
+    assert metrics.count_jobs_by_target(lease_id="lease-a") == {"target-a": 1, "target-b": 1}
+    assert metrics.count_job_records(lease_id="lease-a", states=frozenset({"failed"})) == 2

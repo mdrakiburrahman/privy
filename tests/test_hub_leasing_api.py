@@ -72,6 +72,11 @@ def test_lease_routes_and_schemas_are_exposed(tmp_path):
         for parameter in document["paths"]["/v1/leases/{lease_id}/force-release"]["post"]["parameters"]
     }
     assert {"Origin", "X-Privy-UI"} <= force_headers
+    force_parameters = {
+        parameter["name"]: parameter
+        for parameter in document["paths"]["/v1/leases/{lease_id}/force-release"]["post"]["parameters"]
+    }
+    assert force_parameters["require_unpinned"]["schema"] == {"type": "boolean", "default": False}
     assert [operation.name for operation in OPERATIONS] == mcp_names
 
 
@@ -154,6 +159,31 @@ def test_force_release_requires_ui_header_and_same_origin(tmp_path):
     )
 
     assert no_origin.status == no_ui_marker.status == foreign_origin.status == 403
+
+
+def test_bulk_force_release_rejects_pin_added_after_confirmation(tmp_path):
+    hub = Hub(tmp_path, {"dev/box1_windows": FakeListener(hostname="BOX1")})
+    store = hub.service.leases
+    owner = store.register_client("Bulk admin", session_id="bulk-admin")["client_id"]
+    lease = store.acquire(owner, target="dev/box1")
+    lease_id = lease["lease_id"]
+    assert store.get_lease(lease_id)["running_jobs"] == []
+
+    with store._lock:
+        store._lease(lease_id)["running_jobs"].append("job-started-after-confirmation")
+    ui_headers = {"X-Privy-UI": "1", "Origin": f"http://{HOST}"}
+    path = f"/v1/leases/{lease_id}/force-release"
+
+    guarded = hub.call("POST", path, {"require_unpinned": True}, headers=ui_headers)
+    assert guarded.status == 409
+    assert guarded.payload["error"]["code"] == "lease_pinned"
+    assert store.get_lease(lease_id)["state"] == "active"
+    assert store.get_lease(lease_id)["running_jobs"] == ["job-started-after-confirmation"]
+
+    # Omitting the bulk-only guard retains the established individual force-release behavior.
+    individual = hub.call("POST", path, {}, headers=ui_headers)
+    assert individual.status == 200
+    assert individual.payload["state"] == "released"
 
 
 def test_execution_header_is_an_alternative_to_lease_id_query(tmp_path):

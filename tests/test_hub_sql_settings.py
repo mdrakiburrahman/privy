@@ -7,8 +7,17 @@ import pytest
 import yaml
 
 from privy.hub.leases import DEFAULT_CONFIG, effective_lease_config
+from privy.hub.request_context import REQUEST_ID
 from privy.hub.settings import SettingsError, load_settings
-from privy.hub.sql_store import SqlBackend, StorageError, _home_identity, _HomeLock
+from privy.hub.sql_store import (
+    _IMPORT_BATCH,
+    _SCHEMA,
+    SqlBackend,
+    StorageError,
+    _home_identity,
+    _HomeLock,
+    _ProfileCursor,
+)
 
 
 def test_absent_settings_preserve_file_mode(tmp_path, monkeypatch):
@@ -85,6 +94,296 @@ def test_same_home_successor_fences_previous_incarnation_without_releasing_pins(
     assert json.loads(update[0])["active"] is False
     assert json.loads(insert[1])["active"] is True
     assert json.loads(insert[1])["home_scope"] == "host:/home"
+
+
+def test_unresolved_file_import_owner_is_never_treated_as_stale():
+    backend = object.__new__(SqlBackend)
+    backend.transaction = lambda: pytest.fail("unknown owner must not trigger SQL reconciliation")
+
+    assert backend.owner_is_stale("unresolved-file-import") is False
+
+
+def test_sql_get_many_uses_one_parameterized_openjson_query():
+    rows = [("dev/a", json.dumps({"seen_at": 10, "info": {"platform": {"system": "Linux"}}}))]
+    cursor = FakeCursor(rows)
+
+    @contextmanager
+    def transaction(_lock=None):
+        yield cursor
+
+    backend = object.__new__(SqlBackend)
+    backend.transaction = transaction
+
+    assert backend.get_many("listener", ["dev/a", "dev/b", "dev/a"]) == {
+        "dev/a": {"seen_at": 10, "info": {"platform": {"system": "Linux"}}}
+    }
+    assert len(cursor.statements) == 1
+    query, args = cursor.statements[0]
+    assert "id IN (SELECT value FROM OPENJSON(?))" in query
+    assert args == ("listener", '["dev/a", "dev/b"]')
+
+
+def test_sql_get_many_skips_empty_key_sets():
+    backend = object.__new__(SqlBackend)
+
+    @contextmanager
+    def unexpected_transaction(_lock=None):
+        pytest.fail("empty get_many must not open a SQL transaction")
+        yield
+
+    backend.transaction = unexpected_transaction
+    assert backend.get_many("listener", []) == {}
+
+
+def test_sql_import_commits_deduplicated_insert_only_batch_before_return():
+    cursor = FakeCursor([("audit", "missing")])
+    committed = []
+
+    @contextmanager
+    def transaction(lock=None):
+        assert lock == "privy.leases"
+        yield cursor
+        committed.append(True)
+
+    backend = object.__new__(SqlBackend)
+    backend.owner = "incarnation"
+    backend.transaction = transaction
+    backend.assert_owner_active = lambda cursor: None
+    payload = {"created_at": 100, "job_id": "old-job"}
+    assert backend.import_records([("audit", "missing", payload)] * 2) == {("audit", "missing")}
+    assert committed == [True]
+    query, args = cursor.statements[0]
+    assert query == _IMPORT_BATCH
+    assert "OUTPUT inserted.kind,inserted.id" in query and "NOT EXISTS" in query
+    assert "UPDATE " not in query and "DELETE " not in query
+    assert json.loads(args[0]) == [
+        {
+            "kind": "audit",
+            "id": "missing",
+            "payload": payload,
+            "owner": "incarnation",
+            "at": 100,
+            "target": None,
+            "lease_id": None,
+            "client_id": None,
+        }
+    ]
+
+
+def test_sql_import_failed_commit_does_not_acknowledge_rows():
+    cursor = FakeCursor([("job", "new-job")])
+
+    @contextmanager
+    def transaction(lock=None):
+        yield cursor
+        raise StorageError("SQL commit failed")
+
+    backend = object.__new__(SqlBackend)
+    backend.owner = "incarnation"
+    backend.transaction = transaction
+    backend.assert_owner_active = lambda cursor: None
+    with pytest.raises(StorageError, match="commit failed"):
+        backend.import_records([("job", "new-job", {"created_at": 100})])
+
+
+def test_sql_job_pages_apply_state_filters_and_aggregate_counts():
+    class Cursor:
+        def __init__(self):
+            self.responses = [
+                [(json.dumps({"id": "job-1"}),)],
+                [("target-a", 3), ("target-b", 2)],
+                [("lease-a", 4)],
+                [(3,)],
+            ]
+            self.statements = []
+
+        def execute(self, query, *args):
+            self.statements.append((query, args))
+
+        def fetchall(self):
+            return self.responses.pop(0)
+
+        def fetchone(self):
+            return self.responses.pop(0)[0]
+
+    cursor = Cursor()
+
+    @contextmanager
+    def transaction(_lock=None):
+        yield cursor
+
+    backend = object.__new__(SqlBackend)
+    backend.transaction = transaction
+
+    assert backend.list(
+        "job", limit=2, target="target-a", lease_id="lease-a", states=frozenset({"failed", "error"})
+    ) == [{"id": "job-1"}]
+    assert backend.count_jobs_by_target(lease_id="lease-a") == {"target-a": 3, "target-b": 2}
+    assert backend.count_jobs_by_lease() == {"lease-a": 4}
+    assert (
+        backend.count_job_records(
+            lease_id="lease-a", states=frozenset({"failed", "error"}), after=10, before=20
+        )
+        == 3
+    )
+
+    page_query, page_args = cursor.statements[0]
+    assert "JSON_VALUE(payload,'$.state') IN (?,?)" in page_query
+    assert page_args == (2, "job", "target-a", "lease-a", "error", "failed")
+    assert "GROUP BY target" in cursor.statements[1][0]
+    assert cursor.statements[1][1] == ("lease-a",)
+    assert "GROUP BY lease_id" in cursor.statements[2][0]
+    assert "lease_id<>''" in cursor.statements[2][0]
+    count_query, count_args = cursor.statements[3]
+    assert "at>=?" in count_query and "at<?" in count_query
+    assert "JSON_VALUE(payload,'$.state') IN (?,?)" in count_query
+    assert count_args == ("lease-a", 10, 20, "error", "failed")
+
+
+def test_sql_history_scan_uses_larger_bounded_keyset_pages():
+    class Cursor:
+        def __init__(self):
+            self.statement = None
+
+        def execute(self, query, *args):
+            self.statement = (query, args)
+
+        def fetchall(self):
+            return [(100.0, "record-1", json.dumps({"created_at": 100.0}))]
+
+    cursor = Cursor()
+
+    @contextmanager
+    def transaction(_lock=None):
+        yield cursor
+
+    backend = object.__new__(SqlBackend)
+    backend.transaction = transaction
+
+    assert list(backend.scan("probe", after=0)) == [{"created_at": 100.0}]
+    query, args = cursor.statement
+    assert "SELECT TOP (5000)" in query
+    assert "ORDER BY at DESC,id DESC" in query
+    assert args == ("probe", 0)
+
+
+def test_sql_probe_history_projects_samples_and_loads_only_latest_payloads():
+    class Cursor:
+        def __init__(self):
+            self.statements = []
+            self.result = []
+
+        def execute(self, query, *args):
+            self.statements.append((query, args))
+            if "probe_status,probe_latency_ms" in query:
+                self.result = [
+                    ("target-a", 1.0, "probe-a", "online", 10),
+                    ("target-a", 2.0, "probe-b", "offline", None),
+                    ("target-b", 3.0, "probe-c", "online", 50),
+                ]
+            else:
+                self.result = [
+                    ("probe-b", json.dumps({"info": {"hostname": "a"}, "error": "offline"})),
+                    ("probe-c", json.dumps({"info": {"hostname": "b"}, "legacy": False})),
+                ]
+
+        def fetchall(self):
+            return self.result
+
+    cursor = Cursor()
+
+    @contextmanager
+    def transaction():
+        yield cursor
+
+    backend = object.__new__(SqlBackend)
+    backend.transaction = transaction
+
+    rows = backend.probe_history(after=0, before=4)
+
+    assert [row["status"] for row in rows] == ["online", "offline", "online"]
+    assert rows[0]["latency_ms"] == 10
+    assert rows[1]["error"] == "offline"
+    assert rows[2]["info"] == {"hostname": "b"}
+    sample_query, sample_args = cursor.statements[0]
+    assert "probe_status,probe_latency_ms" in sample_query
+    assert "JSON_VALUE" not in sample_query
+    assert "ORDER BY" not in sample_query
+    assert "at>=?" in sample_query and "at<?" in sample_query
+    assert sample_args == (0, 4)
+    payload_query, payload_args = cursor.statements[1]
+    assert "OPENJSON(?)" in payload_query
+    assert payload_args == (json.dumps(["probe-b", "probe-c"]),)
+
+
+def test_schema_bootstrap_adds_compatible_covering_probe_projection():
+    assert "probe_status AS (CONVERT(nvarchar(32), JSON_VALUE(payload,'$.status')))" in _SCHEMA
+    assert "probe_latency_ms AS (TRY_CONVERT(int, JSON_VALUE(payload,'$.latency_ms')))" in _SCHEMA
+    assert "IF COL_LENGTH('dbo.privy_records','probe_status') IS NULL" in _SCHEMA
+    assert "IX_privy_probe_history" in _SCHEMA
+    assert "CREATE INDEX IX_privy_probe_history ON dbo.privy_records(at DESC)" in _SCHEMA
+    assert "INCLUDE(target,probe_status,probe_latency_ms) WHERE kind='probe'" in _SCHEMA
+
+
+def test_sql_profile_records_failed_statement_without_bound_parameters(caplog):
+    class Cursor:
+        def execute(self, query, *params):
+            raise RuntimeError("database failure")
+
+    with caplog.at_level("ERROR", logger="privy.hub"):
+        with pytest.raises(RuntimeError, match="database failure"):
+            _ProfileCursor(Cursor()).execute("SELECT payload WHERE id=?", "private-value")
+
+    assert "SELECT payload WHERE id=?" in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
+    assert "database failure" not in caplog.text
+    assert "private-value" not in caplog.text
+
+
+def test_sql_profile_separates_application_lock_wait_from_hold(caplog, monkeypatch):
+    class Cursor:
+        def __init__(self):
+            self.row = None
+
+        def execute(self, query, *_params):
+            if "sp_getapplock" in query:
+                self.row = (0,)
+
+        def fetchone(self):
+            row, self.row = self.row, None
+            return row
+
+        def close(self):
+            pass
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    backend = object.__new__(SqlBackend)
+    backend._connect = lambda: Connection()
+    monkeypatch.setattr("privy.hub.sql_store._profile_sql_enabled", lambda: True)
+    request_token = REQUEST_ID.set("request-test")
+    try:
+        with caplog.at_level("INFO", logger="privy.hub"):
+            with backend.transaction("privy.leases"):
+                pass
+    finally:
+        REQUEST_ID.reset(request_token)
+
+    assert "sql_profile applock request_id=request-test" in caplog.text
+    assert "wait_ms=" in caplog.text
+    assert "held_ms=" in caplog.text
+    assert "outcome=committed" in caplog.text
 
 
 def test_active_incarnation_from_a_different_home_scope_blocks_startup():

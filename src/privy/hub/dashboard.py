@@ -16,7 +16,8 @@ import secrets
 import threading
 import time
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -124,6 +125,27 @@ def fmt_span(seconds: float) -> str:
     if seconds < 86400:
         return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
     return f"{seconds // 86400}d {seconds % 86400 // 3600}h"
+
+
+def fmt_interval(seconds: float) -> str:
+    remaining = Decimal(str(seconds))
+    if not remaining.is_finite() or remaining < 0:
+        raise ValueError("interval must be a finite nonnegative number")
+    parts = []
+    for unit, singular in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        count = int(remaining // unit)
+        if count:
+            parts.append(f"{count} {singular}{'' if count == 1 else 's'}")
+            remaining -= count * unit
+    if remaining or not parts:
+        amount = format(remaining.normalize(), "f")
+        parts.append(f"{amount} second{'s' if remaining != 1 else ''}")
+    return " ".join(parts)
+
+
+def fmt_utc_summary(at: float) -> str:
+    moment = datetime.fromtimestamp(at, tz=timezone.utc)
+    return f"{moment.strftime('%b')} {moment.day}, {moment.year} · {moment.strftime('%I:%M %p').lstrip('0')}"
 
 
 def local_time(at: float | None, *, short: bool = False) -> str:
@@ -279,6 +301,8 @@ def gather_probes(service: Any) -> dict[str, ProbeResult | None]:
     """
     registry = service.registry
     targets = list(registry.snapshot().targets)
+    if getattr(service, "background_warmup", None) is not None:
+        return {target.id: registry.cached(target) for target in targets}
     ttl = getattr(registry, "probe_ttl_s", 30.0)
     now = time.time()
     stale = [t for t in targets if (cached := registry.cached(t)) is None or now - cached.checked_at >= ttl]
@@ -292,26 +316,107 @@ def gather_probes(service: Any) -> dict[str, ProbeResult | None]:
 
 
 def build_report(
-    service: Any, range_name: str = DEFAULT_RANGE, *, selection: ReportSelection | None = None
+    service: Any,
+    range_name: str = DEFAULT_RANGE,
+    *,
+    selection: ReportSelection | None = None,
+    include_lease_groups: bool = False,
 ) -> dict[str, Any]:
+    profile = os.environ.get("PRIVY_SQL_PROFILE") == "1"
+    phase_started = time.perf_counter()
     targets = list(service.registry.snapshot().targets)
+    target_snapshot_ms = (time.perf_counter() - phase_started) * 1000
+    phase_started = time.perf_counter()
     probes = gather_probes(service)
-    counts = service.jobs.counts()
+    probe_gather_ms = (time.perf_counter() - phase_started) * 1000
+    history_backend = getattr(getattr(service.metrics, "backend", None), "report_history", None)
+    if callable(history_backend):
+        counts = None
+        job_counts_ms = 0.0
+    else:
+        phase_started = time.perf_counter()
+        counts = service.jobs.counts()
+        job_counts_ms = (time.perf_counter() - phase_started) * 1000
+    phase_started = time.perf_counter()
+    report_kwargs = {"max_running": service.jobs.max_running}
+    if counts is not None:
+        report_kwargs.update(
+            jobs_running=counts["running"],
+            jobs_queued=counts["queued"],
+            jobs_retained=counts["retained"],
+        )
     report = service.metrics.report(
         targets,
         probes,
         range_name=range_name,
         selection=selection,
-        jobs_running=counts["running"],
-        jobs_queued=counts["queued"],
-        jobs_retained=counts["retained"],
-        max_running=service.jobs.max_running,
+        **report_kwargs,
     )
+    metrics_report_ms = (time.perf_counter() - phase_started) * 1000
+    phase_started = time.perf_counter()
+    facts = service.listener_facts_many(targets, probes)
+    listener_facts_ms = (time.perf_counter() - phase_started) * 1000
     for row in report["targets"]:
         probe = probes.get(row["id"])
         row["terminal_shells"] = terminal_languages(probe.info if probe else None)
-        row.update(service.listener_facts(row["id"], row["hybrid_connection"], probe))
+        row.update(facts[row["id"]])
+    leases = getattr(service, "leases", None)
+    if include_lease_groups and leases is not None:
+        phase_started = time.perf_counter()
+        groups = leases.groups()
+        lease_groups_ms = (time.perf_counter() - phase_started) * 1000
+        report["_lease_groups"] = groups
+        report["_active_lease_count"] = sum(group["lease"] is not None for group in groups)
+    else:
+        lease_groups_ms = 0.0
+    if profile:
+        log.info(
+            "dashboard_profile build_report_phases thread=%s targets=%d snapshot_ms=%.1f "
+            "probe_gather_ms=%.1f job_counts_ms=%.1f metrics_report_ms=%.1f "
+            "listener_facts_ms=%.1f lease_groups_ms=%.1f",
+            threading.get_ident(),
+            len(targets),
+            target_snapshot_ms,
+            probe_gather_ms,
+            job_counts_ms,
+            metrics_report_ms,
+            listener_facts_ms,
+            lease_groups_ms,
+        )
     return report
+
+
+def build_shell_report(service: Any, selection: ReportSelection) -> dict[str, Any]:
+    """Build only the current counts needed by the jobs and leases page shell."""
+    targets = list(service.registry.snapshot().targets)
+    now = time.time()
+    start, end, _, _ = selection.window(now, service.started_at)
+    jobs = service.jobs.counts()
+    path_counts: dict[str, int] = {}
+    for target in targets:
+        key = target.path.lower()
+        path_counts[key] = path_counts.get(key, 0) + 1
+    return {
+        "range": selection.range_name,
+        "kept_jobs": service.metrics.count_job_records(),
+        "jobs": {
+            "total": service.metrics.count_job_records(
+                after=None if selection.range_name == "all" else start, before=end
+            ),
+            "running": jobs["running"],
+            "queued": jobs["queued"],
+        },
+        "targets_total": len(targets),
+        "targets_online": sum(
+            1
+            for target in targets
+            if (probe := service.registry.cached(target)) is not None and probe.status == ONLINE
+        ),
+        "targets": [
+            {"id": target.id, "label": target.id if path_counts[target.path.lower()] > 1 else target.path}
+            for target in targets
+        ],
+    }
 
 
 def _last(query: Mapping[str, list[str]], name: str, default: str = "") -> str:
@@ -358,7 +463,10 @@ def shell(
         "jobs": report["jobs"]["total"],
     }
     if getattr(service, "leases", None) is not None:
-        nav_counts["leases"] = len(service.leases.list_leases())
+        active_leases = report.get("_active_lease_count")
+        if active_leases is None:
+            active_leases = len(service.leases.list_leases())
+        nav_counts["leases"] = active_leases
     nav = "".join(
         f'<a href="{esc(link(path, range=rng if rng in ("1h", "7d") else None))}"'
         f"{ON if name == page else ''}>{nav_icon(name)}{esc(label)}"
@@ -632,7 +740,7 @@ def facet_toolbar() -> str:
 # ---- overview -----------------------------------------------------------------------
 
 
-def overview_controls(report: dict[str, Any]) -> str:
+def overview_controls(report: dict[str, Any], *, sql_backed: bool = False) -> str:
     ranges = "".join(
         f'<option value="{name}"{" selected" if name == report["range"] else ""}>'
         f"{esc({'all': 'All retained history', 'custom': 'Custom dates'}.get(name, name))}</option>"
@@ -644,24 +752,47 @@ def overview_controls(report: dict[str, Any]) -> str:
         for name in RESOLUTIONS
     )
     custom = report["range"] == "custom"
-    return (
-        '<section class="metrics-controls"><form id="metrics-controls" class="toolbar">'
-        f'<label>History range<select id="metrics-range">{ranges}</select></label>'
-        f'<label>Resolution<select id="metrics-resolution">{resolutions}</select></label>'
-        f'<div id="metrics-custom" class="report-dates"{"" if custom else " hidden"}>'
-        f'<label>Start (local time)<input type="datetime-local" id="metrics-start" '
-        f'data-timestamp="{report["start_ts"]}"></label>'
-        f'<label>End (local time)<input type="datetime-local" id="metrics-end" '
-        f'data-timestamp="{report["end_ts"]}"></label></div>'
-        '<button type="submit" class="lease-button">Apply</button>'
-        '<span id="metrics-error" class="lease-action-error" role="alert"></span></form>'
-        f'<p id="metrics-effective" class="fine">{"Adjusted to " if report["resolution_adjusted"] else "Showing "}'
-        f"{esc(fmt_span(report['bucket_s']))} per column"
-        f"{' to keep the chart within 1,000 columns' if report['resolution_adjusted'] else ''}. "
-        f"{esc(report['start'])} to {esc(report['end'])} (UTC).</p>"
-        '<p class="fine">Telemetry is kept in RAM without age-based expiry; memory usage grows until restart. '
+    history_notice = (
+        "Request, probe, and job history is shared through Azure SQL; expired records are collected after 7 days, "
+        "while active leases and running jobs are protected. Online status is live."
+        if sql_backed
+        else "Telemetry is kept in RAM without age-based expiry; memory usage grows until restart. "
         f"Request and probe history resets on restart; collecting since {esc(report['telemetry_started_at'])}. "
-        "Existing audit-restored job summaries are separate. Online status and running jobs are live.</p></section>"
+        "Existing audit-restored job summaries are separate. Online status and running jobs are live."
+    )
+
+    def effective_time(name: str) -> str:
+        exact = report[name]
+        label = fmt_utc_summary(report[f"{name}_ts"])
+        aria_label = f"{label} UTC; exact instant {exact}"
+        return (
+            f'<time class="range-time" datetime="{esc(exact)}" '
+            f'title="Exact UTC instant: {esc(exact)}" aria-label="{esc(aria_label)}">'
+            f"{esc(label)}</time>"
+        )
+
+    return (
+        '<section class="metrics-controls" aria-label="History filters">'
+        '<form id="metrics-controls" class="metrics-filter-form">'
+        f'<label class="metrics-filter-field" for="metrics-range">History range'
+        f'<select id="metrics-range">{ranges}</select></label>'
+        f'<label class="metrics-filter-field" for="metrics-resolution">Resolution'
+        f'<select id="metrics-resolution">{resolutions}</select></label>'
+        f'<div id="metrics-custom" class="report-dates"{"" if custom else " hidden"}>'
+        f'<label for="metrics-start">Start (local time)<input type="datetime-local" id="metrics-start" '
+        f'data-timestamp="{report["start_ts"]}" aria-describedby="metrics-error"></label>'
+        f'<label for="metrics-end">End (local time)<input type="datetime-local" id="metrics-end" '
+        f'data-timestamp="{report["end_ts"]}" aria-describedby="metrics-error"></label></div>'
+        '<button type="submit" class="lease-button primary filter-apply">Apply</button>'
+        '<span id="metrics-error" class="metrics-error" role="alert" aria-live="polite"></span></form>'
+        f'<p id="metrics-effective" class="metrics-effective">'
+        f"<span>{'Adjusted to ' if report['resolution_adjusted'] else 'Showing '}</span>"
+        f"<strong>{esc(fmt_interval(report['bucket_s']))}</strong> per column"
+        f"{' to keep the chart within 1,000 columns' if report['resolution_adjusted'] else ''}. "
+        f'<span class="effective-range">from {effective_time("start")} '
+        f'<span aria-hidden="true">to</span> {effective_time("end")} '
+        '<abbr title="Coordinated Universal Time">UTC</abbr></span></p>'
+        f'<p class="fine">{history_notice}</p></section>'
     )
 
 
@@ -741,13 +872,13 @@ def overview_page(service: Any, report: dict[str, Any], now: float) -> str:
     legend = (
         '<div class="legend"><span><i class="exec"></i>exec</span><span><i class="transfer"></i>upload / download</span>'
         '<span><i class="sync"></i>sync</span><span><i class="fail"></i>failed</span>'
-        f"<span>{esc(fmt_span(report['bucket_s']))} per column · local time</span></div>"
+        f"<span>{esc(fmt_interval(report['bucket_s']))} per column · local time</span></div>"
     )
     activity = section(
         "activity",
         "01",
         "Activity",
-        f"jobs started per {fmt_span(report['bucket_s'])}",
+        f"jobs started per {fmt_interval(report['bucket_s'])}",
         f'<div class="chart">{activity_chart(report)}</div>{legend}',
     )
     busiest = [row for row in rows if row["jobs"]][:8]
@@ -805,7 +936,10 @@ def overview_page(service: Any, report: dict[str, Any], now: float) -> str:
     )
     return (
         hero("PRIVY HUB · CONTROL PLANE", "What's running through the relays", chips)
-        + overview_controls(report)
+        + overview_controls(
+            report,
+            sql_backed=callable(getattr(getattr(service.jobs, "backend", None), "report_history", None)),
+        )
         + stats
         + warn
         + activity
@@ -934,17 +1068,28 @@ def lease_cell(group: dict[str, Any], now: float) -> str:
 
 def enrich_lease_report(service: Any, report: dict[str, Any]) -> None:
     store = getattr(service, "leases", None)
-    groups = store.groups() if store is not None else []
+    groups = report.pop("_lease_groups", None)
+    if groups is None:
+        groups = store.groups() if store is not None else []
     by_target = {target: group for group in groups for target in group["members"].values()}
     for row in report["targets"]:
         row["lease_group"] = by_target.get(row["id"])
 
 
-def lease_entries(service: Any, lease_id: str) -> list[JobEntry]:
-    entries = service.metrics.entries()
-    if not lease_id:
-        return entries
-    return [entry for entry in entries if entry.view().get("lease_id") == lease_id]
+def lease_entries(
+    service: Any,
+    lease_id: str | None,
+    *,
+    limit: int | None = None,
+    target_id: str | None = None,
+    states: set[str] | frozenset[str] | None = None,
+) -> list[JobEntry]:
+    return service.metrics.entries(
+        target_id,
+        lease_id=lease_id,
+        limit=limit,
+        states=states,
+    )
 
 
 def leases_page(service: Any, query: Mapping[str, list[str]], now: float) -> str:
@@ -962,11 +1107,7 @@ def leases_page(service: Any, query: Mapping[str, list[str]], now: float) -> str
     by_lease = {lease["lease_id"]: lease for lease in all_leases}
     groups = store.groups()
     clients = store.list_clients(active=False)
-    job_counts: dict[str, int] = {}
-    for entry in service.metrics.entries():
-        lease_id = entry.view().get("lease_id")
-        if lease_id:
-            job_counts[lease_id] = job_counts.get(lease_id, 0) + 1
+    job_counts = service.metrics.count_jobs_by_lease()
     chips = (
         f'<span class="chip">{plural(len(store.list_leases()), "active lease")}</span>'
         f'<span class="chip">{sum(bool(client.get("leases")) for client in clients)} clients holding</span>'
@@ -988,6 +1129,13 @@ def leases_page(service: Any, query: Mapping[str, list[str]], now: float) -> str
         f'<input type="search" id="leaselabel" aria-label="Filter lease labels" value="{esc(_last(query, "label"))}" '
         'placeholder="labels: repo=owner/repo task=leasing" autocomplete="off">'
         f'<span class="seg">{filters}</span><span class="chip" id="leasecount"></span></div>'
+        '<div class="toolbar">'
+        '<button type="button" class="lease-button" id="select-never-used">Select never used</button>'
+        '<button type="button" class="lease-button" id="select-idle">Select idle &gt;</button>'
+        '<select id="lease-idle-threshold" aria-label="Idle threshold">'
+        '<option value="1800">30m</option><option value="3600">1h</option><option value="14400">4h</option></select>'
+        '<button type="button" class="lease-button danger" id="force-release-selected" disabled>'
+        "Force release selected (0)</button></div>"
     )
     body = []
     for lease in leases:
@@ -995,6 +1143,16 @@ def leases_page(service: Any, query: Mapping[str, list[str]], now: float) -> str
         holder = lease.get("holder") or {}
         search = json.dumps(lease, ensure_ascii=False).lower()
         jobs = job_counts.get(lease_id, 0)
+        last_used = lease_time(lease.get("last_used_at"))
+        acquired = lease_time(lease.get("acquired_at"))
+        running_jobs = lease.get("running_jobs")
+        job_owners = lease.get("job_owners")
+        bulk_safe = not running_jobs and not job_owners
+        selection = (
+            f'<input type="checkbox" data-select-lease="{esc(lease_id)}" aria-label="Select {esc(lease_id)}">'
+            if lease["state"] == "active"
+            else ""
+        )
         actions = (
             f'<a class="lease-button" href="{esc(link("/ui/leases", state=state, peek=lease_id))}#s-lease-peek">Peek</a>'
             f'<a class="lease-button" href="{esc(link("/ui/logs", target="*", lease=lease_id))}">Peek logs</a>'
@@ -1012,19 +1170,34 @@ def leases_page(service: Any, query: Mapping[str, list[str]], now: float) -> str
             for layer, target in lease.get("members", {}).items()
         )
         body.append(
-            f'<tr data-lease-row data-q="{esc(search)}" data-labels="{esc(json.dumps(lease.get("labels") or {}))}">'
+            f'<tr data-lease-row data-lease-id="{esc(lease_id)}" data-bulk-safe="{str(bulk_safe).lower()}" data-last-used="{last_used or 0}" data-use-known="{str(lease.get("last_use_known", False)).lower()}" data-acquired="{acquired or 0}" '
+            f'data-q="{esc(search)}" data-labels="{esc(json.dumps(lease.get("labels") or {}))}">'
+            f"<td>{selection}</td>"
             f'<td><b>{esc(lease["group"])}</b><span class="sub">{esc(lease_id)}</span>{lease_state(lease["state"])}</td>'
             f"<td>{members}</td><td><b>{esc(str(holder.get('name') or lease.get('client_id') or '—'))}</b>"
             f'<span class="sub">{esc(str(holder.get("kind") or ""))} · {esc(str(holder.get("session_id") or ""))}</span></td>'
             f"<td>{lease_labels(lease.get('labels') or {})}</td><td>{esc(lease.get('purpose') or '')}</td>"
             f'<td class="nw">{lease_at(lease.get("acquired_at"))}</td><td>{lease_timer(lease, now)}</td>'
+            f'<td class="nw" data-v="{last_used or 0}"{title_attr(utc_time(last_used) if last_used else None)}>'
+            f"{esc((fmt_ago(last_used, now) if last_used is not None else 'never') if lease.get('last_use_known') else 'unknown')}</td>"
             f'<td class="r">{jobs} ({len(lease.get("running_jobs") or [])} running)</td><td class="lease-actions">{actions}</td></tr>'
         )
     lease_table = (
         '<div class="table"><table id="leases"><thead><tr>'
+        '<th><input type="checkbox" id="select-all-leases" aria-label="Select all visible active leases"></th>'
         + "".join(
             sort_th(name)
-            for name in ("Group", "Members", "Holder", "Labels", "Purpose", "Acquired", "Expires", "Jobs")
+            for name in (
+                "Group",
+                "Members",
+                "Holder",
+                "Labels",
+                "Purpose",
+                "Acquired",
+                "Expires",
+                "Last used",
+                "Jobs",
+            )
         )
         + f"<th>Actions</th></tr></thead><tbody>{''.join(body)}</tbody></table></div>"
         '<div class="empty" id="leasenone" hidden>No leases match.</div>'
@@ -1393,11 +1566,9 @@ def logs_page(
 ) -> tuple[str, str]:
     rows = report["targets"]
     by_id = {row["id"]: row for row in rows}
-    lease_id = _last(query, "lease")
-    every = lease_entries(service, lease_id)
-    kept: dict[str, int] = {}
-    for entry in every:
-        kept[entry.target_id] = kept.get(entry.target_id, 0) + 1
+    lease_id = _last(query, "lease") or None
+    kept = service.metrics.count_jobs_by_target(lease_id=lease_id)
+    all_count = sum(kept.values())
     selected = _last(query, "target")
     if lease_id and not selected:
         selected = "*"
@@ -1405,9 +1576,17 @@ def logs_page(
         used = sorted((row for row in rows if row["last_used_ts"]), key=lambda row: -row["last_used_ts"])
         selected = used[0]["id"] if used else (rows[0]["id"] if rows else "*")
     limit = limit_of(query, DEFAULT_LOG_LIMIT)
+    entries = lease_entries(
+        service,
+        lease_id,
+        limit=limit + 1,
+        target_id=None if selected == "*" else selected,
+    )
+    entries = sorted(entries, key=lambda entry: entry.created_at, reverse=True)
+    entry_count = all_count if selected == "*" else kept.get(selected, 0)
     pods = [
         f'<a href="{esc(link("/ui/logs", target="*", lease=lease_id))}"{ON if selected == "*" else ""}>'
-        f"<b>All relay HYCOs</b><span>{len(every):,}</span><small>every job, newest first</small></a>"
+        f"<b>All relay HYCOs</b><span>{all_count:,}</span><small>every job, newest first</small></a>"
     ]
     for row in sorted(rows, key=lambda row: (-(row["last_used_ts"] or 0), row["label"].lower())):
         who = row["user"] and row["host"] and f"{row['user']}@{row['host']}"
@@ -1416,8 +1595,6 @@ def logs_page(
             f"<b>{status_dot(row['status'])}{esc(row['label'])}</b><span>{kept.get(row['id'], 0):,}</span>"
             f"<small>{esc(who or row['status'])} · {esc(fmt_ago(row['last_used_ts'], now))}</small></a>"
         )
-    entries = every if selected == "*" else [entry for entry in every if entry.target_id == selected]
-    entries = sorted(entries, key=lambda entry: entry.created_at, reverse=True)
     shown = entries[:limit]
     terms = "".join(
         safe_terminal(
@@ -1433,10 +1610,10 @@ def logs_page(
         terms = (
             '<div class="empty">No jobs have run here since the hub started (and none in audit.jsonl).</div>'
         )
-    elif len(entries) > limit:
+    elif entry_count > limit:
         terms += (
             f'<a class="more" href="{esc(link("/ui/logs", target=selected, lease=lease_id, limit=str(min(MAX_LIMIT, limit * 4))))}">'
-            f"Show more ({len(entries) - limit:,} older jobs)</a>"
+            f"Show more ({plural(entry_count - limit, 'older job')})</a>"
         )
     toolbar = (
         '<div class="toolbar"><input type="search" id="grep" placeholder="grep commands and output…" '
@@ -1447,12 +1624,12 @@ def logs_page(
     )
     row = by_id.get(selected)
     if row is None:
-        heading, chips = "All relay HYCOs", f'<span class="chip">{plural(len(entries), "job")}</span>'
+        heading, chips = "All relay HYCOs", f'<span class="chip">{plural(entry_count, "job")}</span>'
     else:
         heading = row["label"]
         chips = (
             f'<span class="chip mono">{esc(row["id"])}</span>{_status_chip(row)}'
-            f'<span class="chip">{plural(len(entries), "job")} kept</span>'
+            f'<span class="chip">{plural(entry_count, "job")} kept</span>'
         )
         if row["os"]:
             chips += f'<span class="chip">{esc(row["os"])}</span>'
@@ -1482,14 +1659,12 @@ def _status_chip(row: dict[str, Any]) -> str:
 
 def jobs_page(service: Any, report: dict[str, Any], query: Mapping[str, list[str]], now: float) -> str:
     wanted = _last(query, "state").strip().lower()
-    lease_id = _last(query, "lease")
-    entries = sorted(lease_entries(service, lease_id), key=lambda entry: entry.created_at, reverse=True)
-    views = [entry.view() for entry in entries]
-    if wanted == "failed":
-        views = [view for view in views if view["state"] in BAD_STATES]
-    elif wanted:
-        views = [view for view in views if view["state"] == wanted]
+    lease_id = _last(query, "lease") or None
     limit = limit_of(query, DEFAULT_JOB_LIMIT)
+    states = BAD_STATES if wanted == "failed" else frozenset({wanted}) if wanted else None
+    entries = lease_entries(service, lease_id, limit=limit + 1, states=states)
+    views = [entry.view() for entry in entries]
+    total_count = service.metrics.count_job_records(lease_id=lease_id, states=states)
     names = {row["id"]: row["label"] for row in report["targets"]}
     head = (
         "<tr>"
@@ -1530,12 +1705,12 @@ def jobs_page(service: Any, report: dict[str, Any], query: Mapping[str, list[str
         if views
         else '<div class="empty">No jobs match.</div>'
     )
-    if len(views) > limit:
+    if total_count > limit:
         table += (
             f'<a class="more" href="{esc(link("/ui/jobs", state=wanted or None, lease=lease_id, limit=str(min(MAX_LIMIT, limit * 4))))}">'
-            f"Show more ({len(views) - limit:,} older jobs)</a>"
+            f"Show more ({plural(total_count - limit, 'older job')})</a>"
         )
-    chips = f'<span class="seg">{filters}</span><span class="chip">{plural(len(views), "job")}</span>'
+    chips = f'<span class="seg">{filters}</span><span class="chip">{plural(total_count, "job")}</span>'
     if lease_id:
         chips += f'<span class="chip">lease {esc(lease_id)}</span><a href="/ui/jobs">Clear lease filter</a>'
     return hero("EVERY JOB THE HUB REMEMBERS", "Jobs", chips) + section(
@@ -1553,8 +1728,23 @@ def render(service: Any, page: str, query: Mapping[str, list[str]], base_url: st
         selection = ReportSelection.parse(query) if page == "overview" else ReportSelection(range_name=rng)
     except ValueError as exc:
         return error_response(400, "invalid_argument", str(exc))
-    report = build_report(service, selection=selection)
-    enrich_lease_report(service, report)
+    profile = os.environ.get("PRIVY_SQL_PROFILE") == "1"
+    request_started = time.perf_counter()
+    try:
+        if page in ("leases", "jobs"):
+            report = build_shell_report(service, selection)
+        else:
+            report = build_report(service, selection=selection, include_lease_groups=True)
+            enrich_lease_report(service, report)
+    except Exception:
+        if profile:
+            log.exception(
+                "dashboard_profile failed page=%s phase=report_build thread=%s",
+                page,
+                threading.get_ident(),
+            )
+        raise
+    report_finished = time.perf_counter()
     now = time.time()
     nonce = secrets.token_urlsafe(18)
     params: dict[str, str | None] = {}
@@ -1586,7 +1776,18 @@ def render(service: Any, page: str, query: Mapping[str, list[str]], base_url: st
     document = shell(
         service, page, title=title, main=main, report=report, nonce=nonce, base_url=base_url, params=params
     )
-    return html_response(document, nonce)
+    response = html_response(document, nonce)
+    if profile:
+        finished = time.perf_counter()
+        log.info(
+            "dashboard_profile page=%s thread=%s report_build_ms=%.1f html_render_ms=%.1f total_ms=%.1f",
+            page,
+            threading.get_ident(),
+            (report_finished - request_started) * 1000,
+            (finished - report_finished) * 1000,
+            (finished - request_started) * 1000,
+        )
+    return response
 
 
 def raw_log(service: Any, job_id: str) -> HttpResponse:
