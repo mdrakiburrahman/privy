@@ -855,6 +855,24 @@ def test_running_jobs_return_a_next_step_and_can_be_cancelled(tmp_path):
     assert listener.cancelled == ["remote-blocking"]
 
 
+def test_cancel_response_keeps_nonterminal_job_state(tmp_path, monkeypatch):
+    listener = FakeListener(run=blocking_run)
+    hub = Hub(tmp_path, {BOX1: listener})
+    started = hub.call(
+        "POST", "/v1/jobs", {"target": BOX1, "language": "python", "code": "import time", "wait_s": 0}
+    ).payload
+    try:
+        assert listener.started.wait(5)
+        monkeypatch.setattr(hub.service.jobs, "cancel", lambda job_id, current=None: current)
+        monkeypatch.setattr(hub.service.jobs, "wait", lambda job, timeout: None)
+        cancelled = hub.call("POST", f"/v1/jobs/{started['job_id']}/cancel")
+        assert cancelled.status == 200
+        assert cancelled.payload["state"] == "running"
+        assert cancelled.payload["done"] is False
+    finally:
+        listener.cancel_event.set()
+
+
 @pytest.mark.parametrize(
     ("body", "status", "code"),
     [
