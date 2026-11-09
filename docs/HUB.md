@@ -112,8 +112,16 @@ acknowledge a cancellation belonging to the old controller. Missing/unknown list
 running status, mismatched IDs, or an unreachable listener remain unresolved and keep the pin;
 none is treated as proof of exit. This REST-only operation requires deploying a hub version that
 supports `/v1/jobs/{job_id}/reconcile`, Azure SQL mode, and local Relay connectivity to the target.
-It does not require a schema migration. Job summaries retain the reconciliation evidence. It is not
-a process-kill or listener-restart mechanism.
+Startup installs an additive replay-fence table and database trigger under the existing schema lock.
+These permanent, compact job-identity fences are not deleted with seven-day history. They reject
+legacy writers attempting to overwrite or reinsert a reconciled job; updated hubs skip such job
+journal records while continuing other deliveries. A legacy batch rejected by the trigger stays
+pending and reports a storage error until that exact journal is replayed by updated code. The
+supporting hub must successfully install this database guard before reconciliation is enabled.
+Protocol errors (including `bad_offset`) are not execution-exit evidence and keep the pin.
+The listener's subprocess timeout sentinel (`timed_out=true`, `error=timeout`, `exit_code=-1`)
+also keeps the pin: it means a process exit was not observed after the termination wait.
+Job summaries retain the reconciliation evidence. This is not a process-kill or listener-restart mechanism.
 
 SQL is authoritative for lease policy. A missing `leases.yaml` is hydrated from the shared policy;
 an existing local policy does not override SQL. Target configuration comparisons ignore ordering,

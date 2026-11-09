@@ -16,6 +16,7 @@ import pytest
 from hub_fakes import Hub, relays_document, write_relays
 
 from privy.client import ExecResult
+from privy.hub import sql_store
 from privy.hub.jobs import RUNNING
 from privy.hub.leases import LeaseError, LeaseStore
 from privy.hub.service import HubService
@@ -280,7 +281,7 @@ def test_real_sql_summary_scan_has_no_gaps_at_equal_timestamp_boundaries(stores)
                 cursor.execute("DELETE TOP(300) dbo.privy_records WHERE kind='audit' AND target=?", key)
 
 
-def test_real_sql_reconcile_requires_inactive_owner_and_blocks_delayed_job_replay(stores):
+def test_real_sql_reconcile_requires_inactive_owner_and_blocks_delayed_job_replay(stores, monkeypatch):
     a, b, one, two = stores
     target = a.registry.resolve("sqltest/testbox00_windows")
     client_id = a.register_client("reconcile-test")["client_id"]
@@ -349,6 +350,8 @@ def test_real_sql_reconcile_requires_inactive_owner_and_blocks_delayed_job_repla
             stdout_bytes=b"",
             stderr_bytes=b"",
             duration_ms=25,
+            timed_out=False,
+            error=None,
             job_id=requested_id,
         )
 
@@ -371,13 +374,36 @@ def test_real_sql_reconcile_requires_inactive_owner_and_blocks_delayed_job_repla
         assert two.request_cancel(job_id)["acknowledged"] is True
 
         # A delayed pre-recovery journal record cannot replace the verified terminal result.
-        two.outbox.append("job", job_id, record, one.owner)
+        candidate = two.reconciliation_candidate(job_id)
+        for _ in range(candidate["revision"] + 2):
+            replay_revision = two.outbox.append("job", job_id, record, one.owner)
+            if replay_revision > candidate["revision"]:
+                break
+        assert replay_revision > candidate["revision"]
+        legacy_flush = (Path(__file__).parent / "fixtures" / "legacy_sql_flush_ef946.sql").read_text()
+        with monkeypatch.context() as legacy:
+            legacy.setattr(sql_store, "_FLUSH_BATCH", legacy_flush)
+            with pytest.raises(StorageError) as old_update:
+                two._drain()
+        assert "51002" in str(old_update.value.__cause__)
+        assert two.outbox.status()["pending_writes"] > 0
         assert two.flush(timeout=30)
         persisted = two.get("job", job_id)
         assert persisted["state"] == "succeeded"
         assert persisted["reconciled_at"] == result["job"]["reconciled_at"]
         assert (persisted["stdout_bytes"], persisted["stderr_bytes"], persisted["chunk_count"]) == (41, 9, 3)
         assert b.get_lease(lease["lease_id"])["running_jobs"] == []
+
+        two.delete("job", job_id)  # Exact fixture history removal, as retention would do.
+        two.outbox.append("job", job_id, record, one.owner)
+        with monkeypatch.context() as legacy:
+            legacy.setattr(sql_store, "_FLUSH_BATCH", legacy_flush)
+            with pytest.raises(StorageError) as old_insert:
+                two._drain()
+        assert "51002" in str(old_insert.value.__cause__)
+        assert two.outbox.status()["pending_writes"] > 0
+        assert two.flush(timeout=30)
+        assert two.get("job", job_id) is None
     finally:
         jobs.close()
         with one.transaction() as cursor:
@@ -393,8 +419,12 @@ def test_real_sql_reconcile_requires_inactive_owner_and_blocks_delayed_job_repla
                 json.dumps(owner_payload),
                 one.owner,
             )
-        if not b.get_lease(lease["lease_id"])["running_jobs"]:
-            b.release(lease["lease_id"], client_id)
-            two.delete("job", job_id)
-            with two.transaction() as cursor:
-                cursor.execute("DELETE dbo.privy_cancels WHERE job_id=?", job_id)
+        if job_id in b.get_lease(lease["lease_id"])["running_jobs"]:
+            # This fixture never starts remote execution; clean its own synthetic pin on failure.
+            job.state = "succeeded"
+            a.job_finished(job)
+        b.release(lease["lease_id"], client_id)
+        two.delete("job", job_id)
+        with two.transaction() as cursor:
+            cursor.execute("DELETE dbo.privy_cancels WHERE job_id=?", job_id)
+            cursor.execute("DELETE dbo.privy_job_fences WHERE job_id=?", job_id)

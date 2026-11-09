@@ -1098,9 +1098,15 @@ class HubService:
             ) from None
         if (
             listener_state not in ("done", "cancelled")
-            or result.error == "unknown_job"
+            or result.error not in (None, "timeout", "cancelled")
             or result.job_id != remote_job_id
             or type(result.exit_code) is not int
+            or (
+                request.mode == "subprocess"
+                and result.timed_out is True
+                and result.error == "timeout"
+                and result.exit_code == -1
+            )
         ):
             raise HubError(
                 "the listener did not confirm a terminal result for this exact remote job; "

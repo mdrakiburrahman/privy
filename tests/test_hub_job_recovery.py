@@ -1,13 +1,21 @@
 import copy
+import io
+import json
+import subprocess
+import time
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 from hub_fakes import FakeListener, Hub
 
+from privy import executor
 from privy.client import ExecResult
 from privy.hub.jobs import FAILED, RUNNING, SUCCEEDED
 from privy.hub.service import HubError
 from privy.hub.shared_jobs import SharedJobManager
-from privy.hub.sql_store import StorageError
+from privy.hub.sql_store import SqlBackend, StorageError
+from privy.protocol import ExecRequest
 
 JOB_ID = "e4d4545d803c49bb9bde53d2231001c1"
 REMOTE_JOB_ID = "cd4fbfa6e8f74a6d887922c155c07f2b"
@@ -176,7 +184,7 @@ def test_reconcile_polls_exact_remote_job_and_atomically_clears_only_its_pin(tmp
     ("listener_state", "error", "exit_code", "timed_out", "expected"),
     [
         ("done", None, 17, False, FAILED),
-        ("done", "timed out", 124, True, "timed_out"),
+        ("done", "timeout", 124, True, "timed_out"),
         ("cancelled", "cancelled", 130, False, "cancelled"),
     ],
 )
@@ -226,6 +234,208 @@ def test_reconcile_keeps_pin_when_listener_does_not_confirm_exact_terminal_job(
         assert listener.requests == [] and listener.cancelled == []
     finally:
         jobs.close()
+
+
+def test_reconcile_rejects_real_streaming_bad_offset_from_unfinished_listener_job(tmp_path, monkeypatch):
+    remote = executor._Job(ExecRequest(kind="python", code="unused", stream=True))
+    remote.id = REMOTE_JOB_ID
+    remote.out.append(b"already consumed")
+    with remote.cond:
+        remote.out.trim(remote.out.end)
+    monkeypatch.setitem(executor._JOBS, REMOTE_JOB_ID, remote)
+
+    def poll(_request, job_id, *, wait_s):
+        response = executor.poll_job(job_id, wait_s=wait_s)
+        assert response.state == "done" and response.error == "bad_offset"
+        assert remote.response is None and not remote.done.is_set()
+        return response.state, ExecResult.from_response(response)
+
+    listener = FakeListener(poll=poll)
+    hub, backend, jobs = _service(tmp_path, listener)
+    try:
+        with pytest.raises(HubError) as error:
+            _call(hub.service)
+        assert error.value.code == "job_reconciliation_unconfirmed"
+        assert backend.reconciliation_calls == []
+        assert backend.lease["running_jobs"] == [JOB_ID]
+        assert backend.cancel["acknowledged"] is False
+    finally:
+        jobs.close()
+
+
+@pytest.mark.parametrize("error_code", ["bad_offset", "unknown_job", "bad_request", "invalid_mode"])
+def test_reconcile_rejects_terminal_shaped_protocol_error(tmp_path, error_code):
+    listener = FakeListener(poll=lambda *_args, **_kwargs: ("done", _result(exit_code=1, error=error_code)))
+    hub, backend, jobs = _service(tmp_path, listener)
+    try:
+        with pytest.raises(HubError, match="did not confirm"):
+            _call(hub.service)
+        assert backend.reconciliation_calls == []
+        assert backend.lease["running_jobs"] == [JOB_ID]
+    finally:
+        jobs.close()
+
+
+def test_reconcile_rejects_real_subprocess_timeout_without_observed_exit(tmp_path, monkeypatch):
+    waits = []
+    terminated = []
+    proc = SimpleNamespace(returncode=None, stdout=io.BytesIO(), stderr=io.BytesIO())
+
+    def wait(*, timeout):
+        waits.append(timeout)
+        raise subprocess.TimeoutExpired("fixture-not-launched", timeout)
+
+    proc.wait = wait
+    monkeypatch.setattr(executor.subprocess, "Popen", lambda *_args, **_kwargs: proc)
+    monkeypatch.setattr(executor, "_attach_process_tree", lambda _proc: None)
+    monkeypatch.setattr(executor, "_terminate_process_tree", terminated.append)
+    monkeypatch.setattr(executor, "_release_process_tree", lambda _proc: None)
+    response = executor._run_subprocess("python", "not executed", 0.01, time.monotonic())
+    assert waits == [0.01, 5] and terminated == [proc] and proc.returncode is None
+    remote = executor._Job(ExecRequest(kind="python", code="not executed", mode="subprocess"))
+    remote.id = REMOTE_JOB_ID
+    remote.response = response
+    remote.done.set()
+    monkeypatch.setitem(executor._JOBS, REMOTE_JOB_ID, remote)
+
+    def poll(_request, job_id, *, wait_s):
+        polled = executor.poll_job(job_id, wait_s=wait_s)
+        assert polled.state == "done"
+        assert polled.exit_code == -1 and polled.timed_out and polled.error == "timeout"
+        return polled.state, ExecResult.from_response(polled)
+
+    hub, backend, jobs = _service(tmp_path, FakeListener(poll=poll))
+    try:
+        with pytest.raises(HubError) as error:
+            _call(hub.service)
+        assert error.value.code == "job_reconciliation_unconfirmed"
+        assert backend.reconciliation_calls == []
+        assert backend.lease["running_jobs"] == [JOB_ID]
+        assert backend.cancel["acknowledged"] is False
+    finally:
+        jobs.close()
+
+
+@pytest.mark.parametrize(
+    "mode,exit_code,timed_out,error_code,expected",
+    [
+        ("subprocess", -1, False, None, FAILED),
+        ("subprocess", -9, True, "timeout", "timed_out"),
+        ("inprocess", -1, True, "timeout", "timed_out"),
+    ],
+)
+def test_reconcile_does_not_confuse_negative_exit_with_unobserved_subprocess_sentinel(
+    tmp_path, mode, exit_code, timed_out, error_code, expected
+):
+    record = _record()
+    record["spec"]["mode"] = mode
+    listener = FakeListener(
+        poll=lambda *_args, **_kwargs: (
+            "done",
+            _result(exit_code=exit_code, timed_out=timed_out, error=error_code),
+        )
+    )
+    hub, backend, jobs = _service(tmp_path, listener, record)
+    try:
+        assert _call(hub.service)["job"]["state"] == expected
+        assert backend.lease["running_jobs"] == []
+    finally:
+        jobs.close()
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "none",
+        "active_owner",
+        "owner",
+        "revision",
+        "remote_id",
+        "client",
+        "released",
+        "pin_owner",
+        "unknown_pins",
+    ],
+)
+def test_sql_reconciliation_rechecks_identity_before_atomic_pin_and_fence_writes(changed):
+    backend = object.__new__(SqlBackend)
+    owner_record = {"active": changed == "active_owner"}
+    current = _record()
+    current["stdout_bytes"] = 41
+    lease = {
+        "lease_id": LEASE_ID,
+        "client_id": CLIENT_ID,
+        "state": "active",
+        "members": {"windows": TARGET},
+        "running_jobs": [JOB_ID, "unrelated-job"],
+        "job_owners": {JOB_ID: OLD_OWNER, "unrelated-job": "unknown-owner"},
+        "ttl_s": 1800,
+    }
+    if changed == "remote_id":
+        current["remote_job_id"] = "changed-remote"
+    if changed == "client":
+        lease["client_id"] = "changed-client"
+    if changed == "released":
+        lease["state"] = "released"
+    if changed == "pin_owner":
+        lease["job_owners"][JOB_ID] = "changed-owner"
+    if changed == "unknown_pins":
+        lease["job_owners"] = None
+    rows = iter(
+        [
+            (json.dumps(owner_record),),
+            (
+                json.dumps(current),
+                "changed-owner" if changed == "owner" else OLD_OWNER,
+                6 if changed == "revision" else 8,
+            ),
+            (json.dumps(lease),),
+            (OLD_OWNER, None),
+            (1800000000.0,),
+        ]
+    )
+    writes = []
+
+    class Cursor:
+        def execute(self, query, *params):
+            if not query.startswith("SELECT"):
+                writes.append((query, params))
+
+        def fetchone(self):
+            return next(rows)
+
+    @contextmanager
+    def transaction(lock):
+        assert lock == "privy.leases"
+        yield Cursor()
+
+    backend.transaction = transaction
+    backend.assert_owner_active = lambda _cursor: None
+    recovered = {**_record(), "state": SUCCEEDED, "reconciled_at": "verified"}
+    arguments = dict(
+        job_id=JOB_ID,
+        expected_owner=OLD_OWNER,
+        expected_revision=7,
+        lease_id=LEASE_ID,
+        client_id=CLIENT_ID,
+        target=TARGET,
+        remote_job_id=REMOTE_JOB_ID,
+        record=recovered,
+    )
+    if changed != "none":
+        with pytest.raises(StorageError):
+            backend.reconcile_job(**arguments)
+        assert writes == []
+        return
+    persisted = backend.reconcile_job(**arguments)
+    assert persisted["stdout_bytes"] == 41
+    assert persisted["cancel_requested"] is True
+    saved_lease = json.loads(
+        next(params[0] for query, params in writes if "UPDATE dbo.privy_coordination" in query)
+    )
+    assert saved_lease["running_jobs"] == ["unrelated-job"]
+    assert saved_lease["job_owners"] == {"unrelated-job": "unknown-owner"}
+    assert writes[-1] == ("INSERT dbo.privy_job_fences(job_id,owner) VALUES(?,?)", (JOB_ID, OLD_OWNER))
 
 
 @pytest.mark.parametrize(

@@ -511,7 +511,9 @@ JOIN @latest n ON p.kind=n.kind AND p.id=n.id
 WHERE n.kind<>'output' AND (
     (p.owner=n.owner AND p.revision<n.revision) OR
     (n.kind<>'job' AND p.owner<>n.owner AND p.at<n.at))
-    AND (n.kind<>'job' OR JSON_VALUE(p.payload,'$.reconciled_at') IS NULL);
+    AND (n.kind<>'job' OR (
+        JSON_VALUE(p.payload,'$.reconciled_at') IS NULL AND NOT EXISTS(
+            SELECT 1 FROM dbo.privy_job_fences f WHERE f.job_id=n.id)));
 -- A recovered job is terminal by listener evidence; an old local journal may
 -- still contain a newer sequence number, but must never overwrite that result.
 -- Keep replaying its immutable output/audit rows while suppressing only the job record.
@@ -520,7 +522,10 @@ WHERE n.kind<>'output' AND (
 _FLUSH_BATCH += """
 INSERT dbo.privy_records(kind,id,payload,owner,revision,at,target,lease_id,client_id)
 SELECT n.kind,n.id,n.payload,n.owner,n.revision,n.at,n.target,n.lease_id,n.client_id
-FROM @latest n WHERE n.kind<>'output' AND NOT EXISTS(
+FROM @latest n WHERE n.kind<>'output'
+AND (n.kind<>'job' OR NOT EXISTS(
+    SELECT 1 FROM dbo.privy_job_fences f WHERE f.job_id=n.id))
+AND NOT EXISTS(
     SELECT 1 FROM dbo.privy_records p WITH(UPDLOCK,HOLDLOCK) WHERE p.kind=n.kind AND p.id=n.id);
 INSERT dbo.privy_output(job_id,chunk_index,stream,start_offset,end_offset,payload)
 SELECT JSON_VALUE(n.payload,'$.job_id'),CAST(JSON_VALUE(n.payload,'$.index') AS bigint),
@@ -541,6 +546,27 @@ IF NOT EXISTS(SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.privy_rec
         INCLUDE(kind,id) WHERE kind<>''probe'' AND kind<>''call''');
 """
 
+_RECONCILIATION_SCHEMA = """
+IF OBJECT_ID('dbo.privy_job_fences') IS NULL
+    CREATE TABLE dbo.privy_job_fences(
+        job_id nvarchar(400) NOT NULL PRIMARY KEY,
+        owner nvarchar(64) NOT NULL,
+        reconciled_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME());
+INSERT dbo.privy_job_fences(job_id,owner)
+SELECT p.id,p.owner FROM dbo.privy_records p
+WHERE p.kind='job' AND JSON_VALUE(p.payload,'$.reconciled_at') IS NOT NULL
+AND NOT EXISTS(SELECT 1 FROM dbo.privy_job_fences f WHERE f.job_id=p.id);
+IF OBJECT_ID('dbo.privy_reconciled_job_guard','TR') IS NULL
+    EXEC('CREATE TRIGGER dbo.privy_reconciled_job_guard ON dbo.privy_records
+        AFTER INSERT, UPDATE AS
+        BEGIN
+            SET NOCOUNT ON;
+            IF EXISTS(SELECT 1 FROM inserted i JOIN dbo.privy_job_fences f
+                ON i.kind=''job'' AND i.id=f.job_id)
+                THROW 51002, ''Privy reconciled job replay is fenced'', 1;
+        END');
+"""
+
 _IMPORT_BATCH = """
 DECLARE @rows TABLE(kind nvarchar(32), id nvarchar(400), payload nvarchar(max),
     owner nvarchar(64), at float, target nvarchar(300),
@@ -552,7 +578,9 @@ WITH(kind nvarchar(32), id nvarchar(400), payload nvarchar(max) AS JSON,
 INSERT dbo.privy_records(kind,id,payload,owner,revision,at,target,lease_id,client_id)
 OUTPUT inserted.kind,inserted.id
 SELECT n.kind,n.id,n.payload,n.owner,0,n.at,n.target,n.lease_id,n.client_id
-FROM @rows n WHERE NOT EXISTS(
+FROM @rows n WHERE (n.kind<>'job' OR NOT EXISTS(
+    SELECT 1 FROM dbo.privy_job_fences f WHERE f.job_id=n.id))
+AND NOT EXISTS(
     SELECT 1 FROM dbo.privy_records p WITH(UPDLOCK,HOLDLOCK) WHERE p.kind=n.kind AND p.id=n.id);
 """
 
@@ -763,6 +791,7 @@ class SqlBackend:
         with self.transaction("privy.schema.v1") as cursor:
             cursor.execute(_SCHEMA)
             cursor.execute(_READ_SCHEMA)
+            cursor.execute(_RECONCILIATION_SCHEMA)
             cursor.execute("SELECT version FROM dbo.privy_schema")
             versions = [row[0] for row in cursor.fetchall()]
             if versions != [1]:
@@ -1966,6 +1995,11 @@ class SqlBackend:
                 "WHERE kind='lease' AND id=?",
                 json.dumps(lease, ensure_ascii=True),
                 lease_id,
+            )
+            cursor.execute(
+                "INSERT dbo.privy_job_fences(job_id,owner) VALUES(?,?)",
+                job_id,
+                expected_owner,
             )
 
         model = getattr(self, "read_model", None)
