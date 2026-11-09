@@ -1,4 +1,4 @@
-name: GCI endpoint metadata only
+name: GCI provider runtime metadata only
 on:
   workflow_dispatch:
 permissions:
@@ -13,25 +13,56 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Extract allowlisted endpoint metadata
+      - name: Read provider runtime metadata once
         env:
           BASE64_ENV: ${{ secrets.BASE64_ENV }}
         shell: python
         run: |
           import base64
+          import datetime
+          import hashlib
+          import hmac
+          import http.client
           import json
           import os
           import pathlib
           import re
           import shlex
-          import sys
+          import signal
+          import ssl
+          import time
+          import urllib.parse
+          import xml.etree.ElementTree as ET
 
-          def extract():
+          OFFICIAL_SOURCE = "059ecbcdb07475021696761e3574f34370b3b2c2"
+          HOST = "rakirahman.servicebus.windows.net"
+          PATH = "privy"
+          receipt = {
+              "namespace": "rakirahman",
+              "path": PATH,
+              "http_status": None,
+              "outcome": "configuration_refused",
+              "listener_count": None,
+              "provenance": {
+                  key: os.environ[key]
+                  for key in ("GITHUB_REPOSITORY", "GITHUB_WORKFLOW_REF", "GITHUB_SHA",
+                              "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")
+              },
+              "official_source_commit": OFFICIAL_SOURCE,
+          }
+          connection = None
+
+          def deadline(signum, frame):
+              raise TimeoutError()
+
+          def read_once():
+              global connection
               raw = os.environ.pop("BASE64_ENV", "")
               if not raw or len(raw) > 131072:
                   raise ValueError()
               text = base64.b64decode(raw, validate=True).decode("utf-8")
-              wanted = {"PRIVY_RELAY_NAMESPACE", "PRIVY_RELAY_PATH"}
+              required = {"PRIVY_RELAY_NAMESPACE", "PRIVY_RELAY_PATH",
+                          "PRIVY_RELAY_KEYRULE", "PRIVY_RELAY_KEY"}
               values = {}
               for line in text.splitlines():
                   tokens = shlex.split(line, comments=True, posix=True)
@@ -44,36 +75,91 @@ jobs:
                   name, value = tokens[0].split("=", 1)
                   if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
                       raise ValueError()
-                  if name in wanted:
-                      if name in values or not value:
+                  if name in required:
+                      if name in values or not value or len(value) > 256 or any(ord(c) < 32 for c in value):
                           raise ValueError()
                       values[name] = value
-              if set(values) != wanted:
+              if set(values) != required:
                   raise ValueError()
-              if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", values["PRIVY_RELAY_NAMESPACE"]):
+              if values["PRIVY_RELAY_NAMESPACE"] != "rakirahman" or values["PRIVY_RELAY_PATH"] != PATH:
                   raise ValueError()
-              if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._~/-]{0,259}", values["PRIVY_RELAY_PATH"]):
-                  raise ValueError()
-              result = {
-                  "endpoint": values,
-                  "provenance": {
-                      key: os.environ[key]
-                      for key in ("GITHUB_REPOSITORY", "GITHUB_WORKFLOW", "GITHUB_WORKFLOW_REF",
-                                  "GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")
-                  },
-              }
-              output = pathlib.Path(os.environ["RUNNER_TEMP"]) / "gci-endpoint-metadata.json"
-              output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+              # Official TokenProvider normalizes sb audience to http with trailing slash.
+              audience = urllib.parse.quote_plus("http://" + HOST + "/" + PATH + "/", safe="")
+              expiry = str(int(time.time()) + 600)
+              signature = base64.b64encode(hmac.new(
+                  values["PRIVY_RELAY_KEY"].encode("utf-8"),
+                  (audience + "\n" + expiry).encode("utf-8"),
+                  hashlib.sha256,
+              ).digest()).decode("ascii")
+              token = ("SharedAccessSignature sr=" + audience +
+                       "&sig=" + urllib.parse.quote_plus(signature, safe="") +
+                       "&se=" + expiry +
+                       "&skn=" + urllib.parse.quote_plus(values["PRIVY_RELAY_KEYRULE"], safe=""))
+              receipt["outcome"] = "transport_failure"
+              connection = http.client.HTTPSConnection(HOST, timeout=10, context=ssl.create_default_context())
+              # Exactly one request; http.client has no redirect handling or retry loop.
+              connection.request("GET", "/" + PATH + "?api-version=2016-07", headers={
+                  "X-PROCESS-AT": "ServiceBus",
+                  "Authorization": token,
+                  "Accept": "application/atom+xml",
+                  "Connection": "close",
+              })
+              response = connection.getresponse()
+              receipt["http_status"] = response.status
+              receipt["outcome"] = "http_failure"
+              if response.status != 200:
+                  return
+              receipt["outcome"] = "invalid_metadata"
+              if response.headers.get("Content-Encoding", "identity").lower() != "identity":
+                  return
+              body = bytearray()
+              while len(body) <= 65536:
+                  chunk = response.read1(min(4096, 65537 - len(body)))
+                  if not chunk:
+                      break
+                  body.extend(chunk)
+              if len(body) > 65536 or b"<!DOCTYPE" in body.upper() or b"<!ENTITY" in body.upper():
+                  return
+              root = ET.fromstring(body)
+              atom = "{http://www.w3.org/2005/Atom}"
+              sb = "{http://schemas.microsoft.com/netservices/2010/10/servicebus/connect}"
+              if root.tag != atom + "entry":
+                  return
+              contents = root.findall(atom + "content")
+              if len(contents) != 1:
+                  return
+              descriptions = list(contents[0])
+              if len(descriptions) != 1 or descriptions[0].tag != sb + "HybridConnectionDescription":
+                  return
+              counts = descriptions[0].findall(sb + "ListenerCount")
+              if len(counts) != 1 or list(counts[0]) or not re.fullmatch(r"0|[1-9][0-9]{0,9}", counts[0].text or ""):
+                  return
+              count = int(counts[0].text)
+              if count > 2147483647:
+                  return
+              receipt["listener_count"] = count
+              receipt["outcome"] = "metadata_observed_hold" if count else "metadata_observed_zero"
 
+          signal.signal(signal.SIGALRM, deadline)
+          signal.alarm(25)
           try:
-              extract()
+              read_once()
+          except TimeoutError:
+              receipt["outcome"] = "deadline_exceeded"
           except Exception:
-              print("Endpoint metadata extraction refused: invalid or ambiguous configuration.", file=sys.stderr)
-              sys.exit(1)
-      - name: Upload allowlisted metadata
+              # Do not expose exception strings, response XML or credential-bearing context.
+              receipt["outcome"] += "_refused"
+          finally:
+              signal.alarm(0)
+              if connection is not None:
+                  connection.close()
+              receipt["captured_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+              output = pathlib.Path(os.environ["RUNNER_TEMP"]) / "gci-provider-metadata.json"
+              output.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+      - name: Upload allowlisted metadata receipt
         uses: actions/upload-artifact@v4
         with:
-          name: gci-endpoint-metadata-${{ github.run_id }}
-          path: ${{ runner.temp }}/gci-endpoint-metadata.json
+          name: gci-provider-metadata-${{ github.run_id }}
+          path: ${{ runner.temp }}/gci-provider-metadata.json
           if-no-files-found: error
           retention-days: 1
