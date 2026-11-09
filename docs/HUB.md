@@ -108,20 +108,20 @@ The endpoint polls only the already-recorded listener job ID with a zero-second 
 the exact job, remote ID, active lease, holder client, canonical target, and job pin to still match,
 and rechecks those identities plus the explicitly inactive old controller in the fenced SQL
 transaction before persisting a terminal listener result. Only then does it clear that job's pin and
-acknowledge a cancellation belonging to the old controller. Missing/unknown listener jobs,
-running status, mismatched IDs, or an unreachable listener remain unresolved and keep the pin;
-none is treated as proof of exit. This REST-only operation requires deploying a hub version that
-supports `/v1/jobs/{job_id}/reconcile`, Azure SQL mode, and local Relay connectivity to the target.
-Startup installs an additive replay-fence table and database trigger under the existing schema lock.
-These permanent, compact job-identity fences are not deleted with seven-day history. They reject
-legacy writers attempting to overwrite or reinsert a reconciled job; updated hubs skip such job
-journal records while continuing other deliveries. A legacy batch rejected by the trigger stays
-pending and reports a storage error until that exact journal is replayed by updated code. The
-supporting hub must successfully install this database guard before reconciliation is enabled.
-Protocol errors (including `bad_offset`) are not execution-exit evidence and keep the pin.
-The listener's subprocess timeout sentinel (`timed_out=true`, `error=timeout`, `exit_code=-1`)
-also keeps the pin: it means a process exit was not observed after the termination wait.
-Job summaries retain the reconciliation evidence. This is not a process-kill or listener-restart mechanism.
+acknowledge a cancellation belonging to the old controller. Missing/unknown listener jobs, running
+status, mismatched IDs, or an unreachable listener remain unresolved and keep the pin; none is
+treated as proof of exit. This REST-only operation requires deploying a hub version that supports
+`/v1/jobs/{job_id}/reconcile`, Azure SQL mode, and local Relay connectivity to the target. Startup
+installs an additive replay-fence table and database trigger under the existing schema lock. These
+permanent, compact job-identity fences are not deleted with seven-day history. They reject legacy
+writers attempting to overwrite or reinsert a reconciled job; updated hubs skip such job journal
+records while continuing other deliveries. A legacy batch rejected by the trigger stays pending and
+reports a storage error until that exact journal is replayed by updated code. The supporting hub
+must successfully install this database guard before reconciliation is enabled. Protocol errors
+(including `bad_offset`) are not execution-exit evidence and keep the pin. The listener's subprocess
+timeout sentinel (`timed_out=true`, `error=timeout`, `exit_code=-1`) also keeps the pin: it means a
+process exit was not observed after the termination wait. Job summaries retain the reconciliation
+evidence. This is not a process-kill or listener-restart mechanism.
 
 SQL is authoritative for lease policy. A missing `leases.yaml` is hydrated from the shared policy;
 an existing local policy does not override SQL. Target configuration comparisons ignore ordering,
@@ -168,9 +168,9 @@ serving stops and normal shutdown completes. Allow up to five minutes for the re
 shutdown and SQL flush have bounded waits. HTTP 503 `drain_pending` with `Retry-After: 1` leaves the
 hub draining; retry after jobs finish or SQL recovers. Health remains available and reports
 `draining: true`; other requests return 503 `hub_draining`. A response timeout is not proof of
-success: preserve the home until success and process exit are confirmed.
-After a successful drain, HTTP server shutdown still proceeds if the caller disconnects or the
-response cannot be flushed. A failed or pending drain never schedules shutdown.
+success: preserve the home until success and process exit are confirmed. After a successful drain,
+HTTP server shutdown still proceeds if the caller disconnects or the response cannot be flushed. A
+failed or pending drain never schedules shutdown.
 
 Older binaries without this endpoint require a first **in-place, same-home bridge upgrade**:
 preserve the complete home/outbox, stop the exact old process, then start the new binary against
@@ -628,26 +628,26 @@ Re-run the listener installer with `-UpdateBinary` to upgrade them.
 No route needs authentication. `GET /v1` describes the hub as JSON, and `GET /openapi.json` is a
 complete OpenAPI 3.1 description with examples.
 
-| Method and path                     | Operation                                                                       |
-| ----------------------------------- | ------------------------------------------------------------------------------- |
-| `GET /` and `GET /llms.txt`         | Quickstart (Markdown) with the machines online now; `/` serves browsers HTML    |
-| `GET /ui`                           | Dashboard (HTML); see [Dashboard](#dashboard)                                   |
-| `GET /v1/stats`                     | In-memory usage metrics with independent history range and resolution           |
-| `GET /v1/relays`                    | Export normalized Relay credentials per target (sensitive JSON; REST only)      |
-| `GET /v1/targets`                   | `list_targets` (`refresh`, `online_only`, `relay`, `probe`, and detail filters) |
-| `GET /v1/targets/{target}`          | `get_target`                                                                    |
-| `POST /v1/jobs`                     | `run`; `stream=true` streams the output                                         |
-| `GET /v1/jobs`                      | `list_jobs`                                                                     |
-| `GET /v1/jobs/{job_id}`             | `get_job` (`wait_s`, `max_output_bytes`, `stdout_offset`, `stderr_offset`)      |
-| `GET /v1/jobs/{job_id}/stream`      | The job's output from the start, then live until it finishes                    |
-| `GET /v1/jobs/{job_id}/output`      | `read_job_output` (`stream`, `offset`, `limit`)                                 |
-| `POST /v1/jobs/{job_id}/cancel`     | `cancel_job`                                                                    |
+| Method and path                     | Operation                                                                          |
+| ----------------------------------- | ---------------------------------------------------------------------------------- |
+| `GET /` and `GET /llms.txt`         | Quickstart (Markdown) with the machines online now; `/` serves browsers HTML       |
+| `GET /ui`                           | Dashboard (HTML); see [Dashboard](#dashboard)                                      |
+| `GET /v1/stats`                     | In-memory usage metrics with independent history range and resolution              |
+| `GET /v1/relays`                    | Export normalized Relay credentials per target (sensitive JSON; REST only)         |
+| `GET /v1/targets`                   | `list_targets` (`refresh`, `online_only`, `relay`, `probe`, and detail filters)    |
+| `GET /v1/targets/{target}`          | `get_target`                                                                       |
+| `POST /v1/jobs`                     | `run`; `stream=true` streams the output                                            |
+| `GET /v1/jobs`                      | `list_jobs`                                                                        |
+| `GET /v1/jobs/{job_id}`             | `get_job` (`wait_s`, `max_output_bytes`, `stdout_offset`, `stderr_offset`)         |
+| `GET /v1/jobs/{job_id}/stream`      | The job's output from the start, then live until it finishes                       |
+| `GET /v1/jobs/{job_id}/output`      | `read_job_output` (`stream`, `offset`, `limit`)                                    |
+| `POST /v1/jobs/{job_id}/cancel`     | `cancel_job`                                                                       |
 | `POST /v1/jobs/{job_id}/reconcile`  | SQL-only reconciliation of an exact listener job from an explicitly inactive owner |
-| `POST /v1/broadcasts`               | `broadcast`                                                                     |
-| `GET /v1/broadcasts/{broadcast_id}` | `get_broadcast`                                                                 |
-| `POST /v1/files/upload`             | `upload_file`                                                                   |
-| `POST /v1/files/download`           | `download_file`                                                                 |
-| `POST /v1/files/sync`               | `sync_files`: async file/folder contents update (REST only; 202 + job URL)      |
+| `POST /v1/broadcasts`               | `broadcast`                                                                        |
+| `GET /v1/broadcasts/{broadcast_id}` | `get_broadcast`                                                                    |
+| `POST /v1/files/upload`             | `upload_file`                                                                      |
+| `POST /v1/files/download`           | `download_file`                                                                    |
+| `POST /v1/files/sync`               | `sync_files`: async file/folder contents update (REST only; 202 + job URL)         |
 
 Arguments go in the query string, in a JSON body (`Content-Type: application/json`), or both. For
 `POST /v1/jobs` and `POST /v1/broadcasts`, putting `target` (or `targets`) in the query string makes
