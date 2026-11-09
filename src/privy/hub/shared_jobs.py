@@ -301,9 +301,17 @@ class SharedJob(HubJob):
 
     poll_interval = TICK_S
 
-    def __init__(self, backend: Any, record: dict[str, Any], *, snapshot: bool = False) -> None:
+    def __init__(
+        self,
+        backend: Any,
+        record: dict[str, Any],
+        *,
+        snapshot: bool = False,
+        submitted: HubJob | None = None,
+    ) -> None:
         self.backend = backend
         self._snapshot = snapshot
+        self._submitted = submitted
         target_id = record["target"]
         relay, _, path = target_id.partition("/")
         super().__init__(
@@ -351,7 +359,13 @@ class SharedJob(HubJob):
     def refresh(self) -> None:
         if self._snapshot:
             return
-        record = self.backend.get("job", self.id)
+        try:
+            record = self.backend.get("job", self.id)
+        except StorageError:
+            if self._submitted is None:
+                raise
+            log.warning("SQL refresh unavailable for admitted job %s; returning owner-local state", self.id)
+            record = job_record(self._submitted, self.owner)
         if record is not None:
             with self.cond:
                 self._apply(record)
@@ -419,6 +433,28 @@ class SharedJob(HubJob):
         return dict(self.cursor)
 
     def view(
+        self, *, max_output_bytes: int, offsets=None, advance: bool = True, refresh: bool = True
+    ) -> dict[str, Any]:
+        try:
+            return self._view(
+                max_output_bytes=max_output_bytes, offsets=offsets, advance=advance, refresh=refresh
+            )
+        except StorageError:
+            if self._submitted is None:
+                raise
+            log.warning(
+                "SQL output unavailable for admitted job %s; returning owner-local view without "
+                "advancing shared cursors",
+                self.id,
+            )
+            result = shared_payload(
+                self._submitted.view(max_output_bytes=max_output_bytes, offsets=offsets, advance=False),
+                local_path=self._submitted.spec.get("local_path"),
+            )
+            result["owner"] = self.owner
+            return result
+
+    def _view(
         self, *, max_output_bytes: int, offsets=None, advance: bool = True, refresh: bool = True
     ) -> dict[str, Any]:
         result = self.summary(refresh=refresh)
@@ -527,6 +563,7 @@ class SharedJobManager(JobManager):
         self._audit_import_thread: threading.Thread | None = None
         self._pending_lock = threading.Lock()
         self._pending_finishes: dict[str, HubJob] = {}
+        self._pending_broadcasts: dict[str, dict[str, Any]] = {}
         self._cancel_thread = threading.Thread(
             target=self._monitor_cancels, name="privy-shared-cancel", daemon=True
         )
@@ -820,9 +857,18 @@ class SharedJobManager(JobManager):
     def _retry_finishes(self) -> None:
         with self._pending_lock:
             jobs = list(self._pending_finishes.values())
+            broadcasts = list(self._pending_broadcasts.items())
         for job in jobs:
             with job.cond:
                 self._complete_locked(job)
+        for broadcast_id, record in broadcasts:
+            try:
+                self.backend.enqueue("broadcast", broadcast_id, record)
+            except StorageError:
+                log.exception("shared broadcast %s persistence failed; will retry", broadcast_id)
+            else:
+                with self._pending_lock:
+                    self._pending_broadcasts.pop(broadcast_id, None)
 
     def _output_record(self, job: HubJob, stream: str, start: int, data: bytes) -> None:
         index = job.chunks_base + len(job.chunks)
@@ -844,7 +890,8 @@ class SharedJobManager(JobManager):
 
     def _launch(self, job, body):
         super()._launch(job, body)
-        return self.get(job.id)
+        reader = getattr(self.backend, "read_model", self.backend)
+        return SharedJob(reader, job_record(job, self.backend.owner), submitted=job)
 
     def _run(self, job, body):
         try:
@@ -879,7 +926,10 @@ class SharedJobManager(JobManager):
 
     def start_broadcast(self, *args, **kwargs):
         broadcast, jobs = super().start_broadcast(*args, **kwargs)
-        self.backend.put("broadcast", broadcast.id, {**asdict(broadcast), "owner": self.backend.owner})
+        record = {**asdict(broadcast), "owner": self.backend.owner}
+        with self._pending_lock:
+            self._pending_broadcasts[broadcast.id] = record
+        self._retry_finishes()
         return broadcast, jobs
 
     def get_broadcast(self, broadcast_id):
@@ -959,7 +1009,7 @@ class SharedJobManager(JobManager):
         self._retry_finishes()
         flushed = self.backend.flush(timeout=timeout)
         with self._pending_lock:
-            return flushed and not self._pending_finishes
+            return flushed and not self._pending_finishes and not self._pending_broadcasts
 
     @property
     def audit_import_running(self) -> bool:

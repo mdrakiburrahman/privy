@@ -15,10 +15,11 @@ import uuid
 import pytest
 from hub_fakes import FakeListener, Hub, blocking_run, exec_result
 
-from privy.hub.jobs import CANCELLED, RUNNING, SUCCEEDED, HubJob, utc_iso
+from privy.hub.jobs import CANCELLED, RUNNING, SUCCEEDED, HubJob, JobManager, utc_iso
 from privy.hub.listener_facts import ListenerInfoStore
 from privy.hub.metrics import ReportSelection
 from privy.hub.registry import ONLINE, ProbeResult
+from privy.hub.rest import RestApi
 from privy.hub.service import HubError, HubService
 from privy.hub.shared_jobs import SharedAuditLog, SharedJob, SharedJobManager, job_record
 from privy.hub.shared_metrics import SharedHubMetrics, SharedMetrics
@@ -695,6 +696,54 @@ def test_service_reports_sql_status_and_storage_errors_as_503(tmp_path):
         assert error.value.status == 503 and error.value.code == "storage_unavailable"
         assert "credential-bearing" not in str(error.value)
     finally:
+        jobs.close()
+
+
+@pytest.mark.parametrize("operation", ["run", "broadcast"])
+@pytest.mark.parametrize("failure", ["get", "read_cursors", "output", "advance_cursor"])
+def test_sql_read_failure_after_launch_returns_admitted_job_id(tmp_path, monkeypatch, operation, failure):
+    hub = Hub(tmp_path)
+    backend = Backend()
+    jobs = manager(hub, backend, cancel_poll_s=10)
+    service = HubService(registry=hub.registry, jobs=jobs, version="test")
+    launch = JobManager._launch
+    original = getattr(backend, failure)
+    launched = []
+
+    def fail(*args, **kwargs):
+        raise StorageError("SQL unavailable after worker launch")
+
+    def launch_then_fail(self, job, body):
+        result = launch(self, job, body)
+        launched.append(job.id)
+        monkeypatch.setattr(backend, failure, fail)
+        return result
+
+    monkeypatch.setattr(JobManager, "_launch", launch_then_fail)
+    args = {"code": "hello", "language": "bash", "wait_s": 1}
+    args.update(
+        {"target": "dev/box1_windows"}
+        if operation == "run"
+        else {"targets": ["dev/box1_windows"], "only_online": False}
+    )
+    try:
+        response = RestApi(service).handle(
+            "POST",
+            "/v1/jobs" if operation == "run" else "/v1/broadcasts",
+            {},
+            {"Content-Type": "application/json"},
+            json.dumps(args).encode(),
+        )
+        assert response.status == 200
+        data = json.loads(response.body())
+        views = [data] if operation == "run" else data["jobs"]
+        assert [view["job_id"] for view in views] == launched
+        assert views[0]["stdout"] == "ran bash: hello\n"
+        assert len(hub.listeners["dev/box1_windows"].requests) == 1
+        if failure != "get":
+            assert backend.get("job", launched[0])["state"] == SUCCEEDED
+    finally:
+        monkeypatch.setattr(backend, failure, original)
         jobs.close()
 
 

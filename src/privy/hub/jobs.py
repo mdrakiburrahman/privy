@@ -539,20 +539,30 @@ class JobManager:
             code=code,
             origin=origin,
         )
-        jobs = [
-            self.start_exec(
-                target,
-                language=language,
-                code=code,
-                mode=mode,
-                timeout_s=timeout_s,
-                origin=origin,
-                broadcast_id=broadcast_id,
-                purpose=purpose,
-                lease_id=lease_id,
-            )
-            for target, language in runs
-        ]
+        from privy.hub.sql_store import StorageError
+
+        jobs = []
+        skipped = list(skipped)
+        for target, language in runs:
+            try:
+                jobs.append(
+                    self.start_exec(
+                        target,
+                        language=language,
+                        code=code,
+                        mode=mode,
+                        timeout_s=timeout_s,
+                        origin=origin,
+                        broadcast_id=broadcast_id,
+                        purpose=purpose,
+                        lease_id=lease_id,
+                    )
+                )
+            except StorageError:
+                if not jobs:
+                    raise
+                log.exception("broadcast %s could not admit target %s", broadcast_id, target.id)
+                skipped.append({"target": target.id, "status": "storage_unavailable"})
         broadcast = Broadcast(
             id=broadcast_id,
             created_at=time.time(),
