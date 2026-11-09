@@ -639,6 +639,63 @@ def test_external_launcher_contains_bootstrap_and_descendants(tmp_path):
             kernel.CloseHandle(handle)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows full launcher preflight")
+@pytest.mark.parametrize("case", ["relative", "unc", "device", "provider", "mapped", "reparse"])
+def test_full_launcher_preflight_locality_and_powershell_location(tmp_path, case):
+    source = Path(__file__).parents[1] / "scripts" / "Invoke-JobObserver.ps1"
+    directory = tmp_path / "ps-location"
+    directory.mkdir()
+    for name in ("observer.exe", "bindings.yaml", "settings.yaml", "relays.json"):
+        (directory / name).write_text("synthetic-no-execution")
+    harness = tmp_path / "preflight.ps1"
+    harness.write_text(
+        "$ErrorActionPreference='Stop';"
+        "$content=Get-Content -Raw -LiteralPath $args[0];"
+        "$prefix=$content.Substring(0,$content.IndexOf(\"$\"+'arguments ='));"
+        "$case=$args[2];Set-Location -LiteralPath $args[1];"
+        "$hash=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes((Join-Path $args[1] 'observer.exe')))).Replace('-','');"
+        "$global:access=0;$global:hashes=0;"
+        "function Get-Item {param($LiteralPath,[switch]$Force) $global:access++;"
+        "if($LiteralPath.StartsWith('\\\\')){throw 'Remote metadata access attempted'};"
+        "if($case -eq 'mapped'){throw 'Remote file access attempted'};"
+        "if($case -eq 'reparse' -and $LiteralPath.EndsWith('settings.yaml')){"
+        "return [pscustomobject]@{Attributes=[IO.FileAttributes]::ReparsePoint;PSIsContainer=$false}};"
+        "Microsoft.PowerShell.Management\\Get-Item -LiteralPath $LiteralPath -Force:$Force};"
+        "function Get-FileHash {param($LiteralPath,$Algorithm) $global:hashes++;"
+        "[pscustomobject]@{Hash=$hash}};"
+        "$inputPath='.\\settings.yaml';"
+        "switch($case){"
+        "'unc' {$inputPath='\\\\uncontacted.invalid\\share\\settings.yaml'}"
+        "'device' {$inputPath='\\\\?\\UNC\\uncontacted.invalid\\share\\settings.yaml'}"
+        "'provider' {$inputPath='Registry::HKEY_CURRENT_USER\\Software'}"
+        "'mapped' {$prefix=$prefix.Replace('[PrivyObserverLaunch]::IsLocalDrive($root)','$false');$inputPath='.\\observer.exe'}"
+        "};"
+        "try {"
+        "if($case -eq 'mapped'){"
+        "& ([scriptblock]::Create($prefix)) -Executable $inputPath -ExpectedSha256 $hash -Bindings '.\\bindings.yaml' -Settings '.\\settings.yaml' -Relays '.\\relays.json'"
+        "} else {"
+        "& ([scriptblock]::Create($prefix)) -Executable '.\\observer.exe' -ExpectedSha256 $hash -Bindings '.\\bindings.yaml' -Settings $inputPath -Relays '.\\relays.json'"
+        "};"
+        "if($case -ne 'relative'){throw 'Disallowed path accepted'};"
+        "if($global:hashes -ne 1){throw 'Expected one local artifact hash'};"
+        "Write-Output 'LOCAL_PREFLIGHT_PASSED';"
+        "} catch {"
+        "if($case -eq 'relative'){throw};"
+        "if($global:hashes -ne 0){throw 'Content hash before locality rejection'};"
+        "if($case -eq 'mapped' -and $global:access -ne 0){throw 'Mapped remote accessed'};"
+        "Write-Output ('REFUSED:'+$_)"
+        "}"
+    )
+    result = observer.subprocess.run(
+        ["powershell", "-NoProfile", "-File", str(harness), str(source), str(directory), case],
+        cwd=str(tmp_path),
+        capture_output=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert (b"LOCAL_PREFLIGHT_PASSED" if case == "relative" else b"REFUSED:") in result.stdout
+
+
 def test_cli_missing_arguments_never_initializes_hub(monkeypatch, capsys):
     from privy.cli import main
     from privy.hub.service import HubService

@@ -11,20 +11,6 @@ $ErrorActionPreference = 'Stop'
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw 'Observer launcher requires Windows Job Object containment.'
 }
-# Preflight is offline; the externally enforced deadline starts at native launch.
-$exe = (Resolve-Path -LiteralPath $Executable).Path
-if ($exe.StartsWith('\\') -or (Get-Item -LiteralPath $exe).Length -gt 128MB) {
-    throw 'Observer executable must be a bounded local file.'
-}
-if ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash -ne $ExpectedSha256) {
-    throw 'Observer executable hash mismatch.'
-}
-$paths = @($Bindings, $Settings, $Relays) | ForEach-Object {
-    $p = [IO.Path]::GetFullPath($_)
-    if ($p.StartsWith('\\')) { throw 'Observer inputs must be local paths.' }
-    $p
-}
-
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections;
@@ -84,6 +70,16 @@ public sealed class PrivyObserverLaunch : IDisposable {
     static extern bool GetExitCodeProcess(IntPtr process, out uint code);
     [DllImport("kernel32.dll")]
     static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern uint QueryDosDevice(string device, StringBuilder target, int capacity);
+    public static bool IsLocalDrive(string root) {
+        if (root.Length != 3 || root[1] != ':' || root[2] != '\\') return false;
+        var target = new StringBuilder(1024);
+        if (QueryDosDevice(root.Substring(0, 2), target, target.Capacity) == 0) return false;
+        // Reject network mappings, SUBST aliases and unknown device targets.
+        return target.ToString().StartsWith(@"\Device\HarddiskVolume", StringComparison.OrdinalIgnoreCase)
+            && new System.IO.DriveInfo(root).DriveType == System.IO.DriveType.Fixed;
+    }
     IntPtr job, process;
     readonly Stopwatch deadline = new Stopwatch();
     public uint Pid { get; private set; }
@@ -171,6 +167,54 @@ public sealed class PrivyObserverLaunch : IDisposable {
     }
 }
 '@
+
+function Resolve-ObserverLocalPath {
+    param([Parameter(Mandatory)][string] $Path)
+    # Reject network/device forms before provider resolution or any file access.
+    $form = $Path.Replace('/', '\')
+    if ($form.StartsWith('\\') -or $form.StartsWith('\??\') -or $form.Contains('::')) {
+        throw 'Observer paths must be ordinary local FileSystem paths.'
+    }
+    $provider = $null
+    $drive = $null
+    $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+        $Path, [ref] $provider, [ref] $drive)
+    if ($provider.Name -ne 'FileSystem' -or ($null -ne $drive -and $drive.DisplayRoot)) {
+        throw 'Observer paths require a local FileSystem provider drive.'
+    }
+    $root = [IO.Path]::GetPathRoot($resolved)
+    if (-not [PrivyObserverLaunch]::IsLocalDrive($root)) {
+        throw 'Observer path locality could not be established.'
+    }
+    if ($resolved.Substring($root.Length).Contains(':')) {
+        throw 'Observer alternate data streams are forbidden.'
+    }
+    # Walk from the confirmed local volume outward; never traverse a link/junction.
+    $current = $root
+    $parts = $resolved.Substring($root.Length).Split('\', [StringSplitOptions]::RemoveEmptyEntries)
+    foreach ($part in $parts) {
+        $current = [IO.Path]::Combine($current, $part)
+        $item = Get-Item -LiteralPath $current -Force
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw 'Observer paths must not traverse reparse points or links.'
+        }
+    }
+    if ((Get-Item -LiteralPath $resolved -Force).PSIsContainer) {
+        throw 'Observer path must identify an existing local file.'
+    }
+    return $resolved
+}
+
+# Preflight is offline and outside the native-launch deadline.
+# Establish locality for every path before any content read or artifact hash.
+$exe = Resolve-ObserverLocalPath -Path $Executable
+$paths = @($Bindings, $Settings, $Relays) | ForEach-Object { Resolve-ObserverLocalPath -Path $_ }
+if ((Get-Item -LiteralPath $exe).Length -gt 128MB) {
+    throw 'Observer executable must be a bounded local file.'
+}
+if ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash -ne $ExpectedSha256) {
+    throw 'Observer executable hash mismatch.'
+}
 
 $arguments = @('observe-job', '--bindings', $paths[0], '--settings', $paths[1], '--relays', $paths[2])
 $owned = $null

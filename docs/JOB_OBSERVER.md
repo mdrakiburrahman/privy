@@ -94,7 +94,14 @@ raw response limit. Encoded responses, redirects and non-200 statuses are refuse
 error body or following another endpoint. The external launcher starts a 45-second deadline at
 native process launch, covering onefile extraction/bootstrap as well as credentials, native ODBC,
 DNS and HTTP. Offline launcher compilation, local-path checks and artifact-hash preflight occur
-before that deadline; they do not contact the workload. Inputs and artifact must be local files.
+before that deadline; they do not contact the workload. Inputs and artifact must be local files. All
+paths resolve against PowerShell's current FileSystem location, including after `Set-Location` or
+`Push-Location`; process working-directory differences do not select other input files.
+UNC/device/provider-qualified forms are rejected before file access. Native drive-device checks
+require a fixed local hard-disk volume and reject network mappings, SUBST aliases and unknown
+devices. Every path component is checked for reparse points before it is traversed; links/junctions
+and alternate data streams are refused. Locality must be established for all four files before the
+artifact content hash is read. This conservative boundary can reject otherwise usable local aliases.
 
 Before resuming the executable's first instruction, the launcher assigns its suspended process to a
 kill-on-close Windows Job Object without breakaway permission. The private worker is likewise
