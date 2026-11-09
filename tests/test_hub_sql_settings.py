@@ -95,6 +95,13 @@ def test_same_home_successor_fences_previous_incarnation_without_releasing_pins(
     assert json.loads(insert[1])["home_scope"] == "host:/home"
 
 
+def test_unresolved_file_import_owner_is_never_treated_as_stale():
+    backend = object.__new__(SqlBackend)
+    backend.transaction = lambda: pytest.fail("unknown owner must not trigger SQL reconciliation")
+
+    assert backend.owner_is_stale("unresolved-file-import") is False
+
+
 def test_sql_get_many_uses_one_parameterized_openjson_query():
     rows = [("dev/a", json.dumps({"seen_at": 10, "info": {"platform": {"system": "Linux"}}}))]
     cursor = FakeCursor(rows)

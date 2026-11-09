@@ -154,6 +154,17 @@ class StorageError(RuntimeError):
     """An authoritative operation or durable delivery could not complete."""
 
 
+def _delivery_failure(exc: BaseException) -> str:
+    current: BaseException | None = exc
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if "51001" in str(current):
+            return "SQL job ownership conflict (51001); journal retained for replay"
+        current = current.__cause__ or current.__context__
+    return "SQL delivery unavailable; journal retained for replay"
+
+
 class _HomeLock:
     """Prevent two processes from using the same home identity and local outbox."""
 
@@ -1703,9 +1714,7 @@ class SqlBackend:
             log.warning("Could not mark Azure SQL hub incarnation stopped; heartbeat will expire")
 
     def owner_is_stale(self, owner: str) -> bool:
-        if owner == "unresolved-file-import":
-            return True
-        if not owner or len(owner) > 64:
+        if not owner or owner == "unresolved-file-import" or len(owner) > 64:
             return False
         with self.transaction() as cursor:
             cursor.execute(
@@ -1801,8 +1810,9 @@ class SqlBackend:
                 return False
             try:
                 self._drain()
-            except Exception:
-                self._last_error = "SQL delivery unavailable; journal retained for replay"
+            except Exception as exc:
+                self._last_error = _delivery_failure(exc)
+                log.error("%s", self._last_error)
                 self._wake.set()
                 return False
         return True
@@ -1831,10 +1841,12 @@ class SqlBackend:
                     self._last_error = None
                 if self.outbox.pending(1):
                     continue
-            except Exception:
+            except Exception as exc:
                 if self._last_error is None:
-                    log.error("SQL delivery/maintenance failed; journal retained, no file leasing fallback")
-                self._last_error = "SQL delivery unavailable; journal retained for replay"
+                    self._last_error = _delivery_failure(exc)
+                    log.error("%s; no file leasing fallback", self._last_error)
+                else:
+                    self._last_error = _delivery_failure(exc)
                 self._stop.wait(1)
             self._wake.wait(0.25)
             self._wake.clear()
