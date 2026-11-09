@@ -294,19 +294,29 @@ def test_bulk_release_selection_refresh_confirmation_and_partial_failure(lease_b
     store = hub.service.leases
     client = store.register_client("Second holder")
     second = store.acquire(client["client_id"], target="dev/box2_windows")
-    store._leases[lease["lease_id"]]["running_jobs"] = ["test-pin"]
     page.goto(base + "/ui/leases")
-    page.locator("#select-never-used").click()
+    page.locator("#select-all-leases").check()
     browser_api.expect(page.locator("[data-select-lease]:checked")).to_have_count(2)
     assert all(item["state"] == "active" for item in store.list_leases())
+    store._leases[lease["lease_id"]]["job_owners"] = {"test-pin": "other-hub"}
     with page.expect_response(lambda response: "/ui/leases" in response.url, timeout=15000):
         page.wait_for_timeout(11000)
+    browser_api.expect(page.locator("[data-select-lease]:checked")).to_have_count(1)
+    page.locator(f'[data-select-lease="{lease["lease_id"]}"]').check()
     browser_api.expect(page.locator("[data-select-lease]:checked")).to_have_count(2)
+    release_requests = []
+    page.on(
+        "request",
+        lambda request: (
+            release_requests.append(request.url) if request.url.endswith("/force-release") else None
+        ),
+    )
     page.locator("#force-release-selected").click()
     modal = page.locator(".lease-dialog")
     browser_api.expect(modal).to_contain_text(lease["lease_id"])
     browser_api.expect(modal).to_contain_text(second["lease_id"])
-    browser_api.expect(modal).to_contain_text("PINNED / RUNNING: test-pin")
+    browser_api.expect(modal).to_contain_text("BLOCKED: running jobs/pins test-pin; will not be submitted")
+    browser_api.expect(modal).to_contain_text("skipped; running jobs or pins were detected")
     modal.get_by_role("button", name="Cancel", exact=True).click()
     assert store.get_lease(lease["lease_id"])["state"] == "active"
     page.route(
@@ -316,13 +326,14 @@ def test_bulk_release_selection_refresh_confirmation_and_partial_failure(lease_b
         ),
     )
     page.locator("#force-release-selected").click()
-    modal.get_by_role("button", name="Force release selected", exact=True).click()
-    browser_api.expect(modal).to_contain_text(f"{lease['lease_id']}: released")
+    modal.get_by_role("button", name="Force release unpinned (1)", exact=True).click()
+    browser_api.expect(modal).to_contain_text(f"{lease['lease_id']}: skipped")
     browser_api.expect(modal).to_contain_text(f"{second['lease_id']}: Owner still running")
+    assert release_requests == [f"{base}/v1/leases/{second['lease_id']}/force-release"]
     assert store.get_lease(second["lease_id"])["state"] == "active"
     assert not any(listener.terminal_requests for listener in hub.listeners.values())
     modal.get_by_role("button", name="Close and refresh", exact=True).click()
-    browser_api.expect(page.locator("[data-select-lease]")).to_have_count(1)
+    browser_api.expect(page.locator("[data-select-lease]:checked")).to_have_count(0)
     assert not errors
 
 

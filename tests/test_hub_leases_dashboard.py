@@ -119,6 +119,9 @@ def test_expired_and_pinned_lease_rendering(leased_hub):
     hub, _, lease = leased_hub
     store = hub.service.leases
     clock = time.time()
+    store._leases[lease["lease_id"]]["running_jobs"] = ["j-one"]
+    assert 'data-bulk-safe="false"' in hub.call("GET", "/ui/leases").text
+    store._leases[lease["lease_id"]]["running_jobs"] = []
     store._clock = lambda: clock + 1801
     page = hub.call("GET", "/ui/leases?state=expired").text
     assert 'class="lease-state expired"' in page
