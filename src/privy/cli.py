@@ -1202,6 +1202,7 @@ def _parse_size(value: str) -> int:
 
 def _cmd_observe_job(args: argparse.Namespace) -> int:
     from privy.job_observer import Inconclusive, supervised, worker_main
+    from privy.observer_process import ContainmentError
 
     if args.worker:
         worker_main()
@@ -1216,7 +1217,7 @@ def _cmd_observe_job(args: argparse.Namespace) -> int:
                 "relays": str(args.relays.absolute()),
             }
         )
-    except Inconclusive as exc:
+    except (Inconclusive, ContainmentError) as exc:
         result = {"outcome": "inconclusive", "reason": str(exc)}
     print(json.dumps(result, allow_nan=False))
     return 0 if result["outcome"] == "retained-terminal-result-observed" else 1

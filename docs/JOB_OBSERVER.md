@@ -45,16 +45,25 @@ existing label; neither is guessed. The request hash is the SHA-256 of the autho
 `spec.code` UTF-8 bytes. It is checked locally; the listener does not attest that hash, lease or
 client. Supplied IDs and hashes are assertions, **not authentication**.
 
-After separate operator authorization, the command shape is:
+The supported activation path is **Windows with the reviewed external launcher**. Direct observer
+invocation refuses unless it verifies membership in that launcher's actual named Job Object. An
+environment variable alone is not sufficient. Python 3.9+ source hashing is supported, but a
+source-module invocation is not the reviewed packaged activation path.
+
+After separate operator authorization and independent hash verification, the command template is:
 
 ```powershell
-.\privy.exe observe-job --bindings .\expected-bindings.yaml --settings .\appsettings.yaml --relays .\relays.json
+.\Invoke-JobObserver.ps1 -Executable .\privy.exe -ExpectedSha256 <reviewed-executable-sha256> -Bindings .\expected-bindings.yaml -Settings .\appsettings.yaml -Relays .\relays.json
 ```
 
 Capture stdout only into a sanitized, operator-owned receipt. A result exits `0` only for
 `retained-terminal-result-observed`; inconclusive exits `1`; missing command arguments exit `2`.
-`--help` does not acquire SQL/Relay credentials or initialize a hub. The hidden worker entry point
-is an implementation detail; it is not a separate operational command.
+Launcher deadline exits `124` with an inconclusive reason. Verify the launcher hash separately
+before running it. `--help` does not acquire SQL/Relay credentials or initialize a hub, but a bare
+onefile launch is not externally bounded and is not the activation path. The initial default-TEMP
+help stall observed during packaging remains unexplained; private-TEMP success was not proof that it
+was fixed. The hidden worker entry point is an implementation detail and also requires actual job
+membership.
 
 ## Read and transport boundary
 
@@ -62,7 +71,9 @@ Before and after the poll, the worker opens a fresh SQL connection using `AzureC
 encrypted ODBC Driver 18 with certificate verification, and no connection pooling. Each exact-key
 read uses a short SERIALIZABLE transaction and a two-second SQL lock timeout; query/login timeouts
 are three seconds. It never enables snapshot isolation or acquires the global lease application
-lock. Each transaction is rolled back and its cursor/connection closed before proceeding.
+lock. Each transaction is rolled back and its cursor/connection closed before proceeding. Database
+time is sampled **after** the complete fence read set while serializable locks remain held, so
+expiry passing while reads wait is not accepted using an earlier clock sample.
 
 The read set includes the exact job/owner/revision/request, inactive owner row, lease, client and
 existing target configuration. It requires JSON `active: false` as an actual boolean, an active
@@ -80,10 +91,25 @@ exact remote job ID, empty `code`, `wait_s: 0`, and explicit stdout/stderr ackno
 
 Transport uses a two-second socket timeout, an eight-second poll watchdog/deadline, and a 512 KiB
 raw response limit. Encoded responses, redirects and non-200 statuses are refused without reading an
-error body or following another endpoint. A private supervised worker process imposes a 30-second
-whole-worker bound including credential acquisition, native ODBC, DNS and HTTP. Timeout terminates
-only that private process, not any hub/listener/workload. The worker has its own deadline too. A
-timeout cannot retract the already-sent poll or prove whether its response was delivered.
+error body or following another endpoint. The external launcher starts a 45-second deadline at
+native process launch, covering onefile extraction/bootstrap as well as credentials, native ODBC,
+DNS and HTTP. Offline launcher compilation, local-path checks and artifact-hash preflight occur
+before that deadline; they do not contact the workload. Inputs and artifact must be local files.
+
+Before resuming the executable's first instruction, the launcher assigns its suspended process to a
+kill-on-close Windows Job Object without breakaway permission. The private worker is likewise
+assigned to a nested Job Object while suspended; if containment creation/assignment fails, it never
+runs. Azure CLI credential subprocesses inherit containment. The worker supervisor allows 30 seconds
+then terminates/closes its whole private job, with bounded two-second cleanup. The external launcher
+closes the outer job on normal exit, timeout or interruption and allows at most two seconds for root
+cleanup. This cleanup targets only observer-owned processes and credential helpers, never a
+hub/listener/job. No immediate `os._exit` watchdog is used as a substitute for tree cleanup.
+
+If PowerShell is forcibly terminated, the OS closes its owned job handle and applies kill-on-close.
+Ordinary interruption during its native wait can be deferred until that bounded wait returns; it is
+not promised instantaneous. A timeout cannot retract an already-sent poll or prove whether its
+response was delivered. Containment is cleanup of the **observer tree**, not exit evidence for the
+observed workload or its descendants.
 
 Raw JSON must have present `job_id`, `state`, `exit_code`, `timed_out` and `error` fields. Duplicate
 JSON keys are refused. Exit code must be a genuine integer (not a bool, float, string or default),

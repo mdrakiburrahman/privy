@@ -1,10 +1,13 @@
 import copy
 import hashlib
+import io
 import json
+import os
 import socket
 import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -321,20 +324,22 @@ def test_worker_supervisor_kills_only_owned_process_on_whole_deadline(monkeypatc
             calls.append("closed")
 
         def communicate(self, data=None, timeout=None):
-            if timeout is not None:
+            if timeout != 2:
                 raise observer.subprocess.TimeoutExpired("own-worker", timeout)
             return b"", None
 
-        def kill(self):
+        def close_tree(self):
             calls.append("own-worker-killed")
 
-    monkeypatch.setattr(observer.subprocess, "Popen", lambda *a, **k: Process())
+    monkeypatch.setattr(observer, "require_external_launcher", lambda: None)
+    monkeypatch.setattr(observer, "OwnedProcess", lambda *a, **k: Process())
     assert observer.supervised({"bindings": bindings()})["reason"] == "whole_operation_deadline"
     assert calls == ["own-worker-killed", "closed"]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows owned Job Object containment")
 def test_real_supervisor_stops_owned_sleeping_worker_by_deadline(monkeypatch):
-    popen = observer.subprocess.Popen
+    popen = observer.OwnedProcess
     processes = []
 
     def sleeping_worker(*args, **kwargs):
@@ -342,7 +347,8 @@ def test_real_supervisor_stops_owned_sleeping_worker_by_deadline(monkeypatch):
         processes.append(process)
         return process
 
-    monkeypatch.setattr(observer.subprocess, "Popen", sleeping_worker)
+    monkeypatch.setattr(observer, "require_external_launcher", lambda: None)
+    monkeypatch.setattr(observer, "OwnedProcess", sleeping_worker)
     started = time.monotonic()
     result = observer.supervised({"bindings": bindings()}, seconds=0.15)
     assert result["reason"] == "whole_operation_deadline"
@@ -359,6 +365,7 @@ def test_worker_success_forbids_normal_hub_state_initialization(tmp_path, monkey
 
     for cls in (HubService, SqlBackend, DurableOutbox):
         monkeypatch.setattr(cls, "__init__", forbidden)
+    monkeypatch.setattr(observer, "require_external_launcher", lambda: None)
     relays = tmp_path / "authorized-test-relays.json"
     relays.write_text(
         json.dumps(
@@ -389,7 +396,29 @@ def test_worker_success_forbids_normal_hub_state_initialization(tmp_path, monkey
             close=lambda: closed.append(True),
         ),
     )
-    monkeypatch.setattr(observer, "poll_once", lambda url, request: calls.append(request) or wire())
+    # Use the actual bounded transport with a fake connection, never Azure Relay.
+    original_poll = observer.poll_once
+
+    def transport(url, request):
+        assert url.startswith("https://example.servicebus.windows.net/box_windows")
+        chunks = iter([wire(), b""])
+        return original_poll(
+            url,
+            request,
+            connection_factory=lambda *a, **k: SimpleNamespace(
+                sock=None,
+                request=lambda *a, **k: calls.append(request),
+                getresponse=lambda: SimpleNamespace(
+                    status=200,
+                    getheader=lambda key, default=None: default,
+                    read1=lambda amount: next(chunks),
+                    close=lambda: None,
+                ),
+                close=lambda: None,
+            ),
+        )
+
+    monkeypatch.setattr(observer, "poll_once", transport)
     result = observer.worker({"bindings": bindings(), "settings": str(settings), "relays": str(relays)})
     assert result["outcome"] == "retained-terminal-result-observed"
     assert len(calls) == 1 and calls[0]["code"] == ""
@@ -401,7 +430,6 @@ def test_sql_snapshots_are_exact_key_serializable_rollback_close_only(monkeypatc
     value = snapshot()
     results = iter(
         [
-            [(value["database"], value["now"])],
             [(value["record_owner"], value["revision"], json.dumps(value["job"]))],
             [
                 ("hub", "oldowner", json.dumps(value["hub"])),
@@ -409,6 +437,7 @@ def test_sql_snapshots_are_exact_key_serializable_rollback_close_only(monkeypatc
                 ("client", "client", json.dumps(value["client"])),
                 ("config", "targets", json.dumps(value["targets"])),
             ],
+            [(value["database"], value["now"])],
         ]
     )
 
@@ -451,10 +480,163 @@ def test_sql_snapshots_are_exact_key_serializable_rollback_close_only(monkeypatc
         sql.close()
     queries = [item for item in calls if isinstance(item, tuple)]
     assert "SERIALIZABLE" in queries[0][0] and "LOCK_TIMEOUT 2000" in queries[0][0]
-    assert queries[2][1][-1] == "hubjob"
-    assert queries[3][1][-3:] == ("oldowner", "lease", "client")
+    assert queries[1][1][-1] == "hubjob"
+    assert queries[2][1][-3:] == ("oldowner", "lease", "client")
+    assert "SYSUTCDATETIME" in queries[-1][0]
     assert all(query.startswith(("SELECT", "SET")) for query, _ in queries)
     assert calls[-4:] == ["cursor-close", "rollback", "connection-close", "credential-close"]
+
+
+def test_expiry_during_locked_reads_uses_final_database_time(monkeypatch):
+    backend = object.__new__(observer.ReadOnlySql)
+    backend.expected = bindings()
+    value = snapshot()
+    queries = []
+    from contextlib import contextmanager
+
+    class Cursor:
+        def execute(self, sql, *args):
+            queries.append(sql)
+
+        def fetchone(self):
+            if "SYSUTCDATETIME" in queries[-1]:
+                return "privy", 201  # Lease expired while the earlier reads waited.
+            return "oldowner", 7, json.dumps(value["job"])
+
+        def fetchall(self):
+            return [
+                ("hub", "oldowner", json.dumps(value["hub"])),
+                ("lease", "lease", json.dumps(value["lease"])),
+                ("client", "client", json.dumps(value["client"])),
+                ("config", "targets", json.dumps(value["targets"])),
+            ]
+
+    @contextmanager
+    def read():
+        yield Cursor()
+
+    backend._read = read
+    actual = backend.snapshot()
+    assert "SYSUTCDATETIME" in queries[-1]
+    with pytest.raises(observer.Inconclusive, match="unexpired"):
+        observer.validate_snapshot(actual, bindings())
+
+
+def test_receipt_worker_hashes_on_python39_without_file_digest(monkeypatch, capsys):
+    monkeypatch.setattr(observer, "require_external_launcher", lambda: None)
+    monkeypatch.setattr(
+        observer, "worker", lambda document: {"outcome": "inconclusive", "reason": "synthetic"}
+    )
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b"{}")))
+    monkeypatch.delattr(hashlib, "file_digest", raising=False)
+    observer.worker_main()
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["artifact_sha256"] == hashlib.sha256(Path(observer.__file__).read_bytes()).hexdigest()
+    assert receipt["artifact_kind"] == "observer-source-module"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object containment")
+def test_credential_style_grandchild_is_killed_with_owned_root(tmp_path):
+    import ctypes
+    from ctypes import wintypes
+
+    pidfile = tmp_path / "owned-child.pid"
+    script = (
+        "import subprocess,sys,time,pathlib;"
+        "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);"
+        f"pathlib.Path({str(pidfile)!r}).write_text(str(p.pid));"
+        "time.sleep(30)"
+    )
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = None
+    with observer.OwnedProcess([sys.executable, "-c", script]) as process:
+        deadline = time.monotonic() + 5
+        while not pidfile.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert pidfile.exists()
+        pid = int(pidfile.read_text())
+        handle = kernel.OpenProcess(0x100000, False, pid)
+        assert handle
+        try:
+            started = time.monotonic()
+            process.close_tree()
+            process.wait(timeout=2)
+            assert kernel.WaitForSingleObject(handle, 2000) == 0
+            assert time.monotonic() - started < 3
+        finally:
+            kernel.CloseHandle(handle)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object containment")
+def test_assignment_failure_never_runs_uncontained_helper(tmp_path, monkeypatch):
+    from privy import observer_process
+
+    marker = tmp_path / "must-not-run"
+    actual = observer_process._windows()
+
+    class FailingKernel:
+        def __getattr__(self, name):
+            return getattr(actual, name)
+
+        def AssignProcessToJobObject(self, job, process):
+            return False
+
+    monkeypatch.setattr(observer_process, "_windows", lambda: FailingKernel())
+    with pytest.raises(observer_process.ContainmentError, match="assignment"):
+        observer_process.OwnedProcess([sys.executable, "-c", f"open({str(marker)!r},'w').write('bad')"])
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows external native launcher")
+def test_external_launcher_contains_bootstrap_and_descendants(tmp_path):
+    source = Path(__file__).parents[1] / "scripts" / "Invoke-JobObserver.ps1"
+    script = tmp_path / "native-launcher-test.ps1"
+    script.write_text(
+        "$ErrorActionPreference='Stop'; $content=Get-Content -Raw -LiteralPath $args[0]; "
+        "$code=[regex]::Match($content,\"(?s)Add-Type -TypeDefinition @'\\r?\\n(.*?)\\r?\\n'@\").Groups[1].Value;"
+        "Add-Type -TypeDefinition $code;"
+        "$run=$null; try {"
+        "$run=[PrivyObserverLaunch]::new($args[1],@('-c',$args[2]));"
+        "$ready=[Diagnostics.Stopwatch]::StartNew();"
+        "while(!(Test-Path -LiteralPath $args[3]) -and $ready.ElapsedMilliseconds -lt 5000){Start-Sleep -Milliseconds 20};"
+        "if($run.WaitBounded(150) -ne 124){throw 'Expected synthetic bootstrap deadline'};"
+        "} finally { if($null -ne $run){$run.Dispose()} };"
+    )
+    pidfile = tmp_path / "external-owned-child.pid"
+    child = (
+        "import subprocess,sys,time,pathlib;print('native-launch-contained',flush=True);"
+        f"sys.path.insert(0,{str(Path(observer.__file__).parents[1])!r});"
+        "from privy.observer_process import require_external_launcher;require_external_launcher();"
+        "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);"
+        f"pathlib.Path({str(pidfile)!r}).write_text(str(p.pid));time.sleep(30)"
+    )
+    result = observer.subprocess.run(
+        ["powershell", "-NoProfile", "-File", str(script), str(source), sys.executable, child, str(pidfile)],
+        capture_output=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert b"native-launch-contained" in result.stdout
+    assert pidfile.exists()
+    # Only the exact synthetic descendant recorded by our fixture is examined.
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel.OpenProcess(0x100000, False, int(pidfile.read_text()))
+    if handle:
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        try:
+            assert kernel.WaitForSingleObject(handle, 2000) == 0
+        finally:
+            kernel.CloseHandle(handle)
 
 
 def test_cli_missing_arguments_never_initializes_hub(monkeypatch, capsys):

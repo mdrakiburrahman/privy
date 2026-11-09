@@ -22,9 +22,10 @@ from urllib.parse import urlsplit
 import yaml
 
 from privy import __version__
-from privy._relay import create_http_send_url, create_sas_token
+from privy._relay import create_http_send_url, create_sas_token, fqdn
 from privy.hub.config import parse_relays_document
 from privy.hub.settings import load_settings
+from privy.observer_process import ContainmentError, OwnedProcess, require_external_launcher
 
 MAX_BODY = 512 * 1024
 MAX_FILE = 1024 * 1024
@@ -316,8 +317,6 @@ class ReadOnlySql:
     def snapshot(self):
         b = self.expected
         with self._read() as cursor:
-            cursor.execute("SELECT DB_NAME(),DATEDIFF_BIG(millisecond,'1970-01-01',SYSUTCDATETIME())/1000.0")
-            database, now = cursor.fetchone()
             cursor.execute(
                 "SELECT owner,revision,CASE WHEN DATALENGTH(payload)<=? THEN payload END "
                 "FROM dbo.privy_records WHERE kind='job' AND id=?",
@@ -340,6 +339,8 @@ class ReadOnlySql:
             if len(rows) != 4 or any(row[2] is None for row in rows):
                 raise Inconclusive("missing_or_oversized_coordination")
             records = {(kind, key): _json(payload) for kind, key, payload in rows}
+            cursor.execute("SELECT DB_NAME(),DATEDIFF_BIG(millisecond,'1970-01-01',SYSUTCDATETIME())/1000.0")
+            database, now = cursor.fetchone()
             return {
                 "database": database,
                 "now": float(now),
@@ -435,6 +436,7 @@ def load_bindings(path):
 def worker(document):
     sql = None
     try:
+        require_external_launcher()
         expected = (
             validate_bindings(document["bindings"])
             if "bindings" in document
@@ -453,10 +455,11 @@ def worker(document):
         ):
             raise Inconclusive("local_relay_mapping_mismatch")
         target = targets[0]
+        transport_namespace = fqdn(target.namespace)
         token = target.token or create_sas_token(
-            target.namespace, target.path, target.keyrule, target.key, ttl_seconds=60
+            transport_namespace, target.path, target.keyrule, target.key, ttl_seconds=60
         )
-        url = create_http_send_url(target.namespace, target.path, token)
+        url = create_http_send_url(transport_namespace, target.path, token)
         sql = ReadOnlySql(settings, expected)
 
         def read_snapshot():
@@ -477,6 +480,10 @@ def worker(document):
 
 def supervised(document, *, seconds=OPERATION_SECONDS):
     """A private worker process bounds DNS, credential providers and native ODBC calls too."""
+    try:
+        require_external_launcher()
+    except ContainmentError as exc:
+        raise Inconclusive(str(exc)) from exc
     if "bindings" in document:
         validate_bindings(document["bindings"])
     elif not isinstance(document.get("bindings_file"), str) or not document["bindings_file"]:
@@ -488,14 +495,14 @@ def supervised(document, *, seconds=OPERATION_SECONDS):
     )
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
-    with subprocess.Popen(
+    with OwnedProcess(
         command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment
     ) as process:
         try:
             output, _ = process.communicate(json.dumps(document).encode(), timeout=seconds)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate()
+            process.close_tree()
+            process.communicate(timeout=2)
             return {"outcome": "inconclusive", "reason": "whole_operation_deadline"}
         if process.returncode != 0 or len(output) > MAX_FILE:
             return {"outcome": "inconclusive", "reason": "worker_failure"}
@@ -508,22 +515,30 @@ def supervised(document, *, seconds=OPERATION_SECONDS):
         return result
 
 
+def _artifact_hash(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for _ in range(2048):  # At most 128 MiB, including the exact onefile artifact.
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                return digest.hexdigest()
+            digest.update(chunk)
+    raise Inconclusive("artifact_hash_size_limit")
+
+
 def worker_main():
-    timer = threading.Timer(OPERATION_SECONDS, lambda: os._exit(124))
-    timer.daemon = True
-    timer.start()
     try:
+        require_external_launcher()
         document = _json(sys.stdin.buffer.read(MAX_FILE + 1))
         result = worker(document)
         path = Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__)
-        with path.open("rb") as stream:
-            result["artifact_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+        result["artifact_sha256"] = _artifact_hash(path)
         result["artifact_kind"] = (
             "packaged-executable" if getattr(sys, "frozen", False) else "observer-source-module"
         )
         print(json.dumps(result, allow_nan=False))
-    finally:
-        timer.cancel()
+    except (ContainmentError, Inconclusive) as exc:
+        print(json.dumps({"outcome": "inconclusive", "reason": str(exc)}))
 
 
 if __name__ == "__main__":
