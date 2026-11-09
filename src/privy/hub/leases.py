@@ -253,6 +253,8 @@ class LeaseStore:
                 active_groups.add(lease["group"])
             if not all(timestamp(lease.get(k)) for k in ("acquired_ts", "renewed_ts", "expires_ts")):
                 raise ValueError("invalid lease timestamps")
+            if "last_used_ts" in lease and not timestamp(lease["last_used_ts"]):
+                raise ValueError("invalid lease last-use timestamp")
             if type(lease.get("manual", False)) is not bool:
                 raise ValueError("invalid manual lease marker")
             maximum = self.manual_max_ttl if lease.get("manual") else self.max_ttl
@@ -349,7 +351,19 @@ class LeaseStore:
             for k, v in lease.items()
             if not k.endswith("_ts") and k != "client_record" and (events or k != "events")
         }
+        use = self._uses.get(lease["group"], {})
+        last_used = lease.get("last_used_ts", 0)
+        if use.get("by", {}).get("lease_id") == lease["lease_id"]:
+            last_used = max(last_used, use.get("at", 0))
+        if "last_used_ts" not in lease:
+            for event in lease.get("events", []):
+                if event["event"] in ("pinned", "unpinned"):
+                    last_used = max(
+                        last_used, dt.datetime.fromisoformat(event["at"].replace("Z", "+00:00")).timestamp()
+                    )
         view.update(
+            last_use_known="last_used_ts" in lease or last_used > 0,
+            last_used_at=utc_iso(last_used) if last_used >= lease["acquired_ts"] else None,
             acquired_at=utc_iso(lease["acquired_ts"]),
             expires_at=utc_iso(lease["expires_ts"]),
             renewed_at=utc_iso(lease["renewed_ts"]),
@@ -600,6 +614,7 @@ class LeaseStore:
                         "ttl_s": seconds,
                         "manual": manual,
                         "acquired_ts": now,
+                        "last_used_ts": 0,
                         "renewed_ts": now,
                         "expires_ts": now + seconds,
                         "running_jobs": [],
@@ -715,7 +730,14 @@ class LeaseStore:
             self._renew(lease)
             return self._view(lease)
 
-    def release(self, lease_id: str, client_id: str | None = None, force: bool = False) -> dict[str, Any]:
+    def release(
+        self,
+        lease_id: str,
+        client_id: str | None = None,
+        force: bool = False,
+        *,
+        require_unpinned: bool = False,
+    ) -> dict[str, Any]:
         with self._lock:
             self._sweep()
             lease = self._lease(lease_id)
@@ -723,6 +745,15 @@ class LeaseStore:
                 raise LeaseError(
                     "only the holder may release this lease", status=403, code="not_lease_holder"
                 )
+            if require_unpinned:
+                running_jobs = lease.get("running_jobs")
+                if not isinstance(running_jobs, list) or running_jobs:
+                    raise LeaseError(
+                        "lease has running or unresolved job pins; refresh and retry after they finish",
+                        status=409,
+                        code="lease_pinned",
+                        details={"running_jobs": running_jobs if isinstance(running_jobs, list) else None},
+                    )
             if lease["state"] != "released":
                 lease["state"], lease["released_ts"] = "released", self._clock()
                 self._event(lease, "force_released" if force else "released")
@@ -760,6 +791,7 @@ class LeaseStore:
             if lease_id:
                 self.validate_targets(lease_id, [target])
                 lease = self._lease(lease_id)
+                lease["last_used_ts"] = self._clock()
             self._uses[key] = {
                 "at": self._clock(),
                 "by": {"lease_id": lease_id} if lease_id else {"origin": origin},
@@ -797,6 +829,7 @@ class LeaseStore:
                 }
             if job.lease_id:
                 lease = self._lease(job.lease_id)
+                lease["last_used_ts"] = self._clock()
                 if job.id in lease["running_jobs"]:
                     lease["running_jobs"].remove(job.id)
                     self._event(lease, "unpinned", job_id=job.id, state=job.state)

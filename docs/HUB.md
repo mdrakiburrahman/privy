@@ -95,6 +95,21 @@ If browser storage is cleared, or you switch between `localhost` and `127.0.0.1`
 different identity; the existing force-release action provides recovery. Identity metadata is
 cooperative coordination, not authentication.
 
+The lease table's sortable **Last used** column tracks lease-backed commands, transfers, and
+terminal activity, including job completion, rather than renewal or heartbeat. It is persisted with
+the file-backed lease state across hub restarts. **Never** means no recorded use since acquisition;
+older leases with insufficient retained history show **unknown**, not never.
+
+Use the row checkboxes or select-all-visible to choose active leases. **Select never used** and
+**Select idle >** (30m, 1h, or 4h) only select visible leases with known history; idle age uses
+acquisition when a lease has never been used. Selection survives automatic refresh. **Force release
+selected (N)** lists the chosen leases and warns about running jobs/pins before confirmation. Each
+release uses the existing dashboard-only force-release endpoint independently, without cancelling
+remote jobs. Pinned leases are skipped after a fresh lookup; each bulk request also sends
+`require_unpinned: true`, checked under the lease-store lock to reject a pin added after
+confirmation. Individual force-release retains its existing behavior. Per-lease results remain
+visible until **Close and refresh**; failures and timeouts are not automatically retried.
+
 Closing or refreshing the dashboard does not release or renew a reservation. Lease state survives
 hub restarts. Creation uses the existing acquisition endpoint with `X-Privy-UI: 1` and a matching
 `Origin`; client labels or `kind` alone do not enable longer TTLs.
