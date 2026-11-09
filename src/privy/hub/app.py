@@ -14,6 +14,7 @@ import re
 import socket
 import threading
 import time
+import uuid
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +31,7 @@ from privy.hub.listener_facts import ListenerInfoStore
 from privy.hub.mcp import MCP_PATH, McpEndpoint
 from privy.hub.metrics import RANGES, ReportSelection
 from privy.hub.registry import DEFAULT_PROBE_TTL_S, TargetRegistry
+from privy.hub.request_context import REQUEST_ID
 from privy.hub.responses import HTML_TYPE, HttpResponse, error_response
 from privy.hub.rest import RestApi
 from privy.hub.service import HubService
@@ -272,6 +274,15 @@ class HubApp:
             return
         surface = response.surface or "rest"
         self.service.metrics.call(surface, response.status, seconds)
+        if os.environ.get("PRIVY_SQL_PROFILE") == "1":
+            log.info(
+                "request_profile id=%s method=%s path=%s status=%s total_ms=%.1f",
+                REQUEST_ID.get(),
+                method,
+                target.split("?", 1)[0],
+                response.status,
+                seconds * 1000,
+            )
         outcome = f"{response.status} {response.note}" if response.note else str(response.status)
         if surface == "ui" and response.status < 400:
             # The dashboard refreshes itself every few seconds; keep the console for real work.
@@ -306,27 +317,31 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _dispatch_registered(self) -> None:
         started = time.monotonic()
-        body, response = self._read_and_handle()
+        token = REQUEST_ID.set(uuid.uuid4().hex[:12])
         try:
-            if response.stream is not None:
-                self._send_stream(response)
-            else:
-                self._send(response)
-        except ConnectionError:
-            # The caller went away (Ctrl-C on curl, a client timeout); jobs keep running.
-            response.note = (
-                f"{response.note}, client disconnected" if response.note else "client disconnected"
-            )
-            self.close_connection = True
-        except Exception:  # noqa: BLE001 - keep the server alive
-            log.exception("failed to answer %s %s", self.command, self.path)
-            response.note = f"{response.note}, failed" if response.note else "failed"
-            self.close_connection = True
-        self.server.app.log_call(self.command, self.path, body, response, time.monotonic() - started)
-        if response.note == "drained":
-            self.wfile.flush()
-            self.close_connection = True
-            threading.Thread(target=self.server.shutdown, name="privy-drain-stop", daemon=True).start()
+            body, response = self._read_and_handle()
+            try:
+                if response.stream is not None:
+                    self._send_stream(response)
+                else:
+                    self._send(response)
+            except ConnectionError:
+                # The caller went away (Ctrl-C on curl, a client timeout); jobs keep running.
+                response.note = (
+                    f"{response.note}, client disconnected" if response.note else "client disconnected"
+                )
+                self.close_connection = True
+            except Exception:  # noqa: BLE001 - keep the server alive
+                log.exception("failed to answer %s %s", self.command, self.path)
+                response.note = f"{response.note}, failed" if response.note else "failed"
+                self.close_connection = True
+            self.server.app.log_call(self.command, self.path, body, response, time.monotonic() - started)
+            if response.note == "drained":
+                self.wfile.flush()
+                self.close_connection = True
+                threading.Thread(target=self.server.shutdown, name="privy-drain-stop", daemon=True).start()
+        finally:
+            REQUEST_ID.reset(token)
 
     def _read_and_handle(self) -> tuple[bytes, HttpResponse]:
         headers = Headers(self.headers.items())

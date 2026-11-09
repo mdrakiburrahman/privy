@@ -77,7 +77,8 @@ class _FakeSqlCursor:
         self.rows = []
 
     def execute(self, query, *params):
-        if "FROM dbo.privy_coordination WHERE kind='hub' AND id=?" in query:
+        self.database.executed_queries.append(query)
+        if "FROM dbo.privy_coordination" in query and "kind='hub' AND id=?" in query:
             self.rows = [(1,)] if params[0] in self.database.active_owners else []
         elif query.lstrip().startswith("DECLARE @rows"):
             self.database.flush_batch(json.loads(params[0]))
@@ -102,9 +103,12 @@ class _FakeSqlDatabase:
         self.connection.commit()
         self.lock = threading.RLock()
         self.active_owners = set()
+        self.requested_locks = []
+        self.executed_queries = []
 
     @contextmanager
-    def transaction(self, _lock=None):
+    def transaction(self, lock=None):
+        self.requested_locks.append(lock)
         with self.lock:
             self.connection.execute("BEGIN")
             try:
@@ -241,6 +245,8 @@ def test_previous_owner_outbox_replays_idempotently_without_relaunch_or_unpin(tm
     successor_outbox.ack_batch = lose_ack
     with pytest.raises(StorageError, match="lost outbox acknowledgment"):
         backend._drain()
+    assert database.requested_locks == [None]
+    assert any("WITH (HOLDLOCK)" in query for query in database.executed_queries)
     assert successor_outbox.status()["pending_writes"] == 4
     assert database.record("job", job_id)[0]["state"] == "queued"
     assert database.record("job", finished_id)[0]["state"] == "succeeded"
@@ -281,6 +287,8 @@ def test_fenced_old_owner_and_51001_batch_keep_pending_rows(tmp_path):
     fenced = _fake_backend(database, "owner-a", old_outbox)
     with pytest.raises(StorageError, match="fenced"):
         fenced._drain()
+    assert database.requested_locks == [None]
+    assert any("WITH (HOLDLOCK)" in query for query in database.executed_queries)
     assert old_outbox.status()["pending_writes"] == 1
     assert database.record("audit", "old-write") is None
 

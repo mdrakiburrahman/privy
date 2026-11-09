@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from privy.hub.request_context import REQUEST_ID
 from privy.hub.settings import SqlSettings
 
 log = logging.getLogger("privy.hub")
@@ -41,17 +42,18 @@ class _ProfileCursor:
         try:
             return self._cursor.execute(query, *params)
         except Exception as exc:
-            log.exception(
-                "sql_profile execute failed thread=%s error_type=%s error=%s query=%r",
+            log.error(
+                "sql_profile execute failed request_id=%s thread=%s error_type=%s query=%r",
+                REQUEST_ID.get(),
                 threading.get_ident(),
                 type(exc).__name__,
-                exc,
                 query,
             )
             raise
         finally:
             log.info(
-                "sql_profile execute thread=%s duration_ms=%.1f query=%r",
+                "sql_profile execute request_id=%s thread=%s duration_ms=%.1f query=%r",
+                REQUEST_ID.get(),
                 threading.get_ident(),
                 (time.perf_counter() - started) * 1000,
                 query,
@@ -62,16 +64,17 @@ class _ProfileCursor:
         try:
             rows = self._cursor.fetchall()
         except Exception as exc:
-            log.exception(
-                "sql_profile fetchall failed thread=%s error_type=%s error=%s query=%r",
+            log.error(
+                "sql_profile fetchall failed request_id=%s thread=%s error_type=%s query=%r",
+                REQUEST_ID.get(),
                 threading.get_ident(),
                 type(exc).__name__,
-                exc,
                 self._query,
             )
             raise
         log.info(
-            "sql_profile fetchall thread=%s duration_ms=%.1f rows=%d query=%r",
+            "sql_profile fetchall request_id=%s thread=%s duration_ms=%.1f rows=%d query=%r",
+            REQUEST_ID.get(),
             threading.get_ident(),
             (time.perf_counter() - started) * 1000,
             len(rows),
@@ -84,16 +87,17 @@ class _ProfileCursor:
         try:
             row = self._cursor.fetchone()
         except Exception as exc:
-            log.exception(
-                "sql_profile fetchone failed thread=%s error_type=%s error=%s query=%r",
+            log.error(
+                "sql_profile fetchone failed request_id=%s thread=%s error_type=%s query=%r",
+                REQUEST_ID.get(),
                 threading.get_ident(),
                 type(exc).__name__,
-                exc,
                 self._query,
             )
             raise
         log.info(
-            "sql_profile fetchone thread=%s duration_ms=%.1f rows=%d query=%r",
+            "sql_profile fetchone request_id=%s thread=%s duration_ms=%.1f rows=%d query=%r",
+            REQUEST_ID.get(),
             threading.get_ident(),
             (time.perf_counter() - started) * 1000,
             int(row is not None),
@@ -108,17 +112,18 @@ class _ProfileCursor:
             result = self._cursor.nextset()
             return result
         except Exception as exc:
-            log.exception(
-                "sql_profile nextset failed thread=%s error_type=%s error=%s query=%r",
+            log.error(
+                "sql_profile nextset failed request_id=%s thread=%s error_type=%s query=%r",
+                REQUEST_ID.get(),
                 threading.get_ident(),
                 type(exc).__name__,
-                exc,
                 self._query,
             )
             raise
         finally:
             log.info(
-                "sql_profile nextset thread=%s duration_ms=%.1f result=%r query=%r",
+                "sql_profile nextset request_id=%s thread=%s duration_ms=%.1f result=%r query=%r",
+                REQUEST_ID.get(),
                 threading.get_ident(),
                 (time.perf_counter() - started) * 1000,
                 result,
@@ -130,17 +135,18 @@ class _ProfileCursor:
         try:
             return self._cursor.close()
         except Exception as exc:
-            log.exception(
-                "sql_profile cursor_close failed thread=%s error_type=%s error=%s query=%r",
+            log.error(
+                "sql_profile cursor_close failed request_id=%s thread=%s error_type=%s query=%r",
+                REQUEST_ID.get(),
                 threading.get_ident(),
                 type(exc).__name__,
-                exc,
                 self._query,
             )
             raise
         finally:
             log.info(
-                "sql_profile cursor_close thread=%s duration_ms=%.1f query=%r",
+                "sql_profile cursor_close request_id=%s thread=%s duration_ms=%.1f query=%r",
+                REQUEST_ID.get(),
                 threading.get_ident(),
                 (time.perf_counter() - started) * 1000,
                 self._query,
@@ -593,20 +599,25 @@ class SqlBackend:
             raise ValueError(f"unsupported SQL transaction isolation level: {isolation_level}")
         profile = _profile_sql_enabled()
         connection_started = time.perf_counter()
+        lock_wait_started = None
+        lock_acquired_at = None
+        lock_released_at = None
+        lock_outcome = "pending" if lock else "not_requested"
         try:
             connection = self._connect()
         except Exception as exc:
             if profile:
-                log.exception(
-                    "sql_profile connection_acquire failed thread=%s error_type=%s error=%s",
+                log.error(
+                    "sql_profile connection_acquire failed request_id=%s thread=%s error_type=%s",
+                    REQUEST_ID.get(),
                     threading.get_ident(),
                     type(exc).__name__,
-                    exc,
                 )
             raise
         if profile:
             log.info(
-                "sql_profile connection_acquire thread=%s duration_ms=%.1f",
+                "sql_profile connection_acquire request_id=%s thread=%s duration_ms=%.1f",
+                REQUEST_ID.get(),
                 threading.get_ident(),
                 (time.perf_counter() - connection_started) * 1000,
             )
@@ -630,13 +641,18 @@ class SqlBackend:
             )
             cursor.execute(setup)
             if lock:
+                lock_wait_started = time.perf_counter()
                 cursor.execute(
                     "DECLARE @r int; EXEC @r=sys.sp_getapplock @Resource=?, @LockMode='Exclusive', "
                     "@LockOwner='Transaction', @LockTimeout=15000; SELECT @r;",
                     lock,
                 )
-                if cursor.fetchone()[0] < 0:
+                lock_result = cursor.fetchone()[0]
+                if lock_result < 0:
+                    lock_outcome = "timeout"
                     raise StorageError("SQL coordination lock timed out")
+                lock_acquired_at = time.perf_counter()
+                lock_outcome = "held"
             yield cursor
             try:
                 close_cursor()
@@ -646,19 +662,23 @@ class SqlBackend:
             commit_started = time.perf_counter()
             try:
                 connection.commit()
+                if lock:
+                    lock_released_at = time.perf_counter()
+                    lock_outcome = "committed"
             except Exception as exc:
                 if profile:
-                    log.exception(
-                        "sql_profile commit failed thread=%s error_type=%s error=%s",
+                    log.error(
+                        "sql_profile commit failed request_id=%s thread=%s error_type=%s",
+                        REQUEST_ID.get(),
                         threading.get_ident(),
                         type(exc).__name__,
-                        exc,
                     )
                 raise
             finally:
                 if profile:
                     log.info(
-                        "sql_profile commit thread=%s duration_ms=%.1f",
+                        "sql_profile commit request_id=%s thread=%s duration_ms=%.1f",
+                        REQUEST_ID.get(),
                         threading.get_ident(),
                         (time.perf_counter() - commit_started) * 1000,
                     )
@@ -676,27 +696,58 @@ class SqlBackend:
             try:
                 connection.rollback()
             except Exception as rollback_error:
+                if lock:
+                    lock_outcome = "rollback_failed"
                 if hasattr(connection, "invalidate"):
                     connection.invalidate()
                 log.exception("Azure SQL rollback failed; connection discarded, no file fallback")
                 raise StorageError("Authoritative SQL transaction rollback failed") from rollback_error
+            if lock and lock_released_at is None:
+                lock_released_at = time.perf_counter()
+                if lock_outcome == "held":
+                    lock_outcome = "rolled_back"
+                elif lock_outcome == "pending":
+                    lock_outcome = "failed"
             if cursor_close_error is exc:
                 raise StorageError("Authoritative SQL cursor cleanup failed; no file fallback") from exc
             if type(exc).__module__ == "pyodbc":
                 raise StorageError("Authoritative Azure SQL transaction failed; no file fallback") from exc
             raise
         finally:
+            if profile and lock and lock_wait_started is not None:
+                completed_at = lock_released_at or time.perf_counter()
+                wait_ms = ((lock_acquired_at or completed_at) - lock_wait_started) * 1000
+                held_ms = (
+                    (lock_released_at - lock_acquired_at) * 1000
+                    if lock_acquired_at is not None and lock_released_at is not None
+                    else 0
+                )
+                log.info(
+                    "sql_profile applock request_id=%s thread=%s resource=%s wait_ms=%.1f "
+                    "held_ms=%.1f outcome=%s",
+                    REQUEST_ID.get(),
+                    threading.get_ident(),
+                    lock,
+                    wait_ms,
+                    held_ms,
+                    lock_outcome,
+                )
             close_started = time.perf_counter()
             try:
                 connection.close()
             except Exception:
                 if profile:
-                    log.exception("sql_profile connection_return failed thread=%s", threading.get_ident())
+                    log.error(
+                        "sql_profile connection_return failed request_id=%s thread=%s",
+                        REQUEST_ID.get(),
+                        threading.get_ident(),
+                    )
                 raise
             finally:
                 if profile:
                     log.info(
-                        "sql_profile connection_return thread=%s duration_ms=%.1f",
+                        "sql_profile connection_return request_id=%s thread=%s duration_ms=%.1f",
+                        REQUEST_ID.get(),
                         threading.get_ident(),
                         (time.perf_counter() - close_started) * 1000,
                     )
@@ -760,7 +811,7 @@ class SqlBackend:
     def assert_owner_active(self, cursor) -> None:
         self._assert_owner_current()
         cursor.execute(
-            "SELECT 1 FROM dbo.privy_coordination WHERE kind='hub' AND id=? "
+            "SELECT 1 FROM dbo.privy_coordination WITH (HOLDLOCK) WHERE kind='hub' AND id=? "
             "AND JSON_VALUE(payload,'$.active')='true'",
             self.owner,
         )
@@ -898,7 +949,7 @@ class SqlBackend:
                 )
             encoded = json.dumps(batch, ensure_ascii=True)
             prepared = time.perf_counter()
-            with self.transaction("privy.leases") as cursor:
+            with self.transaction() as cursor:
                 self.assert_owner_active(cursor)
                 cursor.execute(_FLUSH_BATCH, encoded)
             committed = time.perf_counter()
@@ -906,7 +957,8 @@ class SqlBackend:
             self._last_error = None
             if _profile_sql_enabled():
                 log.info(
-                    "sql_profile drain rows=%d prepare_ms=%.1f sql_ms=%.1f ack_ms=%.1f",
+                    "sql_profile drain request_id=%s rows=%d prepare_ms=%.1f sql_ms=%.1f ack_ms=%.1f",
+                    REQUEST_ID.get(),
                     len(rows),
                     (prepared - started) * 1000,
                     (committed - prepared) * 1000,
@@ -1966,10 +2018,24 @@ class SqlLeaseLock:
         if not cursor.nextset():
             raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
         records = {"client": {}, "lease": {}, "use": {}}
-        for kind, key, raw in cursor.fetchall():
+        rows = cursor.fetchall()
+        decode_started = time.perf_counter()
+        for kind, key, raw in rows:
             records[kind][key] = json.loads(raw)
         if cursor.nextset():
             raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")
+        if _profile_sql_enabled():
+            log.info(
+                "sql_profile coordination_decode request_id=%s thread=%s rows=%d clients=%d leases=%d "
+                "uses=%d duration_ms=%.1f",
+                REQUEST_ID.get(),
+                threading.get_ident(),
+                len(rows),
+                len(records["client"]),
+                len(records["lease"]),
+                len(records["use"]),
+                (time.perf_counter() - decode_started) * 1000,
+            )
         return {
             "now": now,
             "clients": records["client"],
@@ -2021,7 +2087,15 @@ class SqlLeaseLock:
             cursor = transaction.__enter__()
             self._local.transaction = transaction
             self._local.cursor = cursor
+            snapshot_started = time.perf_counter()
             self._load_snapshot(cursor)
+            if _profile_sql_enabled():
+                log.info(
+                    "sql_profile lease_snapshot_materialize request_id=%s thread=%s duration_ms=%.1f",
+                    REQUEST_ID.get(),
+                    threading.get_ident(),
+                    (time.perf_counter() - snapshot_started) * 1000,
+                )
             return self
         except BaseException as exc:
             try:

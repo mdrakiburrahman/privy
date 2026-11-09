@@ -21,8 +21,9 @@ from hub_fakes import (
 )
 
 from privy.client import RelayHTTPError
-from privy.hub.app import Headers, HubApp, HubRuntime, build_hub
+from privy.hub.app import Headers, HubApp, HubRuntime, _Handler, build_hub
 from privy.hub.home import LEGACY_TOKEN_FILENAME, read_state
+from privy.hub.request_context import REQUEST_ID
 from privy.hub.responses import HttpResponse
 from privy.hub.rest import RELAYS_OPERATION, ROUTES, STREAM_JOB
 from privy.hub.service import OPERATIONS
@@ -32,6 +33,22 @@ from privy.transfer import TransferResult
 NO_LISTENER = '{"error":{"code":"EndpointNotFound","message":"There are no listeners connected"}}'
 OFFLINE = RelayHTTPError("x", status_code=404, detail=NO_LISTENER)
 BOX1 = "dev/box1_windows"
+
+
+def test_http_request_id_context_resets_after_handler_failure():
+    handler = object.__new__(_Handler)
+
+    def fail():
+        raise RuntimeError("request failed")
+
+    handler._read_and_handle = fail
+    parent_token = REQUEST_ID.set("parent-request")
+    try:
+        with pytest.raises(RuntimeError, match="request failed"):
+            handler._dispatch_registered()
+        assert REQUEST_ID.get() == "parent-request"
+    finally:
+        REQUEST_ID.reset(parent_token)
 
 
 @pytest.fixture

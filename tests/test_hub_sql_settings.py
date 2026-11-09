@@ -7,6 +7,7 @@ import pytest
 import yaml
 
 from privy.hub.leases import DEFAULT_CONFIG, effective_lease_config
+from privy.hub.request_context import REQUEST_ID
 from privy.hub.settings import SettingsError, load_settings
 from privy.hub.sql_store import (
     _IMPORT_BATCH,
@@ -334,8 +335,55 @@ def test_sql_profile_records_failed_statement_without_bound_parameters(caplog):
             _ProfileCursor(Cursor()).execute("SELECT payload WHERE id=?", "private-value")
 
     assert "SELECT payload WHERE id=?" in caplog.text
-    assert "database failure" in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
+    assert "database failure" not in caplog.text
     assert "private-value" not in caplog.text
+
+
+def test_sql_profile_separates_application_lock_wait_from_hold(caplog, monkeypatch):
+    class Cursor:
+        def __init__(self):
+            self.row = None
+
+        def execute(self, query, *_params):
+            if "sp_getapplock" in query:
+                self.row = (0,)
+
+        def fetchone(self):
+            row, self.row = self.row, None
+            return row
+
+        def close(self):
+            pass
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    backend = object.__new__(SqlBackend)
+    backend._connect = lambda: Connection()
+    monkeypatch.setattr("privy.hub.sql_store._profile_sql_enabled", lambda: True)
+    request_token = REQUEST_ID.set("request-test")
+    try:
+        with caplog.at_level("INFO", logger="privy.hub"):
+            with backend.transaction("privy.leases"):
+                pass
+    finally:
+        REQUEST_ID.reset(request_token)
+
+    assert "sql_profile applock request_id=request-test" in caplog.text
+    assert "wait_ms=" in caplog.text
+    assert "held_ms=" in caplog.text
+    assert "outcome=committed" in caplog.text
 
 
 def test_active_incarnation_from_a_different_home_scope_blocks_startup():
