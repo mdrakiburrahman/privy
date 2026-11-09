@@ -23,6 +23,7 @@ from typing import Any
 
 from privy.hub.request_context import REQUEST_ID
 from privy.hub.settings import SqlSettings
+from privy.hub.sql_profile import StartupProfile
 
 log = logging.getLogger("privy.hub")
 
@@ -332,26 +333,31 @@ class AzureSqlConnections:
         self.settings = settings
 
     def __call__(self):
-        if not self._slots.acquire(timeout=15):
-            raise StorageError("Azure SQL connection pool is busy; retry the request")
-        try:
-            return self._checkout()
-        except BaseException:
-            self._slots.release()
-            raise
+        with StartupProfile("connection") as profile:
+            with profile.stage("pool_wait"):
+                if not self._slots.acquire(timeout=15):
+                    raise StorageError("Azure SQL connection pool is busy; retry the request")
+            try:
+                with profile.stage("checkout"):
+                    return self._checkout(profile)
+            except BaseException:
+                self._slots.release()
+                raise
 
-    def _checkout(self):
+    def _checkout(self, profile):
         with self._lock:
             if self._closed:
                 raise StorageError("Azure SQL connection pool has closed")
             while self._idle:
                 connection, expiry = self._idle.pop()
                 if expiry > time.time() + 300:
+                    profile.count("reused")
                     return _PooledConnection(self, connection, expiry)
                 connection.close()
             if self._token is None or self._token.expires_on <= time.time() + 300:
                 try:
-                    self._token = self._credential.get_token("https://database.windows.net/.default")
+                    with profile.stage("auth"):
+                        self._token = self._credential.get_token("https://database.windows.net/.default")
                 except Exception as exc:
                     raise StorageError(
                         "AzureCliCredential could not obtain an Azure SQL token; sign in with Azure CLI"
@@ -361,12 +367,13 @@ class AzureSqlConnections:
             expiry = self._token.expires_on
         s = self.settings
         try:
-            connection = self._odbc.connect(
-                f"Driver={{{s.driver}}};Server=tcp:{s.server},1433;Database={s.database};"
-                "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=10;",
-                attrs_before={1256: token},
-                autocommit=True,
-            )
+            with profile.stage("connect"):
+                connection = self._odbc.connect(
+                    f"Driver={{{s.driver}}};Server=tcp:{s.server},1433;Database={s.database};"
+                    "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=10;",
+                    attrs_before={1256: token},
+                    autocommit=True,
+                )
             connection.timeout = 15
             return _PooledConnection(self, connection, expiry)
         except Exception as exc:
@@ -572,9 +579,15 @@ class SqlBackend:
         self._thread: threading.Thread | None = None
         self.outbox = None
         try:
-            self.bootstrap()
-            self.outbox = DurableOutbox(home / "sql-outbox.sqlite3", max_bytes=settings.outbox_max_bytes)
-            self._register_incarnation()
+            with StartupProfile("backend") as profile:
+                with profile.stage("schema"):
+                    self.bootstrap()
+                with profile.stage("journal"):
+                    self.outbox = DurableOutbox(
+                        home / "sql-outbox.sqlite3", max_bytes=settings.outbox_max_bytes
+                    )
+                with profile.stage("incarnation"):
+                    self._register_incarnation()
         except BaseException:
             if self.outbox is not None:
                 self.outbox.close()
@@ -604,7 +617,8 @@ class SqlBackend:
         lock_released_at = None
         lock_outcome = "pending" if lock else "not_requested"
         try:
-            connection = self._connect()
+            with StartupProfile("transaction_acquire", enabled=profile):
+                connection = self._connect()
         except Exception as exc:
             if profile:
                 log.error(
@@ -966,33 +980,56 @@ class SqlBackend:
                 )
 
     def read_changes(self, version: bytes, *, limit: int = 2000):
-        with self.transaction() as cursor:
-            # MIN_ACTIVE_ROWVERSION excludes uncommitted writes; advancing to
-            # @@DBTS could permanently miss an older transaction committing later.
-            cursor.execute("SELECT MIN_ACTIVE_ROWVERSION()")
-            upper = bytes(cursor.fetchone()[0])
-            cursor.execute(
-                "SELECT TOP (?) change_version,kind,id,payload FROM dbo.privy_records "
-                "WHERE kind<>'probe' AND kind<>'call' AND change_version>? AND change_version<? "
-                "ORDER BY change_version",
-                limit,
-                version,
-                upper,
+        model = getattr(self, "read_model", None)
+        profile = StartupProfile("feed")
+        profile.enabled = profile.enabled and (model is None or not model._ready.is_set())
+        with profile:
+            with profile.stage("transaction"), self.transaction() as cursor:
+                # MIN_ACTIVE_ROWVERSION excludes uncommitted writes; advancing to
+                # @@DBTS could permanently miss an older transaction committing later.
+                with profile.stage("watermark"):
+                    cursor.execute("SELECT MIN_ACTIVE_ROWVERSION()")
+                    upper = bytes(cursor.fetchone()[0])
+                with profile.stage("execute"):
+                    cursor.execute(
+                        "SELECT TOP (?) change_version,kind,id,payload FROM dbo.privy_records "
+                        "WHERE kind<>'probe' AND kind<>'call' AND change_version>? AND change_version<? "
+                        "ORDER BY change_version",
+                        limit,
+                        version,
+                        upper,
+                    )
+                with profile.stage("fetch"):
+                    rows = cursor.fetchall()
+            complete = len(rows) < limit
+            # The exclusive bound is the next possible committed version.
+            watermark = (
+                (int.from_bytes(upper, "big") - 1).to_bytes(8, "big") if complete else bytes(rows[-1][0])
             )
-            rows = cursor.fetchall()
-        complete = len(rows) < limit
-        # The exclusive bound is the next possible committed version.
-        watermark = (int.from_bytes(upper, "big") - 1).to_bytes(8, "big") if complete else bytes(rows[-1][0])
-        return (
-            watermark,
-            [(str(kind), str(key), json.loads(payload)) for _, kind, key, payload in rows],
-            complete,
-        )
+            with profile.stage("decode"):
+                decoded = [(str(kind), str(key), json.loads(payload)) for _, kind, key, payload in rows]
+            profile.count("rows", len(rows))
+            profile.count("complete", int(complete))
+            profile.count("watermark", int.from_bytes(watermark, "big"))
+            return (
+                watermark,
+                decoded,
+                complete,
+            )
 
     def read_record_keys(self):
-        with self.transaction() as cursor:
-            cursor.execute("SELECT kind,id FROM dbo.privy_records WHERE kind<>'probe' AND kind<>'call'")
-            return {(str(kind), str(key)) for kind, key in cursor.fetchall()}
+        with StartupProfile("record_keys") as profile:
+            with profile.stage("transaction"), self.transaction() as cursor:
+                with profile.stage("execute"):
+                    cursor.execute(
+                        "SELECT kind,id FROM dbo.privy_records WHERE kind<>'probe' AND kind<>'call'"
+                    )
+                with profile.stage("fetch"):
+                    rows = cursor.fetchall()
+                with profile.stage("decode"):
+                    keys = {(str(kind), str(key)) for kind, key in rows}
+            profile.count("keys", len(keys))
+            return keys
 
     def read_latest_probes(self):
         with self.transaction() as cursor:
@@ -1534,11 +1571,13 @@ class SqlBackend:
             return [json.loads(row[0]) for row in cursor.fetchall()]
 
     def health(self) -> dict:
-        with self.transaction() as cursor:
-            cursor.execute("SELECT 1")
-            if cursor.fetchone()[0] != 1:
-                raise StorageError("Azure SQL health probe failed")
-        return self.status()
+        with StartupProfile("health_sql") as profile:
+            with profile.stage("query"), self.transaction() as cursor:
+                cursor.execute("SELECT 1")
+                if cursor.fetchone()[0] != 1:
+                    raise StorageError("Azure SQL health probe failed")
+            with profile.stage("status"):
+                return self.status()
 
     def delete(self, kind: str, key: str) -> None:
         with self.transaction() as cursor:

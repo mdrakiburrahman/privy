@@ -183,6 +183,20 @@ execution/fetch/nextset, cursor close, commit, connection return, per-kind recor
 counts, report assembly, and HTML rendering. Failed statements include the exception and SQL text
 but never bind parameters or record payloads; unset the variable to disable profiling.
 
+The same opt-in also emits `startup_profile` entries with monotonic start/end timestamps, thread
+IDs, duration, and failure type (without exception messages or payloads). Construction separates
+local configuration, SQL backend initialization, shared lease configuration, and HTTP bind.
+Backend and connection phases distinguish schema, incarnation registration, pool wait, token
+acquisition, and connection creation or reuse. Cold hydration records page/row counts, watermark,
+fetch/decode, key reconciliation, apply, and the actual readiness publication. Its summary includes
+total and maximum page timings; it does not publish partial history as ready. Warmup separates
+hydration waiting from probes, facts, lease reads, lists, and each common report. Health separates
+its SQL transaction from Python status collection. These timings describe server work, not the
+packaged launcher or a client's polling delay; retain the exact process launch timestamp too.
+Cold feed and hydration profiling stop after readiness, and warmup profiling stops after its first
+successful cycle. Connection and health timings continue while profiling is enabled, so use it
+only for a bounded diagnostic observation. No runtime measurement is performed by enabling tests.
+
 ## Quick start
 
 1. Hydrate keys into the hub's hosting folder with `Sync-PrivyHubRelays.ps1` from

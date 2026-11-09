@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from privy.hub.metrics import RANGES, ReportSelection
+from privy.hub.sql_profile import StartupProfile
 from privy.hub.sql_store import StorageError
 
 log = logging.getLogger("privy.hub")
@@ -313,10 +314,19 @@ class SqlReadModel:
         self.reads.invalidate(lambda key: key[0] in ("report", "history"))
 
     def refresh_once(self):
+        profile = StartupProfile("hydration")
+        profile.enabled = profile.enabled and not self._ready.is_set()
+        with profile:
+            return self._refresh_once(profile)
+
+    def _refresh_once(self, profile):
         started = time.monotonic()
-        with self._lock:
-            candidates = [(identity, self._pending_revision.get(identity, 0)) for identity in self._pending]
-        pending_keys = self.backend.outbox.pending_keys()
+        with profile.stage("pending"):
+            with self._lock:
+                candidates = [
+                    (identity, self._pending_revision.get(identity, 0)) for identity in self._pending
+                ]
+            pending_keys = self.backend.outbox.pending_keys()
         acknowledged = [
             (identity, revision) for identity, revision in candidates if identity not in pending_keys
         ][:500]
@@ -324,8 +334,12 @@ class SqlReadModel:
         version = self._version
         while True:
             if self._stop.is_set():
+                profile.count("stopped")
                 return
-            version, rows, complete = self.backend.read_changes(version)
+            with profile.stage("page"):
+                version, rows, complete = self.backend.read_changes(version)
+            profile.count("pages")
+            profile.count("rows", len(rows))
             changes.extend(rows)
             if complete:
                 break
@@ -334,15 +348,19 @@ class SqlReadModel:
         reconcile = (
             self._reconciled is None or time.monotonic() - self._reconciled >= self._reconcile_interval
         )
-        keys = self.backend.read_record_keys() if reconcile else None
+        with profile.stage("keys"):
+            keys = self.backend.read_record_keys() if reconcile else None
+        profile.count("keys", len(keys) if keys is not None else 0)
         authoritative = {}
         by_kind = {}
         for (kind, key), _ in acknowledged:
             by_kind.setdefault(kind, []).append(key)
         for kind, selected in by_kind.items():
-            rows = self.backend.get_many(kind, selected)
+            with profile.stage("acknowledged"):
+                rows = self.backend.get_many(kind, selected)
+            profile.count("acknowledged", len(selected))
             authoritative.update({(kind, key): value for key, value in rows.items()})
-        with self._lock:
+        with profile.stage("apply"), self._lock:
             changed_kinds = set()
             for kind, key, payload in changes:
                 identity = kind, key
@@ -374,7 +392,11 @@ class SqlReadModel:
             self._updated = time.monotonic()
             self._refresh_duration = self._updated - started
             self._error = None
-            self._ready.set()
+            with profile.stage("publish_ready"):
+                self._ready.set()
+            profile.count("ready")
+            profile.count("records", len(self._records))
+            profile.count("watermark", int.from_bytes(version, "big"))
 
     def _refresh(self):
         while not self._stop.is_set():

@@ -35,6 +35,7 @@ from privy.hub.request_context import REQUEST_ID
 from privy.hub.responses import HTML_TYPE, HttpResponse, error_response
 from privy.hub.rest import RestApi
 from privy.hub.service import HubService
+from privy.hub.sql_profile import StartupProfile
 from privy.hub.sql_store import StorageError
 
 __all__ = ["Headers", "HttpResponse", "HubApp", "HubHTTPServer", "HubRuntime", "build_hub"]
@@ -213,17 +214,20 @@ class HubApp:
             else:
                 backend = getattr(self.service.jobs, "backend", None)
                 if backend is not None:
-                    try:
-                        storage = backend.health()
-                    except StorageError:
-                        return error_response(
-                            503, "storage_unavailable", "Authoritative SQL backing store is unavailable"
-                        )
-                    model = getattr(backend, "read_model", None)
-                    if model is not None:
-                        storage["read_model"] = model.health()
-                    if self.warmup is not None:
-                        storage["warmup"] = self.warmup.status()
+                    with StartupProfile("health") as profile:
+                        try:
+                            with profile.stage("sql"):
+                                storage = backend.health()
+                        except StorageError:
+                            return error_response(
+                                503, "storage_unavailable", "Authoritative SQL backing store is unavailable"
+                            )
+                        with profile.stage("status"):
+                            model = getattr(backend, "read_model", None)
+                            if model is not None:
+                                storage["read_model"] = model.health()
+                            if self.warmup is not None:
+                                storage["warmup"] = self.warmup.status()
                 else:
                     storage = {"mode": "file"}
                 response = HttpResponse(
@@ -442,6 +446,7 @@ class _Warmup:
         self._duration = None
         self._warm = False
         self._error = None
+        self._next_probe = 0.0
         self._thread = threading.Thread(target=self._run, name="privy-sql-warmup", daemon=True)
 
     def start(self):
@@ -462,45 +467,12 @@ class _Warmup:
             }
 
     def _run(self):
-        from privy.hub.dashboard import DEFAULT_JOB_LIMIT, DEFAULT_LOG_LIMIT, build_shell_report
-
-        next_probe = 0.0
         while not self._stop.is_set():
             try:
-                if not self.model._ready.wait(1):
-                    continue
-                service = self.app.service
-                registry = service.registry
-                targets = list(registry.snapshot().targets)
-                if time.monotonic() >= next_probe:
-                    registry.probe_many(targets)
-                    next_probe = time.monotonic() + registry.probe_ttl_s
-                probes = {target.id: registry.cached(target) for target in targets}
-                service.listener_facts_many(targets, probes)
-                service.leases.target_summaries([target.id for target in targets])
-                service.leases.groups()
-                service.leases.list_leases(state="all")
-                service.leases.list_clients(active=False)
-                service.metrics.count_jobs_by_lease()
-                service.metrics.count_jobs_by_target()
-                service.metrics.entries(limit=DEFAULT_JOB_LIMIT + 1)
-                service.metrics.entries(limit=DEFAULT_LOG_LIMIT + 1)
-                service.jobs.list(limit=50)
-                build_shell_report(service, ReportSelection())
-                for name in (*RANGES, "all"):
-                    if self._stop.is_set():
-                        return
-                    service.metrics.report(
-                        targets,
-                        probes,
-                        selection=ReportSelection(name),
-                        max_running=service.jobs.max_running,
-                    )
-                with self._lock:
-                    self._warm = True
-                    if self._duration is None:
-                        self._duration = time.monotonic() - self._started
-                    self._error = None
+                profile = StartupProfile("warmup")
+                profile.enabled = profile.enabled and self._duration is None
+                with profile:
+                    self._warm_once(profile)
             except Exception as exc:
                 with self._lock:
                     self._warm = False
@@ -509,6 +481,56 @@ class _Warmup:
                 if not pending:
                     log.warning("SQL dashboard warmup failed (%s)", type(exc).__name__)
             self._stop.wait(10)
+
+    def _warm_once(self, profile):
+        from privy.hub.dashboard import DEFAULT_JOB_LIMIT, DEFAULT_LOG_LIMIT, build_shell_report
+
+        with profile.stage("hydration_wait"):
+            while not self.model._ready.wait(1):
+                if self._stop.is_set():
+                    return
+        service = self.app.service
+        registry = service.registry
+        with profile.stage("targets"):
+            targets = list(registry.snapshot().targets)
+        profile.count("targets", len(targets))
+        with profile.stage("probes"):
+            if time.monotonic() >= self._next_probe:
+                registry.probe_many(targets)
+                self._next_probe = time.monotonic() + registry.probe_ttl_s
+            probes = {target.id: registry.cached(target) for target in targets}
+        with profile.stage("facts"):
+            service.listener_facts_many(targets, probes)
+        with profile.stage("leases"):
+            service.leases.target_summaries([target.id for target in targets])
+            service.leases.groups()
+            service.leases.list_leases(state="all")
+            service.leases.list_clients(active=False)
+        with profile.stage("lists"):
+            service.metrics.count_jobs_by_lease()
+            service.metrics.count_jobs_by_target()
+            service.metrics.entries(limit=DEFAULT_JOB_LIMIT + 1)
+            service.metrics.entries(limit=DEFAULT_LOG_LIMIT + 1)
+            service.jobs.list(limit=50)
+        with profile.stage("shell"):
+            build_shell_report(service, ReportSelection())
+        for name in (*RANGES, "all"):
+            if self._stop.is_set():
+                return
+            with profile.stage(f"report_{name}"):
+                service.metrics.report(
+                    targets,
+                    probes,
+                    selection=ReportSelection(name),
+                    max_running=service.jobs.max_running,
+                )
+            profile.count("reports")
+        with self._lock:
+            self._warm = True
+            if self._duration is None:
+                self._duration = time.monotonic() - self._started
+            self._error = None
+        profile.count("warm")
 
     def close(self):
         self._stop.set()
@@ -603,14 +625,45 @@ def build_hub(
     sql_connect: Any = None,
 ) -> HubRuntime:
     """Create the hub's components and bind its HTTP server (without serving yet)."""
-    ensure_home(home)
-    relays_path = relays_file or home / RELAYS_FILENAME
-    store = RelaysStore(relays_path)
-    store.snapshot()
-    registry = TargetRegistry(store, client_factory=client_factory, probe_ttl_s=probe_ttl_s)
+    with StartupProfile("construction") as profile:
+        return _build_hub(
+            profile,
+            home=home,
+            host=host,
+            port=port,
+            relays_file=relays_file,
+            max_jobs=max_jobs,
+            probe_ttl_s=probe_ttl_s,
+            version=version,
+            client_factory=client_factory,
+            settings_file=settings_file,
+            sql_connect=sql_connect,
+        )
+
+
+def _build_hub(
+    profile,
+    *,
+    home,
+    host,
+    port,
+    relays_file,
+    max_jobs,
+    probe_ttl_s,
+    version,
+    client_factory,
+    settings_file,
+    sql_connect,
+):
     from privy.hub.settings import load_settings
 
-    sql_settings = load_settings(home, settings_file)
+    with profile.stage("local_config"):
+        ensure_home(home)
+        relays_path = relays_file or home / RELAYS_FILENAME
+        store = RelaysStore(relays_path)
+        store.snapshot()
+        registry = TargetRegistry(store, client_factory=client_factory, probe_ttl_s=probe_ttl_s)
+        sql_settings = load_settings(home, settings_file)
     storage = None
     jobs = None
     server = None
@@ -624,21 +677,27 @@ def build_hub(
             from privy.hub.shared_jobs import SharedAuditLog, SharedJobManager
             from privy.hub.sql_store import SqlBackend
 
-            storage = SqlBackend(sql_settings, home, connect=sql_connect)
-            if callable(getattr(storage, "read_changes", None)):
-                storage.read_model = SqlReadModel(storage)
-            jobs = SharedJobManager(
-                registry, backend=storage, max_running=max_jobs, audit=SharedAuditLog(storage)
+            with profile.stage("backend"):
+                storage = SqlBackend(sql_settings, home, connect=sql_connect)
+            with profile.stage("hydration_start"):
+                if callable(getattr(storage, "read_changes", None)):
+                    storage.read_model = SqlReadModel(storage)
+            with profile.stage("jobs"):
+                jobs = SharedJobManager(
+                    registry, backend=storage, max_running=max_jobs, audit=SharedAuditLog(storage)
+                )
+            with profile.stage("lease_config"):
+                leases = LeaseStore(registry, home=home, audit=jobs.audit, sql_backend=storage)
+            with profile.stage("listeners"):
+                listener_infos = ListenerInfoStore(home, backend=getattr(storage, "read_model", storage))
+        with profile.stage("service"):
+            service = HubService(
+                registry=registry,
+                jobs=jobs,
+                version=version,
+                leases=leases,
+                listener_infos=listener_infos,
             )
-            leases = LeaseStore(registry, home=home, audit=jobs.audit, sql_backend=storage)
-            listener_infos = ListenerInfoStore(home, backend=getattr(storage, "read_model", storage))
-        service = HubService(
-            registry=registry,
-            jobs=jobs,
-            version=version,
-            leases=leases,
-            listener_infos=listener_infos,
-        )
         if storage is None:
             service.metrics.restore(home / AUDIT_FILENAME)
         else:
@@ -648,7 +707,8 @@ def build_hub(
                 getattr(storage, "read_model", storage), registry, max_running=jobs.max_running
             )
         app = HubApp(service, port=port)
-        server = HubHTTPServer((host, port), app)
+        with profile.stage("bind"):
+            server = HubHTTPServer((host, port), app)
         app.set_port(server.server_address[1])
         model = getattr(storage, "read_model", None)
         if model is not None:
@@ -659,16 +719,17 @@ def build_hub(
         )
         if storage is not None and host in ("127.0.0.1", "::1", "localhost"):
             app.drain = runtime.drain
-        write_state(
-            home,
-            {
-                "url": runtime.url,
-                "pid": os.getpid(),
-                "version": version,
-                "started_at": service.started_at,
-                "relays_file": str(relays_path),
-            },
-        )
+        with profile.stage("state_file"):
+            write_state(
+                home,
+                {
+                    "url": runtime.url,
+                    "pid": os.getpid(),
+                    "version": version,
+                    "started_at": service.started_at,
+                    "relays_file": str(relays_path),
+                },
+            )
         return runtime
     except BaseException:
         if server is not None:
