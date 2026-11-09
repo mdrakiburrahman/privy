@@ -301,6 +301,8 @@ def gather_probes(service: Any) -> dict[str, ProbeResult | None]:
     """
     registry = service.registry
     targets = list(registry.snapshot().targets)
+    if getattr(service, "background_warmup", None) is not None:
+        return {target.id: registry.cached(target) for target in targets}
     ttl = getattr(registry, "probe_ttl_s", 30.0)
     now = time.time()
     stale = [t for t in targets if (cached := registry.cached(t)) is None or now - cached.checked_at >= ttl]

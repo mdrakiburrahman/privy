@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import socket
+import threading
 import time
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from privy.hub.jobs import DEFAULT_MAX_RUNNING, AuditLog, JobManager
 from privy.hub.leases import LeaseStore
 from privy.hub.listener_facts import ListenerInfoStore
 from privy.hub.mcp import MCP_PATH, McpEndpoint
+from privy.hub.metrics import RANGES, ReportSelection
 from privy.hub.registry import DEFAULT_PROBE_TTL_S, TargetRegistry
 from privy.hub.responses import HTML_TYPE, HttpResponse, error_response
 from privy.hub.rest import RestApi
@@ -118,6 +120,7 @@ class HubApp:
         self.service = service
         self.rest = RestApi(service)
         self.mcp = McpEndpoint(service)
+        self.warmup = None
         self.set_port(port)
 
     def set_port(self, port: int) -> None:
@@ -177,6 +180,8 @@ class HubApp:
                     model = getattr(backend, "read_model", None)
                     if model is not None:
                         storage["read_model"] = model.health()
+                    if self.warmup is not None:
+                        storage["warmup"] = self.warmup.status()
                 else:
                     storage = {"mode": "file"}
                 response = HttpResponse(
@@ -347,6 +352,91 @@ class HubHTTPServer(ThreadingHTTPServer):
         super().server_bind()
 
 
+class _Warmup:
+    def __init__(self, app, model):
+        self.app, self.model = app, model
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._started = None
+        self._duration = None
+        self._warm = False
+        self._error = None
+        self._thread = threading.Thread(target=self._run, name="privy-sql-warmup", daemon=True)
+
+    def start(self):
+        self._started = time.monotonic()
+        self._thread.start()
+
+    def status(self):
+        with self._lock:
+            error = self._error or self.model.reads.core_error()
+            if self.model.health()["last_error"]:
+                error = error or "SQL record refresh failed"
+            warm = self._warm and error is None
+            return {
+                "warm": warm,
+                "status": "ready" if warm else "degraded" if error else "warming",
+                "warm_seconds": self._duration,
+                "last_error": error,
+            }
+
+    def _run(self):
+        from privy.hub.dashboard import DEFAULT_JOB_LIMIT, DEFAULT_LOG_LIMIT, build_shell_report
+
+        next_probe = 0.0
+        while not self._stop.is_set():
+            try:
+                if not self.model._ready.wait(1):
+                    continue
+                service = self.app.service
+                registry = service.registry
+                targets = list(registry.snapshot().targets)
+                if time.monotonic() >= next_probe:
+                    registry.probe_many(targets)
+                    next_probe = time.monotonic() + registry.probe_ttl_s
+                probes = {target.id: registry.cached(target) for target in targets}
+                service.listener_facts_many(targets, probes)
+                service.leases.target_summaries([target.id for target in targets])
+                service.leases.groups()
+                service.leases.list_leases(state="all")
+                service.leases.list_clients(active=False)
+                service.metrics.count_jobs_by_lease()
+                service.metrics.count_jobs_by_target()
+                service.metrics.entries(limit=DEFAULT_JOB_LIMIT + 1)
+                service.metrics.entries(limit=DEFAULT_LOG_LIMIT + 1)
+                service.jobs.list(limit=50)
+                build_shell_report(service, ReportSelection())
+                for name in (*RANGES, "all"):
+                    if self._stop.is_set():
+                        return
+                    service.metrics.report(
+                        targets,
+                        probes,
+                        selection=ReportSelection(name),
+                        max_running=service.jobs.max_running,
+                    )
+                with self._lock:
+                    self._warm = True
+                    if self._duration is None:
+                        self._duration = time.monotonic() - self._started
+                    self._error = None
+            except Exception as exc:
+                with self._lock:
+                    self._warm = False
+                    pending = isinstance(exc, StorageError) and "still hydrating" in str(exc)
+                    self._error = None if pending else type(exc).__name__
+                if not pending:
+                    log.warning("SQL dashboard warmup failed (%s)", type(exc).__name__)
+            self._stop.wait(10)
+
+    def close(self):
+        self._stop.set()
+        if self._thread.ident is not None:
+            self._thread.join(timeout=75)
+            if self._thread.is_alive():
+                raise StorageError("SQL dashboard warmup did not stop; backend resources remain in use")
+
+
 @dataclass
 class HubRuntime:
     """A constructed hub: its service, HTTP server, and where it keeps state."""
@@ -369,12 +459,16 @@ class HubRuntime:
     def serve_forever(self) -> None:
         if self.storage is not None:
             self.service.jobs.start_audit_import(self.home / AUDIT_FILENAME)
+            if self.app.warmup is not None:
+                self.app.warmup.start()
         self.server.serve_forever(poll_interval=0.5)
 
     def shutdown(self) -> None:
         self.app.rest.terminals.close()
         self.server.shutdown()
         self.server.server_close()
+        if self.app.warmup is not None:
+            self.app.warmup.close()
         self.service.listener_infos.flush()
         if self.storage is not None:
             self.service.jobs.close()
@@ -453,6 +547,10 @@ def build_hub(
             storage.close()
         raise
     app.set_port(server.server_address[1])
+    model = getattr(storage, "read_model", None)
+    if model is not None:
+        app.warmup = _Warmup(app, model)
+        service.background_warmup = app.warmup
     runtime = HubRuntime(
         service=service, server=server, app=app, home=home, relays_file=relays_path, storage=storage
     )

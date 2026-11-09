@@ -542,6 +542,22 @@ def test_default_report_stays_warm_after_idle():
         cache.close()
 
 
+def test_standard_ranges_stay_warm_but_custom_reports_do_not():
+    cache = BackgroundReads(interval=3600, idle_after=60)
+    try:
+        standard = ("report", ReportSelection("7d"), (("max_running", 20),))
+        custom = ("report", ReportSelection("custom", start=1, end=2), (("max_running", 20),))
+        cache.get(standard, lambda: "standard")
+        cache.get(custom, lambda: "custom")
+        now = cache.clock() + 120
+        assert cache._active(cache._reads[standard], now)
+        assert not cache._active(cache._reads[custom], now)
+        assert cache._core_read(("coordination",))
+        assert cache._core_read(("latest-probes",))
+    finally:
+        cache.close()
+
+
 def test_default_report_survives_cache_eviction():
     cache = BackgroundReads(capacity=1, interval=3600)
     key = ("report", ReportSelection(), ())

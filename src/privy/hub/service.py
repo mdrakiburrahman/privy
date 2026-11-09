@@ -383,7 +383,8 @@ OPERATIONS: tuple[Operation, ...] = (
         "languages; os_family, os_version, arch, privy_version, python_version, environment, and "
         "shells are also shown for offline machines from their last report (info_stale, "
         "info_seen_at). Filter on those with os, os_version, environment, arch, privy_version, "
-        "python_version, and shell. Status is probed live and cached briefly. Start here.",
+        "python_version, and shell. Status is cached briefly; SQL mode refreshes it in the background. "
+        "Start here.",
         (
             Param(
                 "refresh",
@@ -396,7 +397,8 @@ OPERATIONS: tuple[Operation, ...] = (
             Param(
                 "probe",
                 "boolean",
-                "Probe machines without a fresh cached status. false returns cached status only (fast).",
+                "Probe machines without a fresh cached status. SQL mode refreshes in the background; "
+                "false returns cached status only. Use refresh=true to wait for fresh probes.",
                 default=True,
             ),
             *(
@@ -1152,7 +1154,8 @@ class HubService:
                     details={"relays": [item.name for item in snapshot.relays]},
                 )
         targets = [target for item in relays for target in item.targets]
-        if probe:
+        background_probes = getattr(self, "background_warmup", None) is not None
+        if probe and (refresh or not background_probes):
             probes = self.registry.probe_many(targets, refresh=refresh)
         else:
             probes = {target.id: self.registry.cached(target) for target in targets}

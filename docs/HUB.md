@@ -112,17 +112,21 @@ same database: a database-backed lease does **not** coordinate with an existing 
 The startup log names `storage: azure_sql`, server/database and the process owner incarnation; the
 dashboard sidebar shows `storage Azure SQL` and pending/rejected delivery counts. `/healthz` probes
 SQL and reports the read model's readiness, last-good snapshot age, last refresh duration and last
-error. Once a snapshot is available, dashboard reads can serve it while background refreshes
-continue; its age can grow during an outage. A cold read that cannot hydrate in time returns 503
-with `Retry-After`. Shared record deletions are reconciled periodically, so they can remain visible
-for up to the reconciliation interval plus a refresh. Lease mutations and output cursor claims
-remain SQL-authoritative. `/v1` includes detailed storage health. The isolated Basic-tier SQL
-benchmark (20 simulated devboxes, 3,360 jobs over seven days, 4 KiB output per job) measured a
-200-job page at 0.63 seconds, seven-day statistics at 4.21 seconds, dashboard HTML at 5.35 seconds
-and an output page at 1.42 seconds. This is not a production-tier or two-physical-machine
-measurement. Dashboard pages render cached listener statuses while stale probes continue in the
-background, waiting at most 0.5 seconds for a refresh. SQL-backed reports reuse the job counts
-already read for that page.
+error. SQL mode also warms common dashboard and API reads in the background after HTTP binding;
+`storage.warmup.warm`, `status` (`warming`, `ready`, or `degraded`), `warm_seconds`, and
+`last_error` describe warmup readiness and failures. Common report ranges and target probes continue
+refreshing while the hub is idle. A normal SQL-mode target listing returns cached probe results;
+`refresh=true` waits for fresh probes. Once a snapshot is available, dashboard reads can serve it
+while background refreshes continue; its age can grow during an outage. A cold read that cannot
+hydrate in time returns 503 with `Retry-After`. Shared record deletions are reconciled periodically,
+so they can remain visible for up to the reconciliation interval plus a refresh. Lease mutations and
+output cursor claims remain SQL-authoritative. `/v1` includes detailed storage health. The isolated
+Basic-tier SQL benchmark (20 simulated devboxes, 3,360 jobs over seven days, 4 KiB output per job)
+measured a 200-job page at 0.63 seconds, seven-day statistics at 4.21 seconds, dashboard HTML at
+5.35 seconds and an output page at 1.42 seconds. This is not a production-tier or
+two-physical-machine measurement. Dashboard pages render cached listener statuses while stale probes
+continue in the background, waiting at most 0.5 seconds for a refresh. SQL-backed reports reuse the
+job counts already read for that page.
 
 Probe history reads use a covering SQL index over computed status and latency fields, while fetching
 full payloads only for each target's latest probe; the additive schema bootstrap is serialized and

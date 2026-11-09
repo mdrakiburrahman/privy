@@ -11,7 +11,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
 from typing import Any
 
-from privy.hub.metrics import ReportSelection
+from privy.hub.metrics import RANGES, ReportSelection
 from privy.hub.sql_store import StorageError
 
 log = logging.getLogger("privy.hub")
@@ -76,7 +76,7 @@ class BackgroundReads:
 
     def _evict_one(self):
         for key in self._reads:
-            if not self.capacity or not self._default_report(key):
+            if not self.capacity or not self._core_read(key):
                 del self._reads[key]
                 return
         self._reads.popitem(last=False)
@@ -84,6 +84,31 @@ class BackgroundReads:
     @staticmethod
     def _default_report(key):
         return key[0] == "report" and len(key) > 1 and key[1] == ReportSelection()
+
+    @staticmethod
+    def _core_read(key):
+        if key in (("coordination",), ("latest-probes",)):
+            return True
+        if BackgroundReads._default_report(key):
+            return True
+        return (
+            len(key) == 3
+            and key[0] == "report"
+            and key[1] in tuple(ReportSelection(name) for name in (*RANGES, "all"))
+            and len(key[2]) == 1
+            and key[2][0][0] == "max_running"
+        )
+
+    def core_error(self):
+        with self._lock:
+            return next(
+                (
+                    type(read.error).__name__
+                    for key, read in self._reads.items()
+                    if self._core_read(key) and read.error is not None
+                ),
+                None,
+            )
 
     def _lookup(self, key, load):
         read = self._reads.get(key)
@@ -196,7 +221,7 @@ class BackgroundReads:
     def _active(self, read, now):
         return (
             read.key[0] == "history"
-            or self._default_report(read.key)
+            or self._core_read(read.key)
             or (read.accessed is not None and now - read.accessed < self.idle_after)
         )
 

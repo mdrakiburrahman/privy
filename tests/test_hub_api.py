@@ -108,6 +108,14 @@ def test_health_includes_read_model_freshness(hub, monkeypatch):
     assert response.payload["storage"]["read_model"] == status
 
 
+def test_health_exposes_warmup_without_starting_it(hub, monkeypatch):
+    backend = SimpleNamespace(health=lambda: {"mode": "azure_sql"})
+    status = {"warm": False, "status": "warming", "warm_seconds": None, "last_error": None}
+    monkeypatch.setattr(hub.jobs, "backend", backend, raising=False)
+    hub.app.warmup = SimpleNamespace(status=lambda: status)
+    assert hub.call("GET", "/healthz").payload["storage"]["warmup"] == status
+
+
 def test_translated_api_storage_error_is_retryable(hub, monkeypatch):
     def unavailable(*args, **kwargs):
         raise StorageError("SQL read model is still hydrating")
@@ -567,6 +575,24 @@ def test_list_targets_reports_live_status_and_listener_details(hub):
     online = hub.call("GET", "/v1/targets?online_only=true&relay=dev").payload
     assert [target["id"] for target in online["targets"]] == [BOX1]
     assert hub.call("GET", "/v1/targets?relay=nope").status == 404
+
+
+def test_background_probes_preserve_explicit_target_refresh(hub, monkeypatch):
+    calls = []
+    original = hub.service.registry.probe_many
+
+    def counted(targets, **kwargs):
+        calls.append(kwargs)
+        return original(targets, **kwargs)
+
+    monkeypatch.setattr(hub.service.registry, "probe_many", counted)
+    hub.call("GET", "/v1/targets")
+    assert len(calls) == 1
+    hub.service.background_warmup = object()
+    hub.call("GET", "/v1/targets")
+    assert len(calls) == 1
+    hub.call("GET", "/v1/targets?refresh=true")
+    assert calls[-1]["refresh"] is True
 
 
 def test_list_targets_as_text_is_a_compact_table(hub):
