@@ -1,9 +1,6 @@
-name: GCI
+name: Disposable Windows packaging only - frozen startup profiler
 
 on:
-  pull_request:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
@@ -13,174 +10,108 @@ env:
   UV_PYTHON: "3.12"
 
 jobs:
-  ci:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    concurrency:
-      group: ci-${{ github.event.pull_request.number || github.ref }}
-      cancel-in-progress: true
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          version: "0.12.13"
-          enable-cache: true
-
-      - name: Check source
-        run: ./scripts/check_ci.sh
-
-      - name: Check Remote Exec in Chromium
-        run: ./scripts/check_hub_browser.sh
-
-      - name: Build release artifacts
-        run: ./scripts/build_release.sh
-
-      - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: privy-wheel-${{ github.sha }}
-          path: dist/*.whl
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload CLI artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: privy-linux-x86_64-${{ github.sha }}
-          path: dist/privy
-          if-no-files-found: error
-          retention-days: 30
-
-  windows-ci:
+  package-windows-only:
     runs-on: windows-latest
     timeout-minutes: 30
 
     steps:
-      - name: Check out repository
+      - name: Check out frozen source, not packaging branch
         uses: actions/checkout@v4
         with:
+          ref: 6e9af17b7f065133fe6ab1c46298da77abc1e805
           persist-credentials: false
 
-      - name: Set up Python
+      - name: Assert source and record separate workflow identity
+        shell: pwsh
+        env:
+          PACKAGING_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          PACKAGING_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Cannot read checkout HEAD" }
+          $tree = (git rev-parse 'HEAD^{tree}').Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Cannot read checkout tree" }
+          if ($head -ne "6e9af17b7f065133fe6ab1c46298da77abc1e805") {
+              throw "Unexpected checkout HEAD: $head"
+          }
+          if ($tree -ne "116a14e268559a3aab2bf6239f9808967be2c082") {
+              throw "Unexpected checkout tree: $tree"
+          }
+          New-Item -ItemType Directory -Path packaging-provenance | Out-Null
+          $lockHash = (Get-FileHash -Algorithm SHA256 -LiteralPath uv.lock).Hash
+          @(
+              "purpose: disposable packaging only; never merge this workflow"
+              "source_head: '$head'"
+              "source_tree: '$tree'"
+              "uv_lock_sha256: '$lockHash'"
+              "workflow_commit: '$env:PACKAGING_WORKFLOW_SHA'"
+              "workflow_ref: '$env:PACKAGING_WORKFLOW_REF'"
+              "dispatch_commit: '$env:GITHUB_SHA'"
+              "dispatch_ref: '$env:GITHUB_REF'"
+              "repository: '$env:GITHUB_REPOSITORY'"
+              "run_id: '$env:GITHUB_RUN_ID'"
+              "run_attempt: '$env:GITHUB_RUN_ATTEMPT'"
+              "runtime_observation: false"
+              "deployment: false"
+          ) | Set-Content -LiteralPath packaging-provenance\receipt.yaml -Encoding utf8
+
+      - name: Set up Python 3.12 x64
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           architecture: x64
 
-      - name: Set up uv
+      - name: Set up pinned uv
         uses: astral-sh/setup-uv@v6
         with:
           version: "0.12.13"
-          enable-cache: true
+          enable-cache: false
 
-      - name: Check source and build Windows CLI
+      - name: Build Windows executable with locked binary and SQL dependencies
         shell: pwsh
-        run: .\scripts\check_windows.ps1
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\scripts\build_binary.ps1 *>&1 |
+              Tee-Object -FilePath packaging-provenance\build.log
 
-      - name: Upload Windows CLI artifact
+      - name: Record installed packages and executable hash
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & uv --version | Set-Content packaging-provenance\uv-version.txt
+          if ($LASTEXITCODE -ne 0) { throw "Cannot record uv version" }
+          & uv run --no-sync python -c "import importlib.metadata as m, platform; print('Python: ' + platform.python_version()); print('Architecture: ' + platform.machine()); print('\n'.join(sorted(d.metadata['Name'] + '==' + d.version for d in m.distributions())))" |
+              Set-Content packaging-provenance\installed-packages.txt
+          if ($LASTEXITCODE -ne 0) { throw "Cannot record installed packages" }
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Cannot read final HEAD" }
+          $tree = (git rev-parse 'HEAD^{tree}').Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Cannot read final tree" }
+          $changes = @(git status --porcelain --untracked-files=no)
+          if ($LASTEXITCODE -ne 0) { throw "Cannot verify tracked source" }
+          if ($head -ne "6e9af17b7f065133fe6ab1c46298da77abc1e805" -or
+              $tree -ne "116a14e268559a3aab2bf6239f9808967be2c082" -or
+              $changes.Count -ne 0) {
+              throw "Frozen tracked source changed during packaging"
+          }
+          $binary = Get-Item -LiteralPath dist\privy.exe
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $binary.FullName).Hash
+          @(
+              "final_source_head: '$head'"
+              "final_source_tree: '$tree'"
+              "binary_sha256: '$hash'"
+              "binary_bytes: $($binary.Length)"
+              "build_command: '.\scripts\build_binary.ps1'"
+              "build_and_offline_smoke: passed"
+          ) | Add-Content -LiteralPath packaging-provenance\receipt.yaml -Encoding utf8
+
+      - name: Upload executable and packaging provenance only
         uses: actions/upload-artifact@v4
         with:
-          name: privy-windows-x86_64-${{ github.sha }}
-          path: dist/privy.exe
+          name: packaging-only-windows-6e9af17-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/privy.exe
+            packaging-provenance/
           if-no-files-found: error
-          retention-days: 30
-
-  gci-linux:
-    needs: ci
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment: gci
-    concurrency:
-      group: privy-gci-relay
-
-    steps:
-      - name: Check out trusted revision
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && github.event.pull_request.base.sha || github.sha }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          version: "0.12.13"
-          enable-cache: true
-
-      - name: Run required Relay E2E tests
-        env:
-          BASE64_ENV: ${{ secrets.BASE64_ENV }}
-          GCI_EVENT_NAME: ${{ github.event_name }}
-          GCI_REPOSITORY: ${{ github.repository }}
-          GCI_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-        run: ./scripts/run_gci.sh
-
-  gci-windows:
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    needs:
-      - windows-ci
-      - gci-linux
-    runs-on: windows-latest
-    timeout-minutes: 15
-    environment: gci
-    concurrency:
-      group: privy-gci-relay
-
-    steps:
-      - name: Check out trusted revision
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && github.event.pull_request.base.sha || github.sha }}
-
-      - name: Download Windows CLI artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: privy-windows-x86_64-${{ github.sha }}
-          path: dist
-
-      - name: Run required Windows binary Relay test
-        shell: pwsh
-        env:
-          BASE64_ENV: ${{ secrets.BASE64_ENV }}
-        run: .\scripts\test_windows_binary_relay.ps1
-
-  gci:
-    if: ${{ always() }}
-    needs:
-      - gci-linux
-      - gci-windows
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Verify platform GCI results
-        env:
-          LINUX_GCI_RESULT: ${{ needs.gci-linux.result }}
-          WINDOWS_GCI_RESULT: ${{ needs.gci-windows.result }}
-        run: ./scripts/check_gci_results.sh
+          retention-days: 7
