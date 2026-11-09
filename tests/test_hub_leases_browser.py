@@ -319,17 +319,36 @@ def test_bulk_release_selection_refresh_confirmation_and_partial_failure(lease_b
     browser_api.expect(modal).to_contain_text("skipped; running jobs or pins were detected")
     modal.get_by_role("button", name="Cancel", exact=True).click()
     assert store.get_lease(lease["lease_id"])["state"] == "active"
+    store._leases[lease["lease_id"]]["job_owners"] = {}
+    page.locator(f'[data-select-lease="{lease["lease_id"]}"]').check()
+    guard_requests = []
+
+    def pin_race(route, lease_id, message):
+        guard_requests.append(route.request.post_data_json)
+        store._leases[lease_id]["job_owners"] = {"new-pin": "other-hub"}
+        route.fulfill(
+            status=409,
+            content_type="application/json",
+            body=f'{{"error":{{"message":"{message}"}}}}',
+        )
+
+    page.route(
+        f"**/v1/leases/{lease['lease_id']}/force-release",
+        lambda route: pin_race(route, lease["lease_id"], "Lease has running jobs or pins"),
+    )
     page.route(
         f"**/v1/leases/{second['lease_id']}/force-release",
-        lambda route: route.fulfill(
-            status=409, content_type="application/json", body='{"error":{"message":"Owner still running"}}'
-        ),
+        lambda route: pin_race(route, second["lease_id"], "Owner still running"),
     )
     page.locator("#force-release-selected").click()
-    modal.get_by_role("button", name="Force release unpinned (1)", exact=True).click()
-    browser_api.expect(modal).to_contain_text(f"{lease['lease_id']}: skipped")
+    modal.get_by_role("button", name="Force release unpinned (2)", exact=True).click()
+    browser_api.expect(modal).to_contain_text(f"{lease['lease_id']}: Lease has running jobs or pins")
     browser_api.expect(modal).to_contain_text(f"{second['lease_id']}: Owner still running")
-    assert release_requests == [f"{base}/v1/leases/{second['lease_id']}/force-release"]
+    assert set(release_requests) == {
+        f"{base}/v1/leases/{lease['lease_id']}/force-release",
+        f"{base}/v1/leases/{second['lease_id']}/force-release",
+    }
+    assert guard_requests == [{"require_unpinned": True}, {"require_unpinned": True}]
     assert store.get_lease(second["lease_id"])["state"] == "active"
     assert not any(listener.terminal_requests for listener in hub.listeners.values())
     modal.get_by_role("button", name="Close and refresh", exact=True).click()
