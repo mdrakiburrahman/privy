@@ -318,13 +318,17 @@ class _Handler(BaseHTTPRequestHandler):
     def _dispatch_registered(self) -> None:
         started = time.monotonic()
         token = REQUEST_ID.set(uuid.uuid4().hex[:12])
+        drained = False
         try:
             body, response = self._read_and_handle()
+            drained = response.status == 200 and response.note == "drained"
             try:
                 if response.stream is not None:
                     self._send_stream(response)
                 else:
                     self._send(response)
+                if drained:
+                    self.wfile.flush()
             except ConnectionError:
                 # The caller went away (Ctrl-C on curl, a client timeout); jobs keep running.
                 response.note = (
@@ -336,11 +340,10 @@ class _Handler(BaseHTTPRequestHandler):
                 response.note = f"{response.note}, failed" if response.note else "failed"
                 self.close_connection = True
             self.server.app.log_call(self.command, self.path, body, response, time.monotonic() - started)
-            if response.note == "drained":
-                self.wfile.flush()
+        finally:
+            if drained:
                 self.close_connection = True
                 threading.Thread(target=self.server.shutdown, name="privy-drain-stop", daemon=True).start()
-        finally:
             REQUEST_ID.reset(token)
 
     def _read_and_handle(self) -> tuple[bytes, HttpResponse]:
