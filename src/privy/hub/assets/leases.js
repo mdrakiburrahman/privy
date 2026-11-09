@@ -90,9 +90,10 @@ window.PrivyLeases = (() => {
     if (dialog || bulkBusy) return;
     const inputs = visibleSelections().filter(input => input.checked);
     if (!inputs.length) return;
+    const selectedIds = inputs.map(input => input.dataset.selectLease);
     const button = $("force-release-selected"); bulkBusy = true; button.disabled = true;
     try {
-      const leases = await Promise.all(inputs.map(input => get(`/v1/leases/${encodeURIComponent(input.dataset.selectLease)}`)));
+      const leases = await Promise.all(selectedIds.map(id => get(`/v1/leases/${encodeURIComponent(id)}`)));
       const panel = element("dialog", "", "lease-dialog"); dialog = panel;
       const heading = element("h2", `Force release ${leases.length} selected leases?`);
       heading.id = "lease-bulk-title"; panel.setAttribute("aria-labelledby", heading.id);
@@ -142,12 +143,46 @@ window.PrivyLeases = (() => {
       proceed.onclick = async () => {
         if (submitting || completed) return;
         submitting = true; proceed.disabled = true; cancel.disabled = true;
-        for (const lease of releasable) {
+        results.replaceChildren();
+        let freshLeases;
+        try {
+          freshLeases = await Promise.all(selectedIds.map(id => get(`/v1/leases/${encodeURIComponent(id)}`)));
+        } catch (error) {
+          results.append(element("p",
+            `Could not refresh selected leases before submission: ${error.message}. No releases were submitted.`,
+            "lease-action-error"));
+          submitting = false; completed = true; cancel.disabled = false;
+          cancel.textContent = "Close and refresh";
+          return;
+        }
+        list.replaceChildren();
+        for (const lease of freshLeases) {
+          const runningJobs = Array.isArray(lease.running_jobs) ? lease.running_jobs : [];
+          const owners = lease.job_owners && typeof lease.job_owners === "object" && !Array.isArray(lease.job_owners)
+            ? Object.keys(lease.job_owners) : [];
+          const running = [...new Set([...runningJobs, ...owners])];
+          const invalidMetadata = (lease.running_jobs && !Array.isArray(lease.running_jobs)) ||
+            (lease.job_owners && (typeof lease.job_owners !== "object" || Array.isArray(lease.job_owners)));
+          const isBlocked = running.length > 0 || invalidMetadata;
+          list.append(element("li", `${lease.lease_id} · ${lease.group} · ${lease.holder?.name || lease.client_id}` +
+            (isBlocked ? ` — BLOCKED: ${running.length ? `running jobs/pins ${running.join(", ")}` : "invalid pin metadata"}; will not be submitted`
+              : " — no running jobs or pins; eligible"),
+          isBlocked ? "lease-warning" : ""));
+          if (isBlocked) {
+            selected.delete(lease.lease_id);
+            persistSelection();
+            results.append(element("p",
+              `${lease.lease_id}: skipped; running jobs or pins were detected during pre-submit refresh.`,
+              "lease-warning"));
+            continue;
+          }
           const result = element("p", `${lease.lease_id}: releasing…`); results.append(result);
           selected.delete(lease.lease_id);
           persistSelection();
           try {
-            await mutate(`/v1/leases/${encodeURIComponent(lease.lease_id)}/force-release`, "POST", {});
+            await mutate(`/v1/leases/${encodeURIComponent(lease.lease_id)}/force-release`, "POST", {
+              require_unpinned: true
+            });
             result.textContent = `${lease.lease_id}: released`;
           } catch (error) {
             result.textContent = `${lease.lease_id}: ${error.name === "AbortError"
