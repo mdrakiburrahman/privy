@@ -232,19 +232,26 @@ def test_admission_is_pinned_and_synchronously_persisted_before_execution(tmp_pa
         jobs.close()
 
 
-def test_failed_admission_never_launches_and_conservatively_retains_pin(tmp_path):
+def test_failed_admission_never_launches_and_retains_pin_until_completion_retry(tmp_path):
     backend = Backend()
     hub = Hub(tmp_path)
     pins = []
-    jobs = manager(hub, backend, on_job=lambda job: pins.append(job.id))
+    jobs = manager(hub, backend, cancel_poll_s=10, on_job=lambda job: pins.append(job.id))
     jobs.on_finish = lambda job: pins.remove(job.id)
     backend.put = lambda *args: (_ for _ in ()).throw(RuntimeError("SQL unavailable"))
+    enqueue = backend.enqueue
+    backend.enqueue = backend.put
     try:
         with pytest.raises(RuntimeError, match="SQL unavailable"):
             start(jobs, hub)
         assert len(pins) == 1
         assert not hub.listeners
         assert jobs._jobs == {}
+        job_id = pins[0]
+        backend.enqueue = enqueue
+        jobs._retry_finishes()
+        assert not pins and not jobs._pending_finishes
+        assert backend.get("job", job_id)["state"] == "error"
     finally:
         jobs.close()
 
@@ -1345,16 +1352,23 @@ class ProcessBackend(Backend):
     def check_config(self, name, payload):
         self.coordination["config", name] = json.dumps(payload)
 
+    def get_config(self, name):
+        raw = self.coordination.get(("config", name))
+        return json.loads(raw) if raw is not None else None
+
     def set_migration_status(self, status):
         self.migration_status = dict(status)
 
     @contextlib.contextmanager
-    def transaction(self, lock=None):
+    def transaction(self, lock=None, **kwargs):
         with self.lock:
             yield ProcessCursor(self)
 
     def close(self):
         return self.flush()
+
+    def stop_worker(self):
+        pass
 
     def health(self):
         return self.status()
@@ -1398,6 +1412,9 @@ class ProcessCursor:
             self.rows = [(time.time(),)]
         elif "SELECT payload" in sql and "id='targets'" in sql:
             self.rows = [(self.backend.coordination["config", "targets"],)]
+        elif "SELECT payload" in sql and "kind='import'" in sql:
+            raw = self.backend.coordination.get(("import", args[0]))
+            self.rows = [(raw,)] if raw is not None else []
         elif "SELECT kind,id,payload" in sql:
             self.rows = [
                 (kind, key, raw)
@@ -1405,7 +1422,7 @@ class ProcessCursor:
                 if kind in ("client", "lease", "use")
             ]
         elif sql.startswith("INSERT dbo.privy_coordination"):
-            kind, key, raw = args
+            kind, key, raw = ("import", *args) if "VALUES('import'" in sql else args
             self.backend.coordination[kind, key] = raw
         elif sql.startswith("UPDATE dbo.privy_coordination"):
             raw, kind, key = args
@@ -1428,6 +1445,232 @@ class ProcessCursor:
         self.result_set_index += 1
         self.rows = self.result_sets[self.result_set_index]
         return True
+
+
+@pytest.mark.parametrize("stale_policy", [False, True])
+def test_sql_policy_restores_missing_home_and_ignores_stale_local_policy(tmp_path, stale_policy):
+    import yaml
+
+    from privy.hub.leases import DEFAULT_CONFIG, LeaseStore, effective_lease_config
+
+    hub = Hub(tmp_path)
+    policy = yaml.safe_load(DEFAULT_CONFIG)
+    policy["defaults"]["ttl"] = "17m"
+    policy["defaults"]["max_leases_per_client"] = 7
+    backend = ProcessBackend(None, tmp_path)
+    backend.coordination["config", "leases"] = json.dumps(effective_lease_config(policy))
+    if stale_policy:
+        (tmp_path / "leases.yaml").write_text("invalid: [", encoding="utf-8")
+    leases = LeaseStore(hub.registry, home=tmp_path, sql_backend=backend)
+    assert leases.default_ttl == 17 * 60 and leases.client_limit == 7
+    if not stale_policy:
+        assert yaml.safe_load((tmp_path / "leases.yaml").read_text())["defaults"]["ttl"] == 17 * 60
+    assert json.loads(backend.coordination["config", "leases"]) == effective_lease_config(policy)
+
+
+def test_sql_legacy_session_reconciliation_preserves_shared_active_owner_and_retires_file(tmp_path):
+    from privy.hub.leases import LeaseStore
+
+    hub = Hub(tmp_path)
+    local = LeaseStore(hub.registry, home=tmp_path)
+    hub.service.invoke("list_targets", {}, origin="test")
+    client_id = local.register_client("old computer", session_id="same-session")["client_id"]
+    lease_id = local.acquire(client_id, target="dev/box1")["lease_id"]
+    local.release(lease_id, client_id)
+    historical_id = uuid.uuid4().hex
+    local._leases[historical_id] = dict(local._leases[lease_id], lease_id=historical_id)
+    local._save()
+    raw = local.state_path.read_bytes()
+    shared_client = dict(local._clients[client_id], client_id="canonical", name="new computer", host="other")
+    shared_lease = dict(
+        local._leases[lease_id],
+        client_id="canonical",
+        state="active",
+        running_jobs=["shared-job"],
+        job_owners={"shared-job": "shared-owner"},
+    )
+    backend = ProcessBackend(None, tmp_path)
+    backend.coordination["client", "canonical"] = json.dumps(shared_client)
+    backend.coordination["lease", lease_id] = json.dumps(shared_lease)
+    restored = LeaseStore(hub.registry, home=tmp_path, sql_backend=backend)
+    assert restored._clients == {"canonical": shared_client}
+    assert restored._leases[lease_id] == shared_lease
+    assert restored._leases[historical_id]["client_id"] == "canonical"
+    snapshot = local.state_path.with_name("leases-state.json.imported-snapshot")
+    assert snapshot.read_bytes() == raw and not local.state_path.exists()
+    before = copy.deepcopy(backend.coordination)
+    local.state_path.write_bytes(raw)
+    LeaseStore(hub.registry, home=tmp_path, sql_backend=backend)
+    assert backend.coordination == before
+    assert snapshot.read_bytes() == raw and not local.state_path.exists()
+
+
+@pytest.mark.parametrize("duplicate_shared_session", [False, True])
+def test_sql_legacy_active_session_alias_requires_explicit_owner_resolution(
+    tmp_path, duplicate_shared_session
+):
+    from privy.hub.leases import LeaseStore
+
+    hub = Hub(tmp_path)
+    local = LeaseStore(hub.registry, home=tmp_path)
+    hub.service.invoke("list_targets", {}, origin="test")
+    client_id = local.register_client("old", session_id="same-session")["client_id"]
+    local.acquire(client_id, target="dev/box1")
+    raw = local.state_path.read_bytes()
+    backend = ProcessBackend(None, tmp_path)
+    canonical = dict(local._clients[client_id], client_id="canonical")
+    backend.coordination["client", "canonical"] = json.dumps(canonical)
+    if duplicate_shared_session:
+        backend.coordination["client", "other"] = json.dumps(dict(canonical, client_id="other"))
+    message = (
+        "ambiguous duplicate client sessions"
+        if duplicate_shared_session
+        else "different shared session owner"
+    )
+    with pytest.raises(StorageError, match=message):
+        LeaseStore(hub.registry, home=tmp_path, sql_backend=backend)
+    assert local.state_path.read_bytes() == raw
+    assert json.loads(backend.coordination["client", "canonical"]) == canonical
+    assert not any(kind == "lease" for kind, _ in backend.coordination)
+
+
+def test_sql_acquire_probes_relays_without_holding_coordination_transaction(tmp_path, monkeypatch):
+    from privy.hub.leases import LeaseStore
+
+    hub = Hub(tmp_path)
+    backend = ProcessBackend(None, tmp_path)
+    leases = LeaseStore(hub.registry, home=tmp_path, sql_backend=backend)
+    client_id = leases.register_client("test", session_id="session")["client_id"]
+    probe = hub.registry.probe
+    observed = []
+
+    def outside_transaction(target, *args, **kwargs):
+        assert getattr(leases._lock._local, "depth", 0) == 0
+        observed.append(target.id)
+        return probe(target, *args, **kwargs)
+
+    monkeypatch.setattr(hub.registry, "probe", outside_transaction)
+    lease = leases.acquire(client_id, target="dev/box1")
+    assert lease["state"] == "active" and "dev/box1_windows" in observed
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_background_audit_import_retires_only_unchanged_durable_source(tmp_path, changed):
+    hub = Hub(tmp_path)
+    backend = ProcessBackend(None, tmp_path)
+    jobs = manager(hub, backend)
+    path = audit_fixture(
+        tmp_path / "audit.jsonl",
+        [{"ts": utc_iso(time.time()), "event": "job.start", "job_id": "old", "target": "dev/box1_windows"}],
+    )
+    raw = path.read_bytes()
+    import_audit = jobs.import_audit
+
+    def import_then_change(*args, **kwargs):
+        result = import_audit(*args, **kwargs)
+        if changed:
+            path.write_bytes(raw + b"\n")
+        return result
+
+    jobs.import_audit = import_then_change
+    try:
+        jobs.start_audit_import(path)
+        jobs._audit_import_thread.join(5)
+        assert not jobs.audit_import_running
+        assert backend.get("job", "old") is not None
+        assert backend.migration_status["state"] == ("failed" if changed else "complete")
+        if changed:
+            assert path.read_bytes() == raw + b"\n"
+        else:
+            assert not path.exists()
+            assert path.with_name("audit.jsonl.imported-snapshot").read_bytes() == raw
+    finally:
+        jobs.close()
+
+
+@pytest.mark.parametrize("stage", ["config", "bind", "state"])
+def test_failed_sql_start_stops_cancel_monitor_before_backend_close(tmp_path, monkeypatch, stage):
+    from privy.hub.app import build_hub
+
+    hub = Hub(tmp_path)
+    (tmp_path / "appsettings.yaml").write_text(
+        "version: 1\nstorage:\n  mode: azure_sql\n  server: example.database.windows.net\n  database: privy\n",
+        encoding="utf-8",
+    )
+    instances = []
+
+    class FailedBackend(ProcessBackend):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.closed = False
+            instances.append(self)
+
+        def get_config(self, name):
+            if stage == "config":
+                raise StorageError("original startup failure")
+            return super().get_config(name)
+
+        def close(self):
+            assert not any(t.name == "privy-shared-cancel" and t.is_alive() for t in threading.enumerate())
+            self.closed = True
+
+    monkeypatch.setattr("privy.hub.sql_store.SqlBackend", FailedBackend)
+    if stage != "config":
+
+        def fail(*args, **kwargs):
+            raise StorageError("original startup failure")
+
+        monkeypatch.setattr("privy.hub.app." + ("HubHTTPServer" if stage == "bind" else "write_state"), fail)
+    with pytest.raises(StorageError, match="original startup failure"):
+        build_hub(home=tmp_path, port=0, version="test", client_factory=hub._client)
+    assert instances[0].closed
+
+
+def test_sql_http_drain_sends_zero_pending_response_then_stops_serving(tmp_path, monkeypatch):
+    import requests
+
+    from privy.hub.app import build_hub
+
+    hub = Hub(tmp_path)
+    (tmp_path / "appsettings.yaml").write_text(
+        "version: 1\nstorage:\n  mode: azure_sql\n  server: example.database.windows.net\n  database: privy\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("privy.hub.sql_store.SqlBackend", ProcessBackend)
+    runtime = build_hub(home=tmp_path, port=0, version="test", client_factory=hub._client)
+    runtime.storage.status = lambda: {"pending_writes": 0, "mode": "azure_sql"}
+    serving = threading.Thread(target=runtime.serve_forever)
+    serving.start()
+    try:
+        response = requests.post(runtime.url + "/v1/admin/drain", timeout=5)
+        assert response.status_code == 200
+        assert response.json() == {"status": "drained", "pending_writes": 0}
+        serving.join(5)
+        assert not serving.is_alive()
+    finally:
+        if serving.is_alive():
+            runtime.server.shutdown()
+        runtime.close()
+    runtime.close()
+
+
+@pytest.mark.parametrize(
+    "owner,state,acknowledged", [("one", "error", True), ("one", "queued", False), ("old", "error", False)]
+)
+def test_absent_cancel_is_acknowledged_only_for_durable_current_owner_terminal_job(
+    tmp_path, owner, state, acknowledged
+):
+    hub = Hub(tmp_path)
+    backend = Backend(owner="one")
+    jobs = manager(hub, backend, cancel_poll_s=10)
+    backend.records["job", "absent"] = {"owner": owner, "state": state}
+    backend.request_cancel("absent")
+    backend.pending_cancels = lambda: ["absent"]
+    try:
+        jobs._process_cancels()
+        assert backend.records["cancel", "absent"]["acknowledged"] is acknowledged
+    finally:
+        jobs.close()
 
 
 @pytest.mark.parametrize("missing_dependency", ["sql_modules", "odbc_driver"])

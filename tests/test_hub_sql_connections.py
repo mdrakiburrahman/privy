@@ -22,7 +22,10 @@ def connections(monkeypatch):
         assert "Encrypt=yes;TrustServerCertificate=no" in args[0]
         assert "Password" not in args[0]
         assert kwargs["attrs_before"][1256][4:].decode("utf-16-le") == "test-token"
-        connection = SimpleNamespace(closed=False, cursor=lambda: None)
+        assert kwargs["autocommit"] is True
+        connection = SimpleNamespace(
+            closed=False, autocommit=True, cursor=lambda: None, rollback=lambda: None
+        )
         connection.close = lambda: setattr(connection, "closed", True)
         created.append(connection)
         return connection
@@ -65,6 +68,21 @@ def test_invalidated_connection_is_never_reused(connections):
     pool().close()
     assert len(created) == 2 and created[0].closed
     assert len(tokens) == 1
+
+
+def test_pool_reset_failure_discards_connection_and_releases_capacity(connections):
+    pool, _, created, _ = connections
+    connection = pool()
+
+    def fail():
+        raise RuntimeError("reset failed")
+
+    created[0].rollback = fail
+    with pytest.raises(StorageError, match="pool reset failed"):
+        connection.close()
+    assert created[0].closed and not pool._idle
+    pool().close()
+    assert len(created) == 2
 
 
 def test_cursor_reads_are_batched_read_only_but_consumption_stays_atomic():
@@ -469,17 +487,22 @@ def test_pooled_transaction_resets_isolation_after_commit_and_rollback(connectio
 
     with backend.transaction(isolation_level="SERIALIZABLE"):
         assert state["isolation"] == "SERIALIZABLE"
+        assert connection.autocommit is False
     assert state["isolation"] == "SERIALIZABLE"
+    assert connection.autocommit is True
 
     with pytest.raises(RuntimeError, match="rollback test"):
         with backend.transaction(isolation_level="SERIALIZABLE"):
             assert state["isolation"] == "SERIALIZABLE"
+            assert connection.autocommit is False
             raise RuntimeError("rollback test")
     assert state["outcome"] == "rollback"
     assert state["isolation"] == "SERIALIZABLE"
+    assert connection.autocommit is True
 
     with backend.transaction():
         assert state["isolation"] == "READ COMMITTED"
+    assert connection.autocommit is True
 
     assert len(created) == 1
     assert [query.split(";", 1)[0] for query in state["queries"]] == [
@@ -586,7 +609,7 @@ def test_pooled_transactions_close_cursors_under_concurrent_reads_and_flushes():
     assert not cursor_open
 
 
-def test_report_history_aggregates_probe_and_call_data_in_one_transaction():
+def test_report_history_aggregates_probe_and_call_data_in_one_transaction(monkeypatch):
     import json
 
     backend = object.__new__(SqlBackend)
@@ -635,11 +658,23 @@ def test_report_history_aggregates_probe_and_call_data_in_one_transaction():
 
     cursor = Cursor()
     transactions = []
+    in_transaction = [False]
+    loads = json.loads
+
+    def decode(raw):
+        assert not in_transaction[0]
+        return loads(raw)
+
+    monkeypatch.setattr("privy.hub.sql_store.json.loads", decode)
 
     @contextmanager
     def transaction():
         transactions.append(True)
-        yield cursor
+        in_transaction[0] = True
+        try:
+            yield cursor
+        finally:
+            in_transaction[0] = False
 
     backend.transaction = transaction
     history = backend.report_history(after=2, before=4)

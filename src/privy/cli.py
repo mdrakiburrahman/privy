@@ -1065,10 +1065,7 @@ def _cmd_hub_serve(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         log.info("Stopping hub.")
     finally:
-        runtime.server.server_close()
-        if runtime.storage is not None:
-            runtime.service.jobs.close()
-            runtime.storage.close()
+        runtime.close()
     return 0
 
 

@@ -143,11 +143,25 @@ class LeaseStore:
         self._uses: dict[str, dict[str, Any]] = {}
         self._rules: list[tuple[dict[str, Any], re.Pattern[str]]] = []
         self.sql_backend = sql_backend
+        stored_config = sql_backend.get_config("leases") if sql_backend is not None else None
+        if stored_config is not None:
+            stored_config = copy.deepcopy(stored_config)
+            defaults = stored_config["defaults"]
+            for name in ("ttl", "max_ttl", "manual_max_ttl", "cooldown", "client_idle_expiry"):
+                if name + "_s" in defaults:
+                    defaults[name] = defaults.pop(name + "_s")
         if self.config_path is not None and not self.config_path.exists():
-            _write_private(self.config_path, DEFAULT_CONFIG)
+            _write_private(
+                self.config_path,
+                yaml.safe_dump(stored_config, sort_keys=False) if stored_config else DEFAULT_CONFIG,
+            )
         try:
-            text = self.config_path.read_text(encoding="utf-8-sig") if self.config_path else DEFAULT_CONFIG
-            self.config = yaml.safe_load(text)
+            text = (
+                (self.config_path.read_text(encoding="utf-8-sig") if self.config_path else DEFAULT_CONFIG)
+                if stored_config is None
+                else ""
+            )
+            self.config = stored_config if stored_config is not None else yaml.safe_load(text)
             self._validate_config()
         except (OSError, ValueError, TypeError, KeyError, yaml.YAMLError, re.error) as exc:
             raise ValueError(f"Invalid leases.yaml ({self.config_path or 'defaults'}): {exc}") from exc
@@ -256,10 +270,6 @@ class LeaseStore:
             self._leases = state["leases"]
             self._uses = state["last_use"]
             self._validate_state()
-            if any(lease["running_jobs"] and lease["state"] != "active" for lease in self._leases.values()):
-                raise StorageError(
-                    "File import has released/expired pinned jobs; verify remote completion before importing"
-                )
             imported = copy.deepcopy((self._clients, self._leases, self._uses))
         except (ValueError, KeyError, TypeError, LeaseError) as exc:
             raise ValueError(f"Invalid SQL import state ({path}): {exc}") from exc
@@ -268,23 +278,56 @@ class LeaseStore:
             cursor = self._lock._local.cursor
             cursor.execute("SELECT payload FROM dbo.privy_coordination WHERE kind='import' AND id=?", digest)
             if cursor.fetchone():
+                self._retire_import(path, digest)
                 return
+            aliases = {}
+            for key, payload in imported[0].items():
+                active_imports = any(
+                    lease_id not in self._leases
+                    and lease["client_id"] == key
+                    and (lease["state"] == "active" or lease["running_jobs"])
+                    for lease_id, lease in imported[1].items()
+                )
+                if (
+                    key in self._clients
+                    and self._clients[key].get("session_id") != payload.get("session_id")
+                    and active_imports
+                ):
+                    raise StorageError("Local active lease client identity differs from shared SQL identity")
+                matches = [
+                    client_id
+                    for client_id, client in self._clients.items()
+                    if payload.get("session_id") and client.get("session_id") == payload["session_id"]
+                ]
+                if len(matches) > 1:
+                    raise StorageError("Shared SQL contains ambiguous duplicate client sessions")
+                if matches and matches[0] != key:
+                    if active_imports:
+                        raise StorageError(
+                            "Local active lease has a different shared session owner; resolve ownership before importing"
+                        )
+                    aliases[key] = matches[0]
+            new_leases = []
             for current, source in zip((self._clients, self._leases, self._uses), imported):
                 for key, payload in source.items():
-                    if key in current and current[key] != payload:
-                        raise StorageError("Local lease-state import conflicts with shared SQL records")
-                    if current is self._clients and any(
-                        payload.get("session_id")
-                        and c.get("session_id") == payload["session_id"]
-                        and c["client_id"] != key
-                        for c in current.values()
-                    ):
-                        raise StorageError("Local client session import conflicts with shared SQL clients")
+                    if current is self._clients and key in aliases:
+                        continue
+                    if current is self._leases and key not in current:
+                        payload["client_id"] = aliases.get(payload["client_id"], payload["client_id"])
+                        new_leases.append(payload)
+                    if key in current:
+                        if current is self._uses and payload["at"] > current[key]["at"]:
+                            current[key] = payload
+                        continue
                     current[key] = payload
             self._validate_state()
             # File-owned pins are unresolved, not evidence that remote execution stopped.
-            for lease in self._leases.values():
+            for lease in new_leases:
                 if lease["running_jobs"]:
+                    if lease["state"] != "active":
+                        raise StorageError(
+                            "File import has released/expired pinned jobs; verify remote completion before importing"
+                        )
                     lease.setdefault("job_owners", {}).update(
                         (job, "unresolved-file-import") for job in lease["running_jobs"]
                     )
@@ -293,6 +336,18 @@ class LeaseStore:
                 digest,
                 json.dumps({"version": 1}),
             )
+        self._retire_import(path, digest)
+
+    @staticmethod
+    def _retire_import(path: Path, digest: str) -> None:
+        from privy.hub.sql_store import StorageError
+
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise StorageError("Legacy lease state changed before retirement; preserve it and retry startup")
+        snapshot = path.with_name(path.name + ".imported-snapshot")
+        if snapshot.exists():
+            snapshot = path.with_name(path.name + f".{digest}.imported-snapshot")
+        path.replace(snapshot)
 
     def _validate_config(self) -> None:
         config = self.config
@@ -735,6 +790,15 @@ class LeaseStore:
             purpose = normalize_purpose(purpose)
         except ValueError as exc:
             raise LeaseError(str(exc)) from exc
+        if self.sql_backend is not None:
+            groups, _ = self._membership()
+            required = {
+                group["members"][layer]
+                for group in groups.values()
+                for layer in group["require_online"]
+                if layer in group["members"]
+            }
+            self.registry.probe_many([self.registry.resolve(target_id) for target_id in required])
         with self._lock:
             self._sweep()
             client = self._client(client_id)
@@ -771,7 +835,7 @@ class LeaseStore:
             candidates = [selected] if selected else list(groups.values())
             views = []
             for candidate in candidates:
-                view = self._group_view(candidate, probe=True)
+                view = self._group_view(candidate, probe=self.sql_backend is None)
                 views.append(view)
                 previous = self._latest(candidate["group"])
                 reclaim = previous and previous["state"] == "expired" and previous["client_id"] == client_id

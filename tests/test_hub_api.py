@@ -21,8 +21,9 @@ from hub_fakes import (
 )
 
 from privy.client import RelayHTTPError
-from privy.hub.app import Headers, HubApp, build_hub
+from privy.hub.app import Headers, HubApp, HubRuntime, build_hub
 from privy.hub.home import LEGACY_TOKEN_FILENAME, read_state
+from privy.hub.responses import HttpResponse
 from privy.hub.rest import RELAYS_OPERATION, ROUTES, STREAM_JOB
 from privy.hub.service import OPERATIONS
 from privy.hub.sql_store import StorageError
@@ -81,6 +82,67 @@ def test_every_endpoint_is_open_without_credentials(hub):
     assert hub.call("GET", "/v1/targets", headers=stale).status == 403
     assert hub.call("GET", "/v1", headers={"Authorization": "Bearer obsolete"}).status == 200
     assert hub.call("GET", "/v1", headers={"Host": "devbox.example:7748"}).status == 403
+
+
+def test_drain_preserves_origin_checks_and_rejects_concurrent_drains_and_new_work(hub):
+    entered, release = threading.Event(), threading.Event()
+
+    def drain():
+        entered.set()
+        assert release.wait(3)
+        return HttpResponse(200, {"status": "drained", "pending_writes": 0})
+
+    hub.app.drain = drain
+    forbidden = hub.call("POST", "/v1/admin/drain", headers={"Origin": "http://evil.example"})
+    assert forbidden.status == 403 and not hub.app.draining
+    responses = []
+    thread = threading.Thread(target=lambda: responses.append(hub.call("POST", "/v1/admin/drain")))
+    thread.start()
+    try:
+        assert entered.wait(3)
+        concurrent = hub.call("POST", "/v1/admin/drain")
+        assert concurrent.status == 503 and concurrent.payload["error"]["code"] == "drain_pending"
+        assert hub.call("POST", "/v1/jobs", {"target": BOX1, "code": "echo unwanted"}).status == 503
+        assert not hub.jobs._jobs
+        assert hub.call("GET", "/healthz").payload["draining"] is True
+    finally:
+        release.set()
+        thread.join(3)
+    assert responses[0].status == 200
+
+
+@pytest.mark.parametrize("flush_succeeds,pending", [(True, 0), (False, 1), (True, 1)])
+def test_runtime_drain_stops_producers_before_zero_write_barrier(hub, flush_succeeds, pending):
+    calls = []
+    jobs = SimpleNamespace(
+        _lock=threading.Lock(),
+        _jobs={},
+        close=lambda **kwargs: calls.append("jobs") or True,
+    )
+    storage = SimpleNamespace(
+        read_model=SimpleNamespace(close=lambda: calls.append("reads")),
+        stop_worker=lambda: calls.append("delivery"),
+        flush=lambda **kwargs: calls.append("flush") or flush_succeeds,
+        status=lambda: {"pending_writes": pending},
+    )
+    hub.app.warmup = SimpleNamespace(close=lambda: calls.append("warmup"))
+    service = SimpleNamespace(jobs=jobs)
+    runtime = HubRuntime(service, None, hub.app, None, None, storage)
+    response = runtime.drain()
+    assert calls == ["warmup", "reads", "delivery", "jobs", "flush"]
+    assert response.status == (200 if flush_succeeds and not pending else 503)
+    if response.status == 200:
+        assert response.payload == {"status": "drained", "pending_writes": 0}
+        assert response.note == "drained"
+
+
+def test_runtime_drain_does_not_abandon_active_local_jobs(hub):
+    service = SimpleNamespace(
+        jobs=SimpleNamespace(_lock=threading.Lock(), _jobs={"active": SimpleNamespace(done=False)})
+    )
+    runtime = HubRuntime(service, None, hub.app, None, None, None)
+    assert runtime.drain().status == 503
+    assert hub.call("POST", "/v1/admin/drain").status == 409
 
 
 @pytest.mark.parametrize(

@@ -544,7 +544,16 @@ class SharedJobManager(JobManager):
 
         def run() -> None:
             try:
+                before = path.stat() if path.exists() else None
                 imported = self.import_audit(path, timeout=300, cancel_event=self._audit_import_stop)
+                if before is not None:
+                    after = path.stat()
+                    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                        raise StorageError("Migration audit changed before retirement")
+                    snapshot = path.with_name(path.name + ".imported-snapshot")
+                    if snapshot.exists():
+                        snapshot = path.with_name(path.name + f".{time.time_ns()}.imported-snapshot")
+                    path.replace(snapshot)
                 self._set_migration_status(
                     {"state": "complete", "imported_jobs": imported, "source": "audit.jsonl"}
                 )
@@ -762,10 +771,7 @@ class SharedJobManager(JobManager):
         job._shared_admitted = True
 
     def _launch_failed(self, job: HubJob, admitted: bool) -> None:
-        if not getattr(job, "_shared_admitted", False):
-            # A failed SQL drain may have left a durable admission in the outbox.
-            # Its outcome is uncertain, so never release its pin.
-            log.error("shared job %s admission failed; retaining any admission pin", job.id)
+        if not admitted:
             return
         with job.cond:
             self._finish_locked(job, ERROR, error="hub could not launch the worker")
@@ -899,6 +905,13 @@ class SharedJobManager(JobManager):
                 job = self._jobs.get(job_id)
             # Old incarnations never acknowledge, execute, or unpin abandoned work.
             if job is None:
+                record = self.backend.get("job", job_id)
+                if (
+                    record is not None
+                    and record.get("owner") == self.backend.owner
+                    and record.get("state") in TERMINAL_STATES
+                ):
+                    self.backend.ack_cancel(job_id)
                 continue
             try:
                 with job.cond:
@@ -941,6 +954,8 @@ class SharedJobManager(JobManager):
                 log.error("Azure SQL audit import did not stop; storage must remain open")
                 return False
         self._cancel_thread.join(timeout)
+        if self._cancel_thread.is_alive():
+            raise StorageError("SQL cancellation monitor did not stop; storage must remain open")
         self._retry_finishes()
         flushed = self.backend.flush(timeout=timeout)
         with self._pending_lock:

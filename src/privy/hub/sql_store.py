@@ -348,7 +348,7 @@ class AzureSqlConnections:
                 f"Driver={{{s.driver}}};Server=tcp:{s.server},1433;Database={s.database};"
                 "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=10;",
                 attrs_before={1256: token},
-                autocommit=False,
+                autocommit=True,
             )
             connection.timeout = 15
             return _PooledConnection(self, connection, expiry)
@@ -357,6 +357,13 @@ class AzureSqlConnections:
 
     def _release(self, connection, expiry: float, broken: bool) -> None:
         try:
+            if not broken:
+                try:
+                    connection.rollback()
+                    connection.autocommit = True
+                except Exception as exc:
+                    connection.close()
+                    raise StorageError("Azure SQL pool reset failed; connection discarded") from exc
             with self._lock:
                 if broken or self._closed or expiry <= time.time() + 300:
                     connection.close()
@@ -380,6 +387,7 @@ class _PooledConnection:
         self._returned = False
 
     def cursor(self):
+        self._connection.autocommit = False
         return self._connection.cursor()
 
     def commit(self) -> None:
@@ -758,12 +766,22 @@ class SqlBackend:
         self._migration_status = dict(status)
 
     def check_config(self, name: str, payload: dict) -> None:
+        def normalized(value):
+            if name == "targets":
+                return {
+                    "targets": sorted(
+                        value["targets"],
+                        key=lambda target: (target["id"], target["namespace"], target["path"]),
+                    )
+                }
+            return value
+
         with self.transaction("privy.leases") as cursor:
             cursor.execute("SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id=?", name)
             row = cursor.fetchone()
             if row:
                 stored = json.loads(row[0])
-                if stored != payload:
+                if normalized(stored) != normalized(payload):
                     compatible = False
                     if name == "leases":
                         from privy.hub.leases import effective_lease_config
@@ -783,6 +801,12 @@ class SqlBackend:
                     name,
                     json.dumps(payload, sort_keys=True),
                 )
+
+    def get_config(self, name: str) -> dict | None:
+        with self.transaction("privy.leases") as cursor:
+            cursor.execute("SELECT payload FROM dbo.privy_coordination WHERE kind='config' AND id=?", name)
+            row = cursor.fetchone()
+            return json.loads(row[0]) if row else None
 
     def enqueue(self, kind: str, key: str, payload: dict) -> None:
         self._enqueue(kind, key, payload)
@@ -1310,75 +1334,75 @@ class SqlBackend:
                     *call_params,
                 ],
             )
-            for name, kind, rows in (
-                ("jobs", "job", job_rows),
-                ("purposes", "purpose", purpose_rows),
-            ):
-                decode_started = time.perf_counter()
-                decoded[name] = [json.loads(row[0]) for row in rows]
-                if _profile_sql_enabled():
-                    log.info(
-                        "sql_profile record_decode thread=%s kind=%s rows=%d duration_ms=%.1f",
-                        threading.get_ident(),
-                        kind,
-                        len(rows),
-                        (time.perf_counter() - decode_started) * 1000,
-                    )
-            decoded["latest_before"] = [json.loads(row[0]) for row in latest_before_rows]
-            status_rows = {str(target): (float(since), bool(first)) for target, since, first in status_result}
-            latency_by_target = {
-                str(target): float(p50) if p50 is not None else None for target, p50 in target_p50_result
-            }
-            overall_row = overall_result[0] if overall_result else None
-            overall_p50, overall_p95 = overall_row if overall_row is not None else (None, None)
-            overall_p50 = float(overall_p50) if overall_p50 is not None else None
-            overall_p95 = float(overall_p95) if overall_p95 is not None else None
-            counts = {row[0]: int(row[1]) for row in job_count_rows}
+        for name, kind, rows in (
+            ("jobs", "job", job_rows),
+            ("purposes", "purpose", purpose_rows),
+        ):
+            decode_started = time.perf_counter()
+            decoded[name] = [json.loads(row[0]) for row in rows]
+            if _profile_sql_enabled():
+                log.info(
+                    "sql_profile record_decode thread=%s kind=%s rows=%d duration_ms=%.1f",
+                    threading.get_ident(),
+                    kind,
+                    len(rows),
+                    (time.perf_counter() - decode_started) * 1000,
+                )
+        decoded["latest_before"] = [json.loads(row[0]) for row in latest_before_rows]
+        status_rows = {str(target): (float(since), bool(first)) for target, since, first in status_result}
+        latency_by_target = {
+            str(target): float(p50) if p50 is not None else None for target, p50 in target_p50_result
+        }
+        overall_row = overall_result[0] if overall_result else None
+        overall_p50, overall_p95 = overall_row if overall_row is not None else (None, None)
+        overall_p50 = float(overall_p50) if overall_p50 is not None else None
+        overall_p95 = float(overall_p95) if overall_p95 is not None else None
+        counts = {row[0]: int(row[1]) for row in job_count_rows}
 
-            by_target = {}
-            decoded["probes"] = []
-            sample_count = 0
-            for row in probe_rows:
-                target = str(row[0])
-                stats = {
-                    "samples": int(row[1]),
-                    "online": int(row[2]),
-                    "latency_p50_ms": latency_by_target.get(target),
-                    "last_online": float(row[3]) if row[3] is not None else None,
-                    "earliest_at": float(row[4]),
-                    "status_since": status_rows.get(target, (float(row[4]), True))[0],
-                    "status_since_first_check": status_rows.get(target, (float(row[4]), True))[1],
-                }
-                by_target[target] = stats
-                sample_count += stats["samples"]
-                latest = json.loads(row[6])
-                latest.update(target=target, at=float(row[5]), status=row[7], latency_ms=row[8])
-                decoded["probes"].append(latest)
-
-            decoded["probe_stats"] = {
-                "by_target": by_target,
-                "samples": sample_count,
-                "latency_p50_ms": overall_p50,
-                "latency_p95_ms": overall_p95,
+        by_target = {}
+        decoded["probes"] = []
+        sample_count = 0
+        for row in probe_rows:
+            target = str(row[0])
+            stats = {
+                "samples": int(row[1]),
+                "online": int(row[2]),
+                "latency_p50_ms": latency_by_target.get(target),
+                "last_online": float(row[3]) if row[3] is not None else None,
+                "earliest_at": float(row[4]),
+                "status_since": status_rows.get(target, (float(row[4]), True))[0],
+                "status_since_first_check": status_rows.get(target, (float(row[4]), True))[1],
             }
-            call_stats = {"total": 0, "by_surface": {}, "errors": 0, "earliest_at": None}
-            for surface, count, errors, earliest_at in call_rows:
-                count, errors = int(count), int(errors or 0)
-                call_stats["total"] += count
-                call_stats["by_surface"][surface] = count
-                call_stats["errors"] += errors
-                if earliest_at is not None:
-                    first = float(earliest_at)
-                    if call_stats["earliest_at"] is None or first < call_stats["earliest_at"]:
-                        call_stats["earliest_at"] = first
-            decoded["call_stats"] = call_stats
-            decoded["calls"] = []
+            by_target[target] = stats
+            sample_count += stats["samples"]
+            latest = json.loads(row[6])
+            latest.update(target=target, at=float(row[5]), status=row[7], latency_ms=row[8])
+            decoded["probes"].append(latest)
 
-            decoded["job_counts"] = {
-                "queued": counts.get("queued", 0),
-                "running": counts.get("running", 0),
-                "retained": sum(counts.values()),
-            }
+        decoded["probe_stats"] = {
+            "by_target": by_target,
+            "samples": sample_count,
+            "latency_p50_ms": overall_p50,
+            "latency_p95_ms": overall_p95,
+        }
+        call_stats = {"total": 0, "by_surface": {}, "errors": 0, "earliest_at": None}
+        for surface, count, errors, earliest_at in call_rows:
+            count, errors = int(count), int(errors or 0)
+            call_stats["total"] += count
+            call_stats["by_surface"][surface] = count
+            call_stats["errors"] += errors
+            if earliest_at is not None:
+                first = float(earliest_at)
+                if call_stats["earliest_at"] is None or first < call_stats["earliest_at"]:
+                    call_stats["earliest_at"] = first
+        decoded["call_stats"] = call_stats
+        decoded["calls"] = []
+
+        decoded["job_counts"] = {
+            "queued": counts.get("queued", 0),
+            "running": counts.get("running", 0),
+            "retained": sum(counts.values()),
+        }
 
         if _profile_sql_enabled():
             log.info(
@@ -1815,15 +1839,18 @@ class SqlBackend:
             self._wake.wait(0.25)
             self._wake.clear()
 
-    def close(self) -> None:
-        if self._closed:
-            return
+    def stop_worker(self) -> None:
         self._stop.set()
         self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=35)
             if self._thread.is_alive():
                 raise StorageError("SQL delivery thread did not stop; backend resources remain in use")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.stop_worker()
 
         failures = []
         read_model = getattr(self, "read_model", None)
@@ -1920,7 +1947,9 @@ class SqlLeaseLock:
                 for target in self.store.registry.snapshot().targets
             ]
         }
-        if row is None or json.loads(row[0]) != targets:
+        if row is None or sorted(json.loads(row[0])["targets"], key=lambda t: t["id"]) != sorted(
+            targets["targets"], key=lambda t: t["id"]
+        ):
             raise StorageError("Local target configuration changed or differs from shared SQL configuration")
         if not cursor.nextset():
             raise StorageError("Azure SQL lease snapshot returned an unexpected result-set count")

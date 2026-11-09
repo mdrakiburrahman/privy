@@ -1045,6 +1045,37 @@ def openapi_document(service: HubService, base_url: str) -> dict[str, Any]:
             }
             spec["description"] += " Optional purpose is hub-only metadata; history resets on hub restart."
         paths[path] = {"post": spec}
+    paths["/v1/admin/drain"] = {
+        "post": {
+            "operationId": "drain_hub",
+            "summary": "Drain this SQL hub and exit",
+            "description": "Loopback-bound SQL hubs only; the socket peer must also be loopback. "
+            "Host and Origin protections apply. Stops admission, waits for local requests/jobs, "
+            "stops background producers and flushes the durable SQL outbox. "
+            "A 503 leaves admission stopped; retry the same drain after outstanding work completes. "
+            "A 200 is sent only with pending_writes=0, then the process shuts down.",
+            "responses": {
+                "200": {
+                    "description": "Drained; the hub exits after sending this response",
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["status", "pending_writes"],
+                                "properties": {
+                                    "status": {"const": "drained"},
+                                    "pending_writes": {"const": 0},
+                                },
+                            }
+                        }
+                    },
+                },
+                "403": {"description": "Non-loopback peer or invalid Host/Origin"},
+                "409": {"description": "Drain unavailable in file mode or a non-loopback bind"},
+                "503": {"description": "drain_pending; retry with admission still stopped"},
+            },
+        },
+    }
     paths["/healthz"] = {
         "get": {
             "operationId": "health",

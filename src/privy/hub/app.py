@@ -15,7 +15,7 @@ import socket
 import threading
 import time
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -121,6 +121,11 @@ class HubApp:
         self.rest = RestApi(service)
         self.mcp = McpEndpoint(service)
         self.warmup = None
+        self.drain = None
+        self.draining = False
+        self._requests = threading.Condition()
+        self._active_requests = 0
+        self._drain_lock = threading.Lock()
         self.set_port(port)
 
     def set_port(self, port: int) -> None:
@@ -165,6 +170,41 @@ class HubApp:
             return rejected
         parsed = urlsplit(target)
         path = parsed.path or "/"
+        if path == "/v1/admin/drain":
+            if method != "POST":
+                return error_response(405, "method_not_allowed", "use POST", {"Allow": "POST"})
+            if self.drain is None:
+                return error_response(409, "drain_unavailable", "SQL drain requires a loopback-bound hub")
+            if not self._drain_lock.acquire(blocking=False):
+                return error_response(
+                    503, "drain_pending", "Another drain is in progress", {"Retry-After": "1"}
+                )
+            try:
+                with self._requests:
+                    self.draining = True
+                    if not self._requests.wait_for(lambda: self._active_requests <= 1, timeout=30):
+                        return error_response(
+                            503,
+                            "drain_pending",
+                            "Existing requests are still completing",
+                            {"Retry-After": "1"},
+                        )
+                try:
+                    return self.drain()
+                except StorageError:
+                    log.exception("SQL drain could not complete; storage remains open")
+                    return error_response(
+                        503,
+                        "drain_pending",
+                        "SQL drain could not complete; see hub logs",
+                        {"Retry-After": "1"},
+                    )
+            finally:
+                self._drain_lock.release()
+        if self.draining and path != "/healthz":
+            return error_response(
+                503, "hub_draining", "Hub is draining; retry on the replacement hub", {"Retry-After": "1"}
+            )
         if path == "/healthz":
             if method not in ("GET", "HEAD"):
                 response = error_response(405, "method_not_allowed", "use GET", {"Allow": "GET, HEAD"})
@@ -190,6 +230,7 @@ class HubApp:
                         "status": "ok",
                         "service": "privy-hub",
                         "version": self.service.version,
+                        "draining": self.draining,
                         "storage": storage,
                     },
                 )
@@ -227,6 +268,8 @@ class HubApp:
         return f"{label} {_describe_body(body)}" if body else label
 
     def log_call(self, method: str, target: str, body: bytes, response: HttpResponse, seconds: float) -> None:
+        if self.draining:
+            return
         surface = response.surface or "rest"
         self.service.metrics.call(surface, response.status, seconds)
         outcome = f"{response.status} {response.note}" if response.note else str(response.status)
@@ -246,6 +289,22 @@ class _Handler(BaseHTTPRequestHandler):
     server: HubHTTPServer
 
     def _dispatch(self) -> None:
+        if urlsplit(self.path).path == "/v1/admin/drain" and self.client_address[0] not in (
+            "127.0.0.1",
+            "::1",
+        ):
+            self._send(error_response(403, "forbidden_peer", "Drain requires a loopback connection"))
+            return
+        with self.server.app._requests:
+            self.server.app._active_requests += 1
+        try:
+            self._dispatch_registered()
+        finally:
+            with self.server.app._requests:
+                self.server.app._active_requests -= 1
+                self.server.app._requests.notify_all()
+
+    def _dispatch_registered(self) -> None:
         started = time.monotonic()
         body, response = self._read_and_handle()
         try:
@@ -264,6 +323,10 @@ class _Handler(BaseHTTPRequestHandler):
             response.note = f"{response.note}, failed" if response.note else "failed"
             self.close_connection = True
         self.server.app.log_call(self.command, self.path, body, response, time.monotonic() - started)
+        if response.note == "drained":
+            self.wfile.flush()
+            self.close_connection = True
+            threading.Thread(target=self.server.shutdown, name="privy-drain-stop", daemon=True).start()
 
     def _read_and_handle(self) -> tuple[bytes, HttpResponse]:
         headers = Headers(self.headers.items())
@@ -447,6 +510,7 @@ class HubRuntime:
     home: Path
     relays_file: Path
     storage: Any = None
+    _closed: bool = field(default=False, init=False)
 
     @property
     def url(self) -> str:
@@ -464,8 +528,13 @@ class HubRuntime:
         self.server.serve_forever(poll_interval=0.5)
 
     def shutdown(self) -> None:
-        self.app.rest.terminals.close()
         self.server.shutdown()
+        self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.app.rest.terminals.close()
         self.server.server_close()
         if self.app.warmup is not None:
             self.app.warmup.close()
@@ -477,6 +546,29 @@ class HubRuntime:
 
                 raise StorageError("audit import is still running; SQL storage remains open")
             self.storage.close()
+        self._closed = True
+
+    def drain(self) -> HttpResponse:
+        with self.service.jobs._lock:
+            if any(not job.done for job in self.service.jobs._jobs.values()):
+                return error_response(
+                    503, "drain_pending", "Local jobs are still running", {"Retry-After": "1"}
+                )
+        if self.app.warmup is not None:
+            self.app.warmup.close()
+        self.app.rest.terminals.close()
+        model = getattr(self.storage, "read_model", None)
+        if model is not None:
+            model.close()
+        self.storage.stop_worker()
+        if not self.service.jobs.close(timeout=30) or not self.storage.flush(timeout=30):
+            return error_response(503, "drain_pending", "SQL writes have not drained", {"Retry-After": "1"})
+        pending = self.storage.status()["pending_writes"]
+        if pending:
+            return error_response(503, "drain_pending", "SQL writes have not drained", {"Retry-After": "1"})
+        response = HttpResponse(200, {"status": "drained", "pending_writes": 0})
+        response.note = "drained"
+        return response
 
 
 def build_hub(
@@ -502,17 +594,19 @@ def build_hub(
 
     sql_settings = load_settings(home, settings_file)
     storage = None
-    if sql_settings is None:
-        jobs = JobManager(registry, max_running=max_jobs, audit=AuditLog(home / AUDIT_FILENAME))
-        leases = LeaseStore(registry, home=home, audit=jobs.audit)
-        listener_infos = ListenerInfoStore(home)
-    else:
-        from privy.hub.read_model import SqlReadModel
-        from privy.hub.shared_jobs import SharedAuditLog, SharedJobManager
-        from privy.hub.sql_store import SqlBackend
+    jobs = None
+    server = None
+    try:
+        if sql_settings is None:
+            jobs = JobManager(registry, max_running=max_jobs, audit=AuditLog(home / AUDIT_FILENAME))
+            leases = LeaseStore(registry, home=home, audit=jobs.audit)
+            listener_infos = ListenerInfoStore(home)
+        else:
+            from privy.hub.read_model import SqlReadModel
+            from privy.hub.shared_jobs import SharedAuditLog, SharedJobManager
+            from privy.hub.sql_store import SqlBackend
 
-        storage = SqlBackend(sql_settings, home, connect=sql_connect)
-        try:
+            storage = SqlBackend(sql_settings, home, connect=sql_connect)
             if callable(getattr(storage, "read_changes", None)):
                 storage.read_model = SqlReadModel(storage)
             jobs = SharedJobManager(
@@ -520,48 +614,58 @@ def build_hub(
             )
             leases = LeaseStore(registry, home=home, audit=jobs.audit, sql_backend=storage)
             listener_infos = ListenerInfoStore(home, backend=getattr(storage, "read_model", storage))
-        except BaseException:
-            storage.close()
-            raise
-    service = HubService(
-        registry=registry,
-        jobs=jobs,
-        version=version,
-        leases=leases,
-        listener_infos=listener_infos,
-    )
-    if storage is None:
-        service.metrics.restore(home / AUDIT_FILENAME)
-    else:
-        from privy.hub.shared_metrics import SharedHubMetrics
-
-        service.metrics = SharedHubMetrics(
-            getattr(storage, "read_model", storage), registry, max_running=jobs.max_running
+        service = HubService(
+            registry=registry,
+            jobs=jobs,
+            version=version,
+            leases=leases,
+            listener_infos=listener_infos,
         )
-    app = HubApp(service, port=port)
-    try:
+        if storage is None:
+            service.metrics.restore(home / AUDIT_FILENAME)
+        else:
+            from privy.hub.shared_metrics import SharedHubMetrics
+
+            service.metrics = SharedHubMetrics(
+                getattr(storage, "read_model", storage), registry, max_running=jobs.max_running
+            )
+        app = HubApp(service, port=port)
         server = HubHTTPServer((host, port), app)
+        app.set_port(server.server_address[1])
+        model = getattr(storage, "read_model", None)
+        if model is not None:
+            app.warmup = _Warmup(app, model)
+            service.background_warmup = app.warmup
+        runtime = HubRuntime(
+            service=service, server=server, app=app, home=home, relays_file=relays_path, storage=storage
+        )
+        if storage is not None and host in ("127.0.0.1", "::1", "localhost"):
+            app.drain = runtime.drain
+        write_state(
+            home,
+            {
+                "url": runtime.url,
+                "pid": os.getpid(),
+                "version": version,
+                "started_at": service.started_at,
+                "relays_file": str(relays_path),
+            },
+        )
+        return runtime
     except BaseException:
+        if server is not None:
+            server.server_close()
         if storage is not None:
-            jobs.close()
-            storage.close()
+            jobs_stopped = True
+            try:
+                if jobs is not None:
+                    jobs.close(timeout=35)
+            except Exception:
+                jobs_stopped = False
+                log.exception("SQL job cleanup failed after hub construction error")
+            if jobs_stopped:
+                try:
+                    storage.close()
+                except Exception:
+                    log.exception("SQL storage cleanup failed after hub construction error")
         raise
-    app.set_port(server.server_address[1])
-    model = getattr(storage, "read_model", None)
-    if model is not None:
-        app.warmup = _Warmup(app, model)
-        service.background_warmup = app.warmup
-    runtime = HubRuntime(
-        service=service, server=server, app=app, home=home, relays_file=relays_path, storage=storage
-    )
-    write_state(
-        home,
-        {
-            "url": runtime.url,
-            "pid": os.getpid(),
-            "version": version,
-            "started_at": service.started_at,
-            "relays_file": str(relays_path),
-        },
-    )
-    return runtime
