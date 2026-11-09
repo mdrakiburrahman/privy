@@ -1014,7 +1014,14 @@ class LeaseStore:
             self._renew(lease)
             return self._view(lease)
 
-    def release(self, lease_id: str, client_id: str | None = None, force: bool = False) -> dict[str, Any]:
+    def release(
+        self,
+        lease_id: str,
+        client_id: str | None = None,
+        force: bool = False,
+        *,
+        require_unpinned: bool = False,
+    ) -> dict[str, Any]:
         with self._lock:
             self._sweep()
             lease = self._lease(lease_id)
@@ -1022,6 +1029,24 @@ class LeaseStore:
                 raise LeaseError(
                     "only the holder may release this lease", status=403, code="not_lease_holder"
                 )
+            if require_unpinned:
+                running_jobs = lease.get("running_jobs")
+                job_owners = lease.get("job_owners", {})
+                if (
+                    not isinstance(running_jobs, list)
+                    or not isinstance(job_owners, dict)
+                    or running_jobs
+                    or job_owners
+                ):
+                    raise LeaseError(
+                        "lease has running or unresolved job pins; refresh and retry after they finish",
+                        status=409,
+                        code="lease_pinned",
+                        details={
+                            "running_jobs": running_jobs if isinstance(running_jobs, list) else None,
+                            "job_owners": sorted(job_owners) if isinstance(job_owners, dict) else None,
+                        },
+                    )
             if self.sql_backend is not None and lease["running_jobs"]:
                 if not force:
                     raise LeaseError(

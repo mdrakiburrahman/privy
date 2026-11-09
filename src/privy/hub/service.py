@@ -762,8 +762,17 @@ FORCE_RELEASE_OPERATION = Operation(
     "force_release_lease",
     "Force-release a lease (REST dashboard only)",
     "Force-release a lease without holder credentials. Restricted to same-origin dashboard requests carrying "
-    "X-Privy-UI: 1; not exposed over MCP. Running jobs are not stopped.",
-    (_REQUIRED_LEASE_ID,),
+    "X-Privy-UI: 1; not exposed over MCP. Running jobs are not stopped. Bulk callers may require an "
+    "unpinned lease to prevent releasing a lease that acquired a job pin after confirmation.",
+    (
+        _REQUIRED_LEASE_ID,
+        Param(
+            "require_unpinned",
+            "boolean",
+            "Reject the release if running_jobs or job_owners contains any pin; stale and unknown pins also block.",
+            default=False,
+        ),
+    ),
     read_only=False,
     destructive=True,
 )
@@ -1550,8 +1559,10 @@ class HubService:
         with _translated_errors():
             return self.leases.release(lease_id, client_id=client_id)
 
-    def _op_force_release_lease(self, *, origin: str, lease_id: str) -> dict[str, Any]:
+    def _op_force_release_lease(
+        self, *, origin: str, lease_id: str, require_unpinned: bool = False
+    ) -> dict[str, Any]:
         if origin != "rest":
             raise HubError("force-release is REST dashboard only", status=403, code="forbidden")
         with _translated_errors():
-            return self.leases.release(lease_id, force=True)
+            return self.leases.release(lease_id, force=True, require_unpinned=require_unpinned)

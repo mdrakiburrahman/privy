@@ -1497,6 +1497,30 @@ class ProcessCursor:
         return True
 
 
+def test_sql_force_release_requires_unpinned_state_in_lease_transaction(tmp_path):
+    from privy.hub.leases import LeaseError, LeaseStore
+
+    hub = Hub(tmp_path, {"dev/box1_windows": FakeListener(hostname="BOX1")})
+    backend = ProcessBackend(None, tmp_path)
+    leases = LeaseStore(hub.registry, home=tmp_path, sql_backend=backend)
+    owner = leases.register_client("Bulk admin", session_id="sql-bulk-admin")["client_id"]
+    lease_id = leases.acquire(owner, target="dev/box1")["lease_id"]
+    assert leases.get_lease(lease_id)["running_jobs"] == []
+
+    with leases._lock:
+        leases._lease(lease_id)["job_owners"] = {"unknown-job": "unresolved-file-import"}
+
+    with pytest.raises(LeaseError) as error:
+        leases.release(lease_id, force=True, require_unpinned=True)
+
+    assert error.value.code == "lease_pinned"
+    with leases._lock:
+        lease = leases._lease(lease_id)
+        assert lease["state"] == "active"
+        assert lease["running_jobs"] == []
+        assert lease["job_owners"] == {"unknown-job": "unresolved-file-import"}
+
+
 @pytest.mark.parametrize("stale_policy", [False, True])
 def test_sql_policy_restores_missing_home_and_ignores_stale_local_policy(tmp_path, stale_policy):
     import yaml

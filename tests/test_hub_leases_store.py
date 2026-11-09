@@ -154,6 +154,39 @@ def test_sql_force_release_reconciles_only_stopped_or_unresolved_pins(leasing):
     assert "may still be running" in record["events"][-2]["warning"]
 
 
+@pytest.mark.parametrize(
+    "pins",
+    [
+        {"running_jobs": ["job-after-confirmation"]},
+        {"job_owners": {"unknown-job": "unresolved-file-import"}},
+        {"job_owners": ["malformed-pin-metadata"]},
+    ],
+)
+@pytest.mark.parametrize("sql_mode", [False, True])
+def test_require_unpinned_rejects_new_and_unknown_pins_before_reconciliation(leasing, pins, sql_mode):
+    _, store, _ = leasing
+    owner = client(store)
+    lease = acquire(store, owner)
+    record = store._leases[lease["lease_id"]]
+    assert record["running_jobs"] == []
+
+    record.update(pins)
+    if sql_mode:
+        store.sql_backend = SimpleNamespace(
+            owner_is_stale=lambda _owner: pytest.fail(
+                "unpinned guard must run before stale-owner reconciliation"
+            )
+        )
+
+    with pytest.raises(LeaseError) as error:
+        store.release(lease["lease_id"], force=True, require_unpinned=True)
+
+    assert error.value.code == "lease_pinned"
+    assert record["state"] == "active"
+    for name, value in pins.items():
+        assert record[name] == value
+
+
 def test_first_leasing_start_restores_cooldown_from_existing_hub_audit(tmp_path):
     hub = Hub(tmp_path)
     result = hub.call(

@@ -413,14 +413,18 @@ class RestApi:
                     )
                 )
             if route.operation == FORCE_RELEASE_OPERATION.name:
-                FORCE_RELEASE_OPERATION.parse(args)
+                args = FORCE_RELEASE_OPERATION.parse(args)
                 if headers.get("X-Privy-UI") != "1" or not _same_origin_ui(headers):
                     return error_response(
                         403,
                         "forbidden_origin",
                         "Force-release requires a same-origin dashboard request with X-Privy-UI: 1",
                     )
-                result = self.service._op_force_release_lease(origin="rest", lease_id=args["lease_id"])
+                result = self.service._op_force_release_lease(
+                    origin="rest",
+                    lease_id=args["lease_id"],
+                    require_unpinned=args["require_unpinned"],
+                )
                 if text:
                     return HttpResponse(
                         200,
