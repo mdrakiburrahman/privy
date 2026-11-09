@@ -131,7 +131,9 @@ startup.
 Accepted late output advances separate durable fence watermarks, not the fenced terminal job
 payload. Public output and chunk reads merge those monotonic watermarks with terminal metadata.
 These counters do not promise retained bytes after history garbage collection, and must not be taken
-as new exit proof.
+as new exit proof. Output snapshot loads read accepted watermarks before selecting output rows; a
+later delivery cannot make an older cached row set appear current. A newer public watermark causes
+that older snapshot to refresh before output is returned.
 
 The supporting hub must successfully install this database guard before reconciliation is enabled.
 Protocol errors (including `bad_offset`) are not execution-exit evidence and keep the pin. The

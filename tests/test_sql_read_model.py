@@ -382,6 +382,59 @@ def test_genuine_missing_chunk_is_not_mistaken_for_cache_lag(model):
     assert model.output("j", "stdout", 0, 4) == []
 
 
+def test_between_read_delivery_refreshes_snapshot_before_public_terminal_view(model):
+    delivered = False
+    chunk = {"index": 0, "stream": "stdout", "start": 0, "end": 4, "data": "bGF0ZQ=="}
+    backend = object.__new__(SqlBackend)
+
+    def watermarks(job_id):
+        return {"stdout_bytes": 4 if delivered else 0, "stderr_bytes": 0, "chunk_count": int(delivered)}
+
+    @contextlib.contextmanager
+    def transaction():
+        sets = iter([True, False])
+        captured = [chunk] if delivered else []
+
+        def fetchall():
+            nonlocal delivered
+            delivered = True  # Delivery commits after rows were selected, before a later watermark read.
+            return [(json.dumps(row),) for row in captured]
+
+        yield SimpleNamespace(
+            execute=lambda *args: None,
+            fetchone=lambda: (0, 0, 0, "reconciled"),
+            fetchall=fetchall,
+            nextset=lambda: next(sets),
+        )
+
+    backend.transaction = transaction
+    backend.output_watermarks = watermarks
+    model.backend.read_output_snapshot = backend.read_output_snapshot
+    model.backend.output_watermarks = watermarks
+    old = model._output_snapshot("j")
+    assert old["rows"] == []
+    assert old["sizes"] == {"stdout": 0, "stderr": 0, "chunks": 0}
+    projection = SharedJob(
+        model,
+        job(
+            SUCCEEDED,
+            type="exec",
+            origin="rest",
+            stdout_bytes=0,
+            stderr_bytes=0,
+            chunk_count=0,
+            reconciled_at="reconciled",
+            spec={"language": "bash", "code": "test", "mode": "subprocess", "timeout_s": 30},
+        ),
+        snapshot=True,
+    )
+    result = projection.view(max_output_bytes=100, offsets={"stdout": 0, "stderr": 0})
+    assert result["done"] is True
+    assert result["stdout"] == "late"
+    assert result["stdout_offset"] == 4
+    assert projection.read_output("stdout", 0, 100)["data"] == "late"
+
+
 def test_streaming_projection_carries_chunk_count_during_progressive_startup(model):
     assert model._output_snapshot("j")["sizes"]["chunks"] == 0
     model.backend.chunks = [{"index": 0, "stream": "stdout", "start": 0, "end": 4, "data": "YWJjZA=="}]
@@ -822,6 +875,7 @@ def test_output_snapshot_reads_metadata_before_bounded_chunks_in_one_execute():
         yield cursor
 
     backend.transaction = transaction
+    backend.output_watermarks = lambda job_id: {}
     snapshot = backend.read_output_snapshot("j")
     assert snapshot == {"rows": [chunk], "sizes": {"stdout": 4, "stderr": 0, "chunks": 1}}
     assert len(executes) == 1 and executes[0][1:] == ("j", "j")

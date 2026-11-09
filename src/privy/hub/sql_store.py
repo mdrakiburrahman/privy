@@ -1086,6 +1086,8 @@ class SqlBackend:
         return result
 
     def read_output_snapshot(self, job_id: str):
+        # Never label older rows with watermarks from a later delivery.
+        accepted = self.output_watermarks(job_id)
         with self.transaction() as cursor:
             cursor.execute(
                 "SELECT COALESCE(TRY_CONVERT(bigint,JSON_VALUE(payload,'$.stdout_bytes')),0),"
@@ -1110,7 +1112,6 @@ class SqlBackend:
                 raise StorageError("SQL output snapshot returned an unexpected result-set count")
         sizes = {"stdout": int(metadata[0]), "stderr": int(metadata[1]), "chunks": int(metadata[2])}
         if metadata[3] is not None:
-            accepted = self.output_watermarks(job_id)
             for name, key in (
                 ("stdout", "stdout_bytes"),
                 ("stderr", "stderr_bytes"),
