@@ -518,9 +518,22 @@ Examples:
     )
     sub = parser.add_subparsers(
         dest="command",
-        metavar="{server,client,proxy,file,token,hub}",
+        metavar="{server,client,proxy,file,token,hub,observe-job}",
         title="commands",
     )
+
+    observer = sub.add_parser(
+        "observe-job",
+        help="standalone one-shot retained-job observation (no hub/control initialization)",
+        description="Read exact SQL bindings before/after one zero-ACK poll; does not grant execution or unpin authority.",
+    )
+    observer.add_argument("--bindings", type=Path, help="complete expected identity bindings YAML")
+    observer.add_argument("--settings", type=Path, help="explicit existing SQL settings YAML")
+    observer.add_argument(
+        "--relays", type=Path, help="explicit existing authorized local Relay credentials JSON"
+    )
+    observer.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    observer.set_defaults(func=_cmd_observe_job)
 
     server = sub.add_parser(
         "server",
@@ -1185,6 +1198,29 @@ def _parse_size(value: str) -> int:
     suffix = (match.group(2) or "").lower()
     multiplier = {"": 1, "b": 1, "kib": 1024, "mib": 1024 * 1024}[suffix]
     return _positive_int(int(match.group(1)) * multiplier)
+
+
+def _cmd_observe_job(args: argparse.Namespace) -> int:
+    from privy.job_observer import Inconclusive, supervised, worker_main
+    from privy.observer_process import ContainmentError
+
+    if args.worker:
+        worker_main()
+        return 0
+    if any(value is None for value in (args.bindings, args.settings, args.relays)):
+        raise CliError("observe-job requires --bindings, --settings and --relays; no auto-discovery")
+    try:
+        result = supervised(
+            {
+                "bindings_file": str(args.bindings.absolute()),
+                "settings": str(args.settings.absolute()),
+                "relays": str(args.relays.absolute()),
+            }
+        )
+    except (Inconclusive, ContainmentError) as exc:
+        result = {"outcome": "inconclusive", "reason": str(exc)}
+    print(json.dumps(result, allow_nan=False))
+    return 0 if result["outcome"] == "retained-terminal-result-observed" else 1
 
 
 def main(argv: list[str] | None = None) -> int:
