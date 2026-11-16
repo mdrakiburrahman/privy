@@ -35,6 +35,7 @@ from privy.hub.metrics import (
     ReportSelection,
 )
 from privy.hub.registry import ONLINE, UNKNOWN, ProbeResult
+from privy.hub.relay_sas import SAS_CSS, SAS_HTML, SAS_JS
 from privy.hub.remote_exec import EXEC_CSS, EXEC_JS, TERMINAL_ICON, workspace
 from privy.hub.responses import HTML_TYPE, TEXT_TYPE, HttpResponse, error_response
 from privy.hub.terminals import terminal_languages
@@ -60,6 +61,7 @@ text-anchor="middle">P</text>
 PAGES = {
     "overview": ("/ui", "Overview"),
     "hycos": ("/ui/hycos", "Relay HYCOs"),
+    "sas": ("/ui/relay-sas", "Relay SAS"),
     "leases": ("/ui/leases", "Leases"),
     "exec": ("/ui/exec", "Remote Exec"),
     "logs": ("/ui/logs", "Logs"),
@@ -163,6 +165,7 @@ def nav_icon(name: str) -> str:
         '<rect x="2" y="16" width="8" height="5" rx="1.5"/>'
         '<rect x="14" y="16" width="8" height="5" rx="1.5"/><path d="M12 8v4H6v4m6-4h6v4"/>',
         "leases": '<circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 8.7-8.7M16 7l2.5 2.5M18.5 4.5 21 7"/>',
+        "sas": '<circle cx="8" cy="9" r="4"/><path d="m11 12 9 9m-3-3 3-3m-6 0 3-3"/>',
         "logs": '<path d="M7 3h8l4 4v14H5V5a2 2 0 0 1 2-2Z"/><path d="M14 3v5h5M8 12h8m-8 4h6"/>',
         "jobs": '<rect x="3" y="7" width="18" height="14" rx="3"/>'
         '<path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M3 12h18m-11 0v3h4v-3"/>',
@@ -400,7 +403,7 @@ def shell(
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex"><title>{esc(title)} · privy hub</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<style nonce="{nonce}">{CSS}{EXEC_CSS}</style></head>
+<style nonce="{nonce}">{CSS}{EXEC_CSS}{SAS_CSS if page == "sas" else ""}</style></head>
 <body>
 <aside class="sidebar"><div class="brand"><b>privy hub</b><small>CONTROL PLANE</small></div>
 <div class="nav-label">VIEWS</div><nav id="nav">{nav}</nav>
@@ -413,7 +416,7 @@ def shell(
 <main class="main" id="main">
 {main}
 </main></div>
-<script nonce="{nonce}">{JS}{EXEC_JS if page == "exec" else ""}</script>
+<script nonce="{nonce}">{JS}{EXEC_JS if page == "exec" else ""}{SAS_JS if page == "sas" else ""}</script>
 </body></html>
 """
 
@@ -1592,6 +1595,8 @@ def render(service: Any, page: str, query: Mapping[str, list[str]], base_url: st
     elif page == "leases":
         title, main = "Leases", leases_page(service, query, now)
         params = {key: _last(query, key) or None for key in ("state", "q", "label", "peek")}
+    elif page == "sas":
+        title, main = "Relay SAS", SAS_HTML
     elif page == "exec":
         title, main = "Remote Exec", workspace(service, report, _last(query, "target"))
         params = {"target": _last(query, "target") or None}
