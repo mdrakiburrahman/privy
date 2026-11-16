@@ -73,8 +73,18 @@ def _printable(text: str, limit: int = _LABEL_CHARS) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _contains_relay_credentials(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        name in lowered
+        for name in ("connection_string", "sharedaccesskey", "sharedaccesssignature", "sb-hc-token")
+    )
+
+
 def _describe_body(body: bytes) -> str:
     text = body.decode("utf-8", "replace")
+    if _contains_relay_credentials(text):
+        return "[credential payload omitted]"
     try:
         return console.compact_json(json.loads(text))
     except ValueError:
@@ -187,8 +197,12 @@ class HubApp:
             path = urlsplit(target).path or "/"
         except ValueError:
             path = None
-        if path == "/v1/relay-sas":
+        if path and unquote(path).startswith("/v1/relay-sas"):
             return f"REST {method} /v1/relay-sas [credential payload omitted]"
+        if _contains_relay_credentials(unquote(target)) or _contains_relay_credentials(
+            body.decode("utf-8", "replace")
+        ):
+            return f"REST {method} [credential request omitted]"
         if method == "POST" and path == MCP_PATH:
             return "MCP " + _describe_mcp(body)
         label = f"REST {method} {_printable(unquote(target))}"
@@ -304,7 +318,7 @@ class _Handler(BaseHTTPRequestHandler):
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _dispatch
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - BaseHTTPRequestHandler API
-        if urlsplit(self.path).path == "/v1/relay-sas":
+        if "/v1/relay-sas" in unquote(self.path) or _contains_relay_credentials(unquote(self.path)):
             return
         log.debug("http %s - %s", self.address_string(), format % args)
 

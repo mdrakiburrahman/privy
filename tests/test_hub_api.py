@@ -56,9 +56,8 @@ def test_http_sas_generator_is_transient_and_omits_secrets_from_all_logs(http_hu
     caplog.set_level(logging.DEBUG, logger="privy")
     response = requests.post(
         runtime.url + "/v1/relay-sas",
-        headers={"Origin": runtime.url, "X-Privy-UI": "1"},
-        json=body if not any(isinstance(v, float) for v in body.values()) else None,
-        data=json.dumps(body) if any(isinstance(v, float) for v in body.values()) else None,
+        headers={"Origin": runtime.url, "X-Privy-UI": "1", "Content-Type": "application/json"},
+        data=json.dumps(body),
         timeout=5,
     )
     assert response.status_code == status
@@ -101,6 +100,17 @@ def test_http_sas_generator_rejects_bad_json_and_query_credentials_without_loggi
         assert response.status_code == 400
         assert response.headers["Cache-Control"] == "no-store"
         assert "c3ludGhldGljLWtleQ==" not in response.text
+    assert "c3ludGhldGljLWtleQ==" not in caplog.text
+
+
+@pytest.mark.parametrize("path", ["/v1/relay-sas/", "/v1/not-a-route"])
+def test_http_sas_secrets_are_omitted_even_for_invalid_routes(http_hub, caplog, path):
+    runtime, _ = http_hub
+    caplog.set_level(logging.DEBUG, logger="privy")
+    response = requests.post(runtime.url + path, json={"connection_string": SAS_CONNECTION}, timeout=5)
+    assert response.status_code == 404
+    assert response.headers["Cache-Control"] == "no-store"
+    assert wait_for(lambda: "credential" in caplog.text)
     assert "c3ludGhldGljLWtleQ==" not in caplog.text
 
 
