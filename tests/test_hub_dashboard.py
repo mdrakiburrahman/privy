@@ -57,6 +57,75 @@ def html_of(response):
 # ---- negotiation and pages ---------------------------------------------------------
 
 
+def test_sas_generator_has_transient_masked_inputs_and_copyable_outputs(hub):
+    page = html_of(hub.call("GET", "/ui/relay-sas"))
+    assert '<input id="sas-connection" type="password"' in page
+    assert 'id="sas-hours"' in page and 'value="6"' in page
+    assert 'id="sas-entity" required' in page
+    assert 'data-sas-copy="sas-token"' in page and 'data-sas-copy="sas-url"' in page
+    assert 'role="alert"' in page and 'id="sas-expiry"' in page
+    assert "Permissions are inherited" in page
+    assert 'if ($("#relay-sas")) return' in page
+
+
+def test_sas_generator_browser_mint_copy_clear_and_errors(hub):
+    browser_api = pytest.importorskip(
+        "playwright.sync_api", reason="optional browser checks require playwright"
+    )
+    from privy._relay import parse_sas_token
+    from privy.hub.app import HubHTTPServer
+
+    server = HubHTTPServer(("127.0.0.1", 0), hub.app)
+    hub.app.set_port(server.server_address[1])
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = (
+        "Endpoint=sb://contoso.servicebus.windows.net/;"
+        "SharedAccessKeyName=Send;SharedAccessKey=c3ludGhldGljLWtleQ=="
+    )
+    try:
+        with browser_api.sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            context = browser.new_context(permissions=["clipboard-read", "clipboard-write"])
+            page = context.new_page()
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(base + "/ui/relay-sas")
+            page.locator("#sas-connection").fill(connection + ";EntityPath=hyco")
+            browser_api.expect(page.locator("#sas-entity-field")).to_be_hidden()
+            page.locator("#sas-generate").click()
+            browser_api.expect(page.locator("#sas-output")).to_be_visible()
+            assert page.locator("#sas-connection").input_value() == ""
+            token = page.locator("#sas-token").input_value()
+            assert parse_sas_token(token)["sr"] == "http://contoso.servicebus.windows.net/hyco"
+            page.locator('[data-sas-copy="sas-token"]').click()
+            browser_api.expect(page.locator("#sas-copy-status")).to_have_text("Copied.")
+            assert page.evaluate("navigator.clipboard.readText()") == token
+            page.locator('[data-sas-copy="sas-url"]').click()
+            assert page.evaluate("navigator.clipboard.readText()") == page.locator("#sas-url").input_value()
+            page.locator("#sas-hours").fill("2")
+            browser_api.expect(page.locator("#sas-output")).to_be_hidden()
+            assert page.locator("#sas-token").input_value() == ""
+            page.locator("#sas-connection").fill("not-a-connection-string")
+            page.locator("#sas-entity").fill("hyco")
+            page.locator("#sas-generate").click()
+            browser_api.expect(page.locator("#sas-error")).to_be_visible()
+            page.locator("#sas-connection").fill(connection)
+            page.locator("#sas-generate").click()
+            browser_api.expect(page.locator("#sas-output")).to_be_visible()
+            page.locator("#sas-reset").click()
+            browser_api.expect(page.locator("#sas-output")).to_be_hidden()
+            browser_api.expect(page.locator("#sas-hours")).to_have_value("6")
+            assert page.locator("#sas-url").input_value() == ""
+            assert not errors
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_root_serves_the_dashboard_to_browsers_and_markdown_to_everyone_else(hub):
     page = hub.call("GET", "/", headers=BROWSER)
     text = html_of(page)
@@ -397,12 +466,14 @@ def test_hycos_page_leads_with_colored_status_last_used_and_last_seen_online(hub
     assert 'class="dot' not in table
 
 
-@pytest.mark.parametrize("path", ["/ui", "/ui/hycos", "/ui/leases", "/ui/exec", "/ui/logs", "/ui/jobs"])
+@pytest.mark.parametrize(
+    "path", ["/ui", "/ui/hycos", "/ui/relay-sas", "/ui/leases", "/ui/exec", "/ui/logs", "/ui/jobs"]
+)
 def test_all_sidebar_links_have_consistent_decorative_icons(hub, path):
     text = html_of(hub.call("GET", path, headers=BROWSER))
     sidebar = re.search(r'<aside class="sidebar">([\s\S]*?)</aside>', text).group(1)
     links = re.findall(r'<a href="([^"]*)"[^>]*>([\s\S]*?)</a>', sidebar)
-    assert len(links) == 10
+    assert len(links) == 11
     for _, content in links:
         assert content.count("<svg ") == 1
         assert 'viewBox="0 0 24 24"' in content
@@ -412,6 +483,7 @@ def test_all_sidebar_links_have_consistent_decorative_icons(hub, path):
     assert {href.split("?")[0] for href, _ in links} == {
         "/ui",
         "/ui/hycos",
+        "/ui/relay-sas",
         "/ui/leases",
         "/ui/exec",
         "/ui/logs",

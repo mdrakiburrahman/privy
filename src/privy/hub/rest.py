@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from privy._relay import mint_relay_sas
 from privy.hub import dashboard, guide, render
 from privy.hub.jobs import HubJob
 from privy.hub.mcp import MCP_PATH, SUPPORTED_VERSIONS
@@ -286,6 +287,8 @@ class RestApi:
         body: bytes,
     ) -> HttpResponse:
         base_url = self.base_url_for(headers)
+        if path == "/v1/relay-sas":
+            return self.mint_relay_sas(method, query, headers, body)
         terminal_response = self.terminals.route(method, path, headers, body, query=query)
         if terminal_response is not None:
             return terminal_response
@@ -327,6 +330,37 @@ class RestApi:
         if allowed:
             return _method_not_allowed(allowed)
         return error_response(404, "not_found", f"no route for {method} {path}; GET / explains the API")
+
+    @staticmethod
+    def mint_relay_sas(
+        method: str, query: Mapping[str, list[str]], headers: Mapping[str, str], body: bytes
+    ) -> HttpResponse:
+        if method != "POST":
+            return _method_not_allowed(["POST"])
+        if headers.get("X-Privy-UI") != "1" or not _same_origin_ui(headers):
+            return error_response(
+                403, "forbidden_origin", "Use the same-origin dashboard to generate a SAS token."
+            )
+        if query:
+            return error_response(
+                400, "invalid_argument", "Send credentials only in the JSON body, not the URL."
+            )
+        try:
+            data = _json_object(body)
+            if data is None or set(data) - {"connection_string", "entity_path", "ttl_seconds"}:
+                raise ValueError(
+                    "Provide connection_string, optional entity_path, and ttl_seconds in a JSON object."
+                )
+            result = mint_relay_sas(
+                data.get("connection_string"),
+                data.get("entity_path"),
+                data.get("ttl_seconds", 21600),
+            )
+        except HubError:
+            return error_response(400, "invalid_json", "Provide a valid JSON object.")
+        except ValueError as exc:
+            return error_response(400, "invalid_argument", str(exc))
+        return HttpResponse(200, result)
 
     def home(self, query: Mapping[str, list[str]], headers: Mapping[str, str], base_url: str) -> HttpResponse:
         """The dashboard for browsers, the Markdown quickstart for everything else (curl, LLMs)."""
@@ -877,6 +911,42 @@ def openapi_document(service: HubService, base_url: str) -> dict[str, Any]:
         }
     }
     paths["/ui"]["get"]["parameters"] = paths["/v1/stats"]["get"]["parameters"]
+    paths["/v1/relay-sas"] = {
+        "post": {
+            "operationId": "mint_relay_sas",
+            "summary": "Generate an entity-scoped Relay SAS (dashboard only)",
+            "description": "Signs locally using transient key-based connection-string input. Requires a "
+            "same-origin Origin and X-Privy-UI: 1. No query parameters or storage. Inherits policy rights.",
+            "parameters": [
+                {"name": "Origin", "in": "header", "required": True, "schema": {"type": "string"}},
+                {"name": "X-Privy-UI", "in": "header", "required": True, "schema": {"const": "1"}},
+            ],
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["connection_string"],
+                            "properties": {
+                                "connection_string": {"type": "string", "writeOnly": True},
+                                "entity_path": {"type": ["string", "null"]},
+                                "ttl_seconds": {"type": "integer", "minimum": 1, "default": 21600},
+                            },
+                        }
+                    }
+                },
+            },
+            "responses": {
+                "200": {
+                    "description": "Bearer token, HTTPS sender URL, entity endpoint, and UTC expiry; never cache"
+                },
+                "400": {"$ref": "#/components/responses/Error"},
+                "403": {"$ref": "#/components/responses/Error"},
+            },
+        }
+    }
     paths["/v1"] = {
         "get": {
             "operationId": "capabilities",

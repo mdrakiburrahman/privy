@@ -400,6 +400,7 @@ JS = r"""
 
   let busy = false;
   async function refresh() {
+    if ($("#relay-sas")) return;
     const paused = () => document.querySelector(".lease-dialog[open]") ||
       document.querySelector("#purpose-panel:not([hidden])") || window.PrivyHycoFacets?.isOpen() ||
       $("#metrics-controls")?.dataset.dirty;

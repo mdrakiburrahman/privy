@@ -15,6 +15,7 @@ import re
 import time
 import urllib.parse
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import TypedDict, Union
 
 DEFAULT_TOKEN_TTL_SECONDS = 60 * 60 * 48
@@ -226,3 +227,89 @@ def create_http_send_url(service_namespace: str, entity_path: str, token: str | 
     if token:
         url += "&sb-hc-token=" + urllib.parse.quote(token)
     return url
+
+
+@dataclass(frozen=True)
+class RelayConnectionString:
+    namespace: str
+    key_name: str
+    key: str = field(repr=False)
+    entity_path: str | None = None
+
+
+def parse_relay_connection_string(value: str) -> RelayConnectionString:
+    """Parse a key-based Azure Relay connection string without reflecting its secrets."""
+    if not isinstance(value, str) or not value.strip() or len(value) > 16384:
+        raise ValueError("Provide a key-based Relay connection string.")
+    fields: dict[str, str] = {}
+    allowed = {"endpoint", "sharedaccesskeyname", "sharedaccesskey", "entitypath"}
+    for part in value.strip().rstrip(";").split(";"):
+        name, separator, content = part.partition("=")
+        name, content = name.strip().lower(), content.strip()
+        if not separator or name not in allowed or name in fields or not content:
+            raise ValueError("Connection string contains missing, duplicate, or unsupported fields.")
+        fields[name] = content
+    if not {"endpoint", "sharedaccesskeyname", "sharedaccesskey"} <= fields.keys():
+        raise ValueError("Connection string requires Endpoint, SharedAccessKeyName, and SharedAccessKey.")
+    try:
+        endpoint = urllib.parse.urlsplit(fields["endpoint"])
+        valid = (
+            endpoint.scheme == "sb"
+            and endpoint.hostname is not None
+            and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9-]*\.servicebus\.windows\.net", endpoint.netloc)
+            and endpoint.path in ("", "/")
+            and not endpoint.query
+            and not endpoint.fragment
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError("Endpoint must be sb://<namespace>.servicebus.windows.net/.")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", fields["sharedaccesskeyname"]):
+        raise ValueError("SharedAccessKeyName must be an authorization policy name.")
+    try:
+        decoded_key = base64.b64decode(fields["sharedaccesskey"], validate=True)
+    except ValueError:
+        raise ValueError("SharedAccessKey must be a non-empty base64 key.") from None
+    if not decoded_key:
+        raise ValueError("SharedAccessKey must be a non-empty base64 key.")
+    return RelayConnectionString(
+        namespace=endpoint.hostname,
+        key_name=fields["sharedaccesskeyname"],
+        key=fields["sharedaccesskey"],
+        entity_path=fields.get("entitypath"),
+    )
+
+
+def mint_relay_sas(
+    connection_string: str, entity_path: str | None = None, ttl_seconds: int = 21600
+) -> dict[str, str | int]:
+    """Mint one entity-scoped token and its HTTPS sender URL, without retaining credentials."""
+    connection = parse_relay_connection_string(connection_string)
+    if entity_path is not None and not isinstance(entity_path, str):
+        raise ValueError("Hybrid Connection name must be text.")
+    supplied = entity_path.strip() if entity_path else None
+    path = connection.entity_path or supplied
+    if supplied and connection.entity_path and supplied != connection.entity_path:
+        raise ValueError("Hybrid Connection name conflicts with EntityPath.")
+    if not path or not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", path):
+        raise ValueError(
+            "Provide a specific Hybrid Connection name using letters, numbers, '.', '_', '-' or '/'."
+        )
+    if any(segment in (".", "..") for segment in path.split("/")):
+        raise ValueError("Hybrid Connection name cannot contain relative path segments.")
+    if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
+        raise ValueError("Lifetime must be a positive whole number of seconds.")
+    # Keep the expiry representable in the returned UTC timestamp on all supported platforms.
+    if ttl_seconds > 253402300799 - math.floor(time.time()):
+        raise ValueError("Lifetime exceeds the supported expiry timestamp.")
+    token = create_sas_token(connection.namespace, path, connection.key_name, connection.key, ttl_seconds)
+    expires_at = parse_sas_token(token)["se"]
+    endpoint = f"https://{connection.namespace}/{path}"
+    return {
+        "token": token,
+        "sender_url": endpoint + "?" + urllib.parse.urlencode({"sb-hc-token": token}),
+        "endpoint": endpoint,
+        "expires_at": expires_at,
+        "expires_utc": _format_utc(expires_at),
+    }

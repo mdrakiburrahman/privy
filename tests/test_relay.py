@@ -1,3 +1,5 @@
+from urllib.parse import parse_qs, urlsplit
+
 import pytest
 
 from privy import _relay
@@ -7,10 +9,83 @@ from privy._relay import (
     RelayTokenError,
     RelayTokenExpiredError,
     create_sas_token,
+    mint_relay_sas,
+    parse_relay_connection_string,
     parse_sas_token,
     redact_relay_secrets,
     validate_sas_token,
 )
+
+CONNECTION = (
+    "Endpoint=sb://contoso.servicebus.windows.net/;"
+    "SharedAccessKeyName=Send;SharedAccessKey=c3ludGhldGljLWtleQ=="
+)
+
+
+def test_connection_string_preserves_padded_key_and_scopes_one_mint(monkeypatch):
+    monkeypatch.setattr(_relay.time, "time", lambda: 1_800_000_000)
+    parsed = parse_relay_connection_string(CONNECTION + ";EntityPath=my-hyco;")
+    assert parsed.key == "c3ludGhldGljLWtleQ=="
+    assert parsed.key not in repr(parsed)
+    result = mint_relay_sas(CONNECTION + ";EntityPath=my-hyco")
+    expected = create_sas_token("contoso", "my-hyco", "Send", parsed.key, 21600)
+    assert result["token"] == expected
+    claims = parse_sas_token(result["token"])
+    assert claims["se"] == 1_800_021_600
+    assert claims["sr"] == "http://contoso.servicebus.windows.net/my-hyco"
+    assert result["expires_utc"] == _relay._format_utc(claims["se"])
+    url = urlsplit(result["sender_url"])
+    assert url.scheme == "https" and url.path == "/my-hyco"
+    assert parse_qs(url.query) == {"sb-hc-token": [expected]}
+
+
+def test_connection_string_requires_entity_or_matching_fallback(monkeypatch):
+    monkeypatch.setattr(_relay.time, "time", lambda: 1_800_000_000)
+    result = mint_relay_sas(CONNECTION, "nested/hyco", 90)
+    assert result["expires_at"] == 1_800_000_090
+    assert parse_sas_token(result["token"])["sr"].endswith("/nested/hyco")
+    with pytest.raises(ValueError, match="specific Hybrid Connection"):
+        mint_relay_sas(CONNECTION)
+    with pytest.raises(ValueError, match="conflicts"):
+        mint_relay_sas(CONNECTION + ";EntityPath=one", "two")
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [";EntityPath=../x", ";EntityPath=/", ";EntityPath=x?y", ";EntityPath=x#y", ";EntityPath=x%2fy"],
+)
+def test_mint_rejects_ambiguous_entity_paths(suffix):
+    with pytest.raises(ValueError, match="Hybrid Connection"):
+        mint_relay_sas(CONNECTION + suffix)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        None,
+        "not-a-connection-string",
+        CONNECTION + ";SharedAccessKey=other",
+        CONNECTION + ";sharedaccesskey=other",
+        CONNECTION + ";EntityPath=",
+        CONNECTION.replace("sb://", "https://"),
+        CONNECTION.replace("contoso.servicebus.windows.net/", "contoso.servicebus.windows.net/path"),
+        CONNECTION.replace("contoso.servicebus.windows.net/", "user@contoso.servicebus.windows.net/"),
+        CONNECTION.replace("c3ludGhldGljLWtleQ==", "not-base64"),
+        CONNECTION + ";SharedAccessSignature=secret",
+    ],
+)
+def test_connection_string_rejects_malformed_values_without_reflecting_input(value):
+    with pytest.raises(ValueError) as error:
+        parse_relay_connection_string(value)
+    assert "c3ludGhldGljLWtleQ==" not in str(error.value)
+    assert "not-base64" not in str(error.value)
+
+
+@pytest.mark.parametrize("ttl", [0, -1, True, 1.5, "6h", float("nan"), float("inf"), 10**100])
+def test_mint_rejects_invalid_expiry(ttl):
+    with pytest.raises(ValueError, match="Lifetime"):
+        mint_relay_sas(CONNECTION, "hyco", ttl)
 
 
 def _token(*, audience: str = "ns.servicebus.windows.net/path", ttl_seconds: int = 60) -> str:

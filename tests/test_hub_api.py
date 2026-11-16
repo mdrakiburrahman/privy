@@ -30,6 +30,79 @@ NO_LISTENER = '{"error":{"code":"EndpointNotFound","message":"There are no liste
 OFFLINE = RelayHTTPError("x", status_code=404, detail=NO_LISTENER)
 BOX1 = "dev/box1_windows"
 
+SAS_CONNECTION = (
+    "Endpoint=sb://contoso.servicebus.windows.net/;"
+    "SharedAccessKeyName=Send;SharedAccessKey=c3ludGhldGljLWtleQ==;EntityPath=hyco"
+)
+
+
+@pytest.mark.parametrize(
+    "body, status",
+    [
+        ({"connection_string": SAS_CONNECTION}, 200),
+        ({"connection_string": SAS_CONNECTION, "ttl_seconds": 90}, 200),
+        ({"connection_string": SAS_CONNECTION, "ttl_seconds": 0}, 400),
+        ({"connection_string": SAS_CONNECTION, "ttl_seconds": float("inf")}, 400),
+        ({"connection_string": SAS_CONNECTION, "ttl_seconds": float("nan")}, 400),
+        ({"connection_string": SAS_CONNECTION, "ttl_seconds": True}, 400),
+        ({"connection_string": SAS_CONNECTION, "unknown": "ignored?"}, 400),
+        ({"connection_string": SAS_CONNECTION + ";SharedAccessKey=bad"}, 400),
+        ({"connection_string": []}, 400),
+        ({}, 400),
+    ],
+)
+def test_http_sas_generator_is_transient_and_omits_secrets_from_all_logs(http_hub, caplog, body, status):
+    runtime, listener = http_hub
+    caplog.set_level(logging.DEBUG, logger="privy")
+    response = requests.post(
+        runtime.url + "/v1/relay-sas",
+        headers={"Origin": runtime.url, "X-Privy-UI": "1"},
+        json=body if not any(isinstance(v, float) for v in body.values()) else None,
+        data=json.dumps(body) if any(isinstance(v, float) for v in body.values()) else None,
+        timeout=5,
+    )
+    assert response.status_code == status
+    assert response.headers["Cache-Control"] == "no-store"
+    assert "c3ludGhldGljLWtleQ==" not in response.text
+    if status == 200:
+        result = response.json()
+        assert result["token"].startswith("SharedAccessSignature ")
+        assert wait_for(lambda: "credential payload omitted" in caplog.text)
+        assert result["token"] not in caplog.text and result["sender_url"] not in caplog.text
+    assert listener.requests == [] and listener.info_calls == 0
+    assert not (runtime.home / "audit.jsonl").exists()
+    assert "c3ludGhldGljLWtleQ==" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"X-Privy-UI": "1"}, {"Origin": "http://evil.example", "X-Privy-UI": "1"}],
+)
+def test_http_sas_generator_requires_same_origin(http_hub, caplog, headers):
+    runtime, _ = http_hub
+    caplog.set_level(logging.DEBUG, logger="privy")
+    response = requests.post(
+        runtime.url + "/v1/relay-sas", headers=headers, json={"connection_string": SAS_CONNECTION}, timeout=5
+    )
+    assert response.status_code == 403
+    assert response.headers["Cache-Control"] == "no-store"
+    assert "c3ludGhldGljLWtleQ==" not in caplog.text
+
+
+def test_http_sas_generator_rejects_bad_json_and_query_credentials_without_logging(http_hub, caplog):
+    runtime, _ = http_hub
+    caplog.set_level(logging.DEBUG, logger="privy")
+    headers = {"Origin": runtime.url, "X-Privy-UI": "1", "Content-Type": "application/json"}
+    for path, body in [
+        ("/v1/relay-sas", '{"connection_string":"' + SAS_CONNECTION),
+        ("/v1/relay-sas?connection_string=" + quote(SAS_CONNECTION), "{}"),
+    ]:
+        response = requests.post(runtime.url + path, headers=headers, data=body, timeout=5)
+        assert response.status_code == 400
+        assert response.headers["Cache-Control"] == "no-store"
+        assert "c3ludGhldGljLWtleQ==" not in response.text
+    assert "c3ludGhldGljLWtleQ==" not in caplog.text
+
 
 @pytest.fixture
 def hub(tmp_path):

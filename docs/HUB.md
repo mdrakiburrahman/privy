@@ -42,6 +42,36 @@ every request, so startup is instant and works without an Azure login.
 For an always-on hub, install the `PrivyHub` logon task described in
 [Scheduled tasks](SCHEDULED_TASKS.md#2-install-the-hub-task).
 
+## Generate a short-lived Relay SAS
+
+Open **Relay SAS** in the hub sidebar (`/ui/relay-sas`). Paste a key-based Azure
+Relay connection string with `Endpoint`, `SharedAccessKeyName`, and
+`SharedAccessKey`. The generator uses `EntityPath` when present; otherwise enter
+the specific Hybrid Connection name. Namespace-wide tokens are not generated.
+
+The lifetime defaults to six hours and is editable (rounded to whole seconds).
+Generate once to copy either the raw SAS token or an HTTPS sender URL containing
+the same token in `sb-hc-token`. The exact UTC expiry is shown. Both outputs are
+bearer secrets: do not put them in logs or source control. The sender URL is an
+HTTP entity endpoint, not a WebSocket listener URL.
+
+Use a **Send-only policy** for sender access. Tokens inherit the supplied policy's
+permissions; a policy name is not proof of its rights, and the generator cannot
+reduce Listen or Manage rights. Signing is local and does not verify Azure
+authorization. Expiry prevents later authentication, but does not guarantee
+termination of already-established connections.
+
+The loopback hub processes the connection string transiently. Inputs and outputs
+are not saved to Relay configuration, browser storage, job history, or request
+logs. Responses are not cached. The signing key is cleared from the input after
+successful generation; **Clear all** removes the displayed results. Editing any
+input also clears stale results. Keep the hub loopback-only.
+
+The dashboard submits JSON to `POST /v1/relay-sas` with `connection_string`,
+optional `entity_path`, and positive integer `ttl_seconds` (default `21600`).
+This credential endpoint requires a same-origin `Origin` and `X-Privy-UI: 1`,
+rejects query parameters, and is not an MCP tool.
+
 ## Lease a devbox
 
 When using the hub for a task, register a client once, acquire a lease for the devbox stack, pass
