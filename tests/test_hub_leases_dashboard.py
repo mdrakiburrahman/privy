@@ -174,6 +174,7 @@ def test_last_used_is_not_renewal_survives_unleased_use_and_restart(leased_hub, 
     store._clock = lambda: now + 60
     store.use(BOX)
     store.touch(lease["lease_id"])
+    store.flush()
     restored = LeaseStore(hub.registry, home=store.state_path.parent, clock=lambda: now + 60)
     assert restored.get_lease(lease["lease_id"])["last_used_at"] == used
     page = hub.call("GET", "/ui/leases").text

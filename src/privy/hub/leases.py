@@ -42,6 +42,10 @@ groups:
 
 log = logging.getLogger("privy.hub")
 
+ENDED_LEASE_RETENTION_S = 24 * 3600
+MAX_LEASE_EVENTS = 100
+SAVE_DEBOUNCE_S = 5.0
+
 
 class LeaseError(Exception):
     def __init__(
@@ -100,6 +104,7 @@ class LeaseStore:
         self.config_path = home / "leases.yaml" if home else None
         self.state_path = home / "leases-state.json" if home else None
         self._lock = threading.RLock()
+        self._save_timer: threading.Timer | None = None
         self._clients: dict[str, dict[str, Any]] = {}
         self._leases: dict[str, dict[str, Any]] = {}
         self._uses: dict[str, dict[str, Any]] = {}
@@ -129,6 +134,9 @@ class LeaseStore:
                 self._validate_state()
                 cleared_pins = False
                 for lease in self._leases.values():
+                    if len(lease["events"]) > MAX_LEASE_EVENTS:
+                        cleared_pins = True
+                        del lease["events"][:-MAX_LEASE_EVENTS]
                     # Hub jobs are not restored; stale pins must not reserve a group forever.
                     if lease["running_jobs"]:
                         cleared_pins = True
@@ -276,27 +284,44 @@ class LeaseStore:
     def _save(self) -> None:
         if self.state_path is None:
             return
-        temporary = self.state_path.with_suffix(".tmp")
-        _write_private(
-            temporary,
-            json.dumps(
-                {
-                    "version": 1,
-                    "clients": self._clients,
-                    "leases": self._leases,
-                    "last_use": self._uses,
-                },
-                ensure_ascii=True,
-                indent=2,
+        with self._lock:
+            if self._save_timer is not None:
+                self._save_timer.cancel()
+                self._save_timer = None
+            temporary = self.state_path.with_suffix(".tmp")
+            _write_private(
+                temporary,
+                json.dumps(
+                    {
+                        "version": 1,
+                        "clients": self._clients,
+                        "leases": self._leases,
+                        "last_use": self._uses,
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                )
+                + "\n",
             )
-            + "\n",
-        )
-        temporary.replace(self.state_path)
+            temporary.replace(self.state_path)
+
+    def _save_soon(self) -> None:
+        """Coalesce routine timestamp updates (renewals, use, pins) into one deferred write."""
+        if self.state_path is None or self._save_timer is not None:
+            return
+        self._save_timer = threading.Timer(SAVE_DEBOUNCE_S, self.flush)
+        self._save_timer.daemon = True
+        self._save_timer.start()
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._save_timer is not None:
+                self._save()
 
     def _event(self, lease: dict[str, Any], event: str, **details: Any) -> None:
         entry = {"at": utc_iso(self._clock()), "event": event, **details}
         lease["events"].append(entry)
-        del lease["events"][:-1000]
+        del lease["events"][:-MAX_LEASE_EVENTS]
         self.audit.record(
             f"lease.{event}",
             lease_id=lease["lease_id"],
@@ -318,6 +343,18 @@ class LeaseStore:
             if client_id not in active and now - client["last_seen_ts"] >= self.client_idle_expiry:
                 del self._clients[client_id]
                 self.audit.record("client.expired", client_id=client_id)
+                changed = True
+        # Ended leases live on in audit.jsonl; keep each group's latest for cooldown and revival.
+        latest = {item["group"]: lease_id for lease_id, item in self._leases.items()}
+        for lease_id, lease in list(self._leases.items()):
+            ended = lease.get("released_ts", lease.get("expired_ts", lease["expires_ts"]))
+            if (
+                lease["state"] != "active"
+                and not lease["running_jobs"]
+                and latest[lease["group"]] != lease_id
+                and now - ended >= ENDED_LEASE_RETENTION_S
+            ):
+                del self._leases[lease_id]
                 changed = True
         if changed:
             self._save()
@@ -396,7 +433,7 @@ class LeaseStore:
             )
             if existing:
                 existing["last_seen_ts"] = now
-                self._save()
+                self._save_soon()
                 return {**self._client_view(existing), "created": False}
             client_id = "cl-" + uuid.uuid4().hex
             client = {
@@ -714,7 +751,10 @@ class LeaseStore:
         if client:
             client["last_seen_ts"] = self._clock()
         self._event(lease, "revived" if revived else "renewed")
-        self._save()
+        if revived:
+            self._save()
+        else:
+            self._save_soon()
 
     def renew(
         self, lease_id: str, client_id: str, ttl: str | None = None, *, manual: bool = False
@@ -802,7 +842,7 @@ class LeaseStore:
                 view = self._view(active)
                 result["lease_warning"] = {k: view[k] for k in ("lease_id", "group", "holder", "expires_at")}
                 self._event(active, "warning", target=target, origin=origin)
-            self._save()
+            self._save_soon()
             return result
 
     def job_started(self, job: Any) -> None:
@@ -816,7 +856,7 @@ class LeaseStore:
                     job.purpose = lease["purpose"]
                 lease["running_jobs"].append(job.id)
                 self._event(lease, "pinned", job_id=job.id, target=job.target.id)
-                self._save()
+                self._save_soon()
 
     def job_finished(self, job: Any) -> None:
         with self._lock:
@@ -836,4 +876,4 @@ class LeaseStore:
                     if lease["state"] == "active" and not lease["running_jobs"]:
                         lease["renewed_ts"] = self._clock()
                         lease["expires_ts"] = self._clock() + lease["ttl_s"]
-            self._save()
+            self._save_soon()
