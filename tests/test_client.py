@@ -51,7 +51,7 @@ def test_client_resolves_token_provider_for_every_request(monkeypatch):
         )
         return FakeResponse(json.loads(response.to_json()))
 
-    monkeypatch.setattr("privy.client.requests.post", post)
+    monkeypatch.setattr("privy.client._HTTP.post", post)
     client = RelayClient(namespace="ns", path="path", token=provider)
 
     assert client.run_bash("true", timeout_s=1).ok
@@ -70,7 +70,7 @@ def test_client_redacts_token_from_transport_errors(monkeypatch):
     def post(url, **kwargs):
         raise requests.ConnectionError(f"failed URL {url}")
 
-    monkeypatch.setattr("privy.client.requests.post", post)
+    monkeypatch.setattr("privy.client._HTTP.post", post)
     client = RelayClient(namespace="ns", path="path", token=token)
 
     with pytest.raises(RuntimeError) as exc:

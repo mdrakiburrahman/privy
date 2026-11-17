@@ -66,7 +66,7 @@ def test_client_listener_info_returns_the_listener_description(monkeypatch):
         sent.append(json.loads(kwargs["data"]))
         return FakeResponse({"kind": LISTENER_INFO_KIND, "hostname": "box"})
 
-    monkeypatch.setattr("privy.client.requests.post", post)
+    monkeypatch.setattr("privy.client._HTTP.post", post)
 
     assert _client().listener_info() == {"kind": LISTENER_INFO_KIND, "hostname": "box"}
     assert sent[0]["kind"] == LISTENER_INFO_KIND
@@ -81,7 +81,7 @@ def test_client_listener_info_reports_a_legacy_listener_as_none(monkeypatch):
         error="bad_request",
     )
     monkeypatch.setattr(
-        "privy.client.requests.post",
+        "privy.client._HTTP.post",
         lambda url, **kwargs: FakeResponse(json.loads(legacy.to_json())),
     )
 
@@ -95,7 +95,7 @@ def test_http_failures_carry_status_and_redacted_detail(monkeypatch):
     def post(url, **kwargs):
         return FakeResponse(status_code=503, text=f"No listener for {token}")
 
-    monkeypatch.setattr("privy.client.requests.post", post)
+    monkeypatch.setattr("privy.client._HTTP.post", post)
     client = RelayClient(namespace="ns", path="path", token=token)
 
     with pytest.raises(RelayHTTPError) as exc:
@@ -112,7 +112,7 @@ def test_http_timeouts_are_marked(monkeypatch):
     def post(url, **kwargs):
         raise requests.ReadTimeout("read timed out")
 
-    monkeypatch.setattr("privy.client.requests.post", post)
+    monkeypatch.setattr("privy.client._HTTP.post", post)
 
     with pytest.raises(RelayHTTPError) as exc:
         _client().listener_info()
