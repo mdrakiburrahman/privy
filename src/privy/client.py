@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import http.cookiejar
 import json
 import logging
 import os
+import ssl
+import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import Any
 
 import requests
+from urllib3.util.ssl_ import create_urllib3_context
 
 from privy._relay import (
     DEFAULT_TOKEN_TTL_SECONDS,
@@ -74,6 +78,53 @@ SubmitCallback = Callable[[str], None]
 #: HTTP timeout for a ``listener_info`` probe.
 _INFO_HTTP_TIMEOUT_S = 15.0
 _ERROR_DETAIL_CHARS = 300
+
+
+class _RelayHTTPAdapter(requests.adapters.HTTPAdapter):
+    """Reuse one CA-loaded SSL context for default verification.
+
+    Stock requests reloads the CA bundle for every new TLS connection, which is
+    kernel-heavy on hosts that scan file opens. A custom ``verify`` path keeps
+    the stock behaviour.
+    """
+
+    _context: ssl.SSLContext | None = None
+    _context_lock = threading.Lock()
+
+    @classmethod
+    def _verified_context(cls) -> ssl.SSLContext:
+        with cls._context_lock:
+            if cls._context is None:
+                context = create_urllib3_context()
+                context.load_verify_locations(requests.utils.DEFAULT_CA_BUNDLE_PATH)
+                cls._context = context
+            return cls._context
+
+    def build_connection_pool_key_attributes(self, request, verify, cert=None):  # type: ignore[no-untyped-def]
+        host_params, pool_kwargs = super().build_connection_pool_key_attributes(request, verify, cert)
+        if verify is True and cert is None and host_params.get("scheme") == "https":
+            pool_kwargs["ssl_context"] = self._verified_context()
+        return host_params, pool_kwargs
+
+    def cert_verify(self, conn, url, verify, cert):  # type: ignore[no-untyped-def]
+        super().cert_verify(conn, url, verify, cert)
+        if self._context is not None and getattr(conn, "conn_kw", {}).get("ssl_context") is self._context:
+            conn.ca_certs = None
+
+
+def _new_http_session() -> requests.Session:
+    # One shared session keeps TLS state and connections across relay calls;
+    # a bare requests.post() rebuilds both, costing ~0.5 s kernel CPU per call on
+    # some hosts. Cookies stay off so calls remain independent, as before.
+    session = requests.Session()
+    session.cookies.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
+    adapter = _RelayHTTPAdapter(pool_connections=16, pool_maxsize=32)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+_HTTP = _new_http_session()
 
 
 class RelayHTTPError(RuntimeError):
@@ -553,7 +604,7 @@ class RelayClient:
             token,
         )
         try:
-            response = requests.post(
+            response = _HTTP.post(
                 url,
                 headers={"Content-Type": "application/json"},
                 data=payload,
