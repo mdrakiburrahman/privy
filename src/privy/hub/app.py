@@ -364,6 +364,8 @@ class HubRuntime:
         self.server.shutdown()
         self.server.server_close()
         self.service.listener_infos.flush()
+        if self.service.leases is not None:
+            self.service.leases.flush()
 
 
 def build_hub(

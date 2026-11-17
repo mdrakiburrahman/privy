@@ -462,6 +462,7 @@ def test_last_use_tracks_job_completion_and_persists_beyond_event_retention(leas
     for _ in range(1001):
         store._event(store._leases[lease_id], "renewed")
     store.renew(lease_id, owner)
+    store.flush()
     restored = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
     assert restored.get_lease(lease_id)["last_used_at"] == finished
     assert restored.get_lease(lease_id)["last_use_known"] is True
@@ -554,6 +555,28 @@ def test_multiple_job_pins_and_restart_do_not_leave_permanent_pin(leasing, tmp_p
     now[0] += 3600
     store.job_finished(jobs[0])
     assert store.get_lease(lease["lease_id"])["running_jobs"] == ["1"]
+    store.flush()
     restored = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
     assert restored.get_lease(lease["lease_id"])["running_jobs"] == []
     assert restored.get_lease(lease["lease_id"])["state"] == "active"
+
+
+def test_ended_leases_are_pruned_and_touches_do_not_rewrite_state(leasing, tmp_path):
+    hub, store, now = leasing
+    owner = client(store)
+    old = acquire(store, owner)["lease_id"]
+    store.release(old, owner)
+    latest = acquire(store, owner)["lease_id"]
+    store.release(latest, owner)
+    held = acquire(store, owner, target="raki-windows-big-3")["lease_id"]
+    now[0] += 86400
+    store.touch(held)
+    assert {lease["lease_id"] for lease in store.list_leases(state="all")} == {latest, held}
+    written = store.state_path.stat().st_mtime_ns
+    for _ in range(50):
+        store.touch(held)
+    assert store.state_path.stat().st_mtime_ns == written
+    store.flush()
+    restored = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
+    assert restored.get_lease(held)["state"] == "active"
+    assert restored.get_lease(held)["expires_at"] == store.get_lease(held)["expires_at"]
