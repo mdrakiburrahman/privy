@@ -99,9 +99,9 @@ response includes a `lease_warning`. `GET /v1/jobs` also accepts `lease_id` and 
 MCP exposes client, group, and lease operations, but not force-release.
 
 The hub keeps lease state in `leases-state.json`. Released and expired leases are pruned 24 hours
-after they end, except each group's most recent lease; the full history stays in `audit.jsonl`.
-Each lease keeps its latest 100 events. Renewals and usage updates are written at most every few
-seconds rather than on every call.
+after they end, except each group's most recent lease; the full history stays in `audit.jsonl`. Each
+lease keeps its latest 100 events. Renewals and usage updates are written at most every few seconds
+rather than on every call.
 
 ### Reserve a devbox from the dashboard
 
