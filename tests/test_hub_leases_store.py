@@ -50,6 +50,59 @@ def acquire(store, client_id, target="raki-windows-big", **kwargs):
     return store.acquire(client_id, target=target, **kwargs)
 
 
+def test_untargeted_release_retry_prefers_other_groups_after_restart(leasing, tmp_path):
+    hub, store, now = leasing
+    owner, other = client(store), client(store, "other")
+    first = store.acquire(owner)
+    store.release(first["lease_id"], owner)
+    restored = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
+
+    second = restored.acquire(owner)
+    assert second["group"] != first["group"]
+    restored.release(second["lease_id"], owner)
+    other_lease = restored.acquire(other)
+    assert other_lease["group"] == first["group"]
+    restored.release(other_lease["lease_id"], other)
+
+    # A pinned request still grants and renews the requested group.
+    pinned = restored.acquire(owner, target=second["group"], exclude=[first["group"]])
+    assert pinned["group"] == second["group"]
+    assert restored.acquire(owner, target=second["group"])["lease_id"] == pinned["lease_id"]
+    restored.release(pinned["lease_id"], owner)
+    # Do not impose a cooldown when no alternative is eligible.
+    fallback = restored.acquire(owner, exclude=[second["group"], "dev/single"])
+    assert fallback["group"] == first["group"]
+    restored.release(fallback["lease_id"], owner)
+    now[0] += 301
+    assert restored.acquire(owner)["group"] == first["group"]
+
+
+def test_exclusions_filter_groups_and_diagnostics_before_availability(leasing):
+    _, store, _ = leasing
+    owner, other = client(store), client(store, "other")
+    first = acquire(store, other, ttl="1s")
+    second = acquire(store, other, target="raki-windows-big-3", ttl="20m")
+    exclusion = [first["members"]["wsl"], "dev/single"]
+
+    with pytest.raises(LeaseError) as error:
+        store.acquire(owner, exclude=exclusion)
+    assert error.value.code == "none_available"
+    assert error.value.details["retry_after_s"] == 1201
+    assert {"group": first["group"], "state": "excluded"} in error.value.details["groups"]
+
+    with pytest.raises(LeaseError) as error:
+        store.acquire(owner, exclude=[*exclusion, second["group"]])
+    assert error.value.code == "none_available"
+    assert all(group["state"] == "excluded" for group in error.value.details["groups"])
+
+    with pytest.raises(LeaseError) as error:
+        store.acquire(other, target=first["group"], exclude=exclusion)
+    assert error.value.code == "target_excluded"
+    with pytest.raises(LeaseError) as error:
+        store.acquire(owner, exclude=["not-a-group"])
+    assert error.value.code == "unknown_target"
+
+
 def test_manual_duration_survives_restart_and_excludes_other_clients(leasing, tmp_path):
     hub, store, now = leasing
     owner, other = client(store), client(store, "other")

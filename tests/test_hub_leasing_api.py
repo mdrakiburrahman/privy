@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from hub_fakes import HOST, FakeListener, Hub
 
+from privy.hub.mcp import tool_definitions
 from privy.hub.rest import REST_OPERATIONS, ROUTES, RestApi, write_job_stream
 from privy.hub.service import OPERATIONS
 
@@ -78,6 +79,43 @@ def test_lease_routes_and_schemas_are_exposed(tmp_path):
     }
     assert force_parameters["require_unpinned"]["schema"] == {"type": "boolean", "default": False}
     assert [operation.name for operation in OPERATIONS] == mcp_names
+
+
+def test_rest_and_mcp_acquisition_honor_member_exclusions(tmp_path):
+    hub = Hub(
+        tmp_path,
+        {
+            "dev/box1_windows": FakeListener(hostname="BOX1"),
+            "dev/box2_windows": FakeListener(hostname="BOX2"),
+        },
+    )
+    owner = hub.call("POST", "/v1/clients", {"name": "Agent"}).payload["client_id"]
+    args = {"client_id": owner, "exclude": ["dev/box1_windows"]}
+    http = hub.call("POST", "/v1/leases", args)
+    assert http.status == 201 and http.payload["group"] == "dev/box2"
+    hub.call("DELETE", f"/v1/leases/{http.payload['lease_id']}?client_id={owner}")
+    other = hub.call("POST", "/v1/clients", {"name": "MCP agent"}).payload["client_id"]
+    mcp = hub.call(
+        "POST",
+        "/mcp",
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "acquire_lease", "arguments": {**args, "client_id": other}},
+        },
+    )
+    assert mcp.payload["result"]["structuredContent"]["group"] == "dev/box2"
+    response = hub.call("POST", "/v1/leases", {**args, "exclude": [""]})
+    assert response.status == 400
+
+    rest = hub.call("GET", "/openapi.json").payload["paths"]["/v1/leases"]["post"]
+    rest_schema = rest["requestBody"]["content"]["application/json"]["schema"]
+    mcp_schema = next(tool["inputSchema"] for tool in tool_definitions() if tool["name"] == "acquire_lease")
+    for schema in (rest_schema, mcp_schema):
+        assert schema["properties"]["exclude"]["type"] == "array"
+        assert schema["properties"]["exclude"]["items"] == {"type": "string"}
+        assert "exclude" not in schema["required"]
 
 
 def test_lease_lists_are_bare_arrays(tmp_path, monkeypatch):

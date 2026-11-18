@@ -67,6 +67,8 @@ authentication is needed.
 Recommended flow: register_client once per chat (session_id makes registration idempotent), then
 acquire_lease with client_id, purpose and arbitrary labels (e.g. repo). Omit target for ANY free group,
 or name any member to reserve the whole stack. Separate ANY requests can allocate multiple groups.
+Use the assigned free group rather than inferring availability from old lease lists. Use exclude
+only for real constraints; it lists group names or member targets to skip.
 Pass lease_id on every run, broadcast, transfer, sync, job poll or terminal call. Usage renews the
 30m idle TTL; jobs pin it until completion. Before a long wait, renew_lease with ttl up to 4h.
 Release with release_lease and client_id when pushed work is done. On none_available wait for
@@ -659,6 +661,11 @@ OPERATIONS: tuple[Operation, ...] = (
         (
             _REQUIRED_CLIENT_ID,
             Param("target", "string", "Target member or group name; omit to acquire any available group."),
+            Param(
+                "exclude",
+                "array",
+                "Groups or member targets to skip. An explicitly targeted group cannot also be excluded.",
+            ),
             _LABELS,
             PURPOSE_PARAM,
             _TTL,
@@ -1486,13 +1493,20 @@ class HubService:
         origin: str,
         client_id: str,
         target: str | None,
+        exclude: list[str] | None,
         labels: dict[str, str] | None,
         purpose: str | None,
         ttl: str | None,
     ) -> dict[str, Any]:
         with _translated_errors():
             return self.leases.acquire(
-                client_id, target=target, labels=labels, purpose=purpose, ttl=ttl, manual=origin == "ui"
+                client_id,
+                target=target,
+                labels=labels,
+                purpose=purpose,
+                ttl=ttl,
+                manual=origin == "ui",
+                exclude=exclude,
             )
 
     def _op_list_leases(
