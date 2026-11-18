@@ -45,6 +45,7 @@ log = logging.getLogger("privy.hub")
 ENDED_LEASE_RETENTION_S = 24 * 3600
 MAX_LEASE_EVENTS = 100
 SAVE_DEBOUNCE_S = 5.0
+RELEASE_RETRY_WINDOW_S = 5 * 60
 
 
 class LeaseError(Exception):
@@ -576,6 +577,34 @@ class LeaseStore:
             raise LeaseError(f"ttl must not exceed {maximum:g} seconds")
         return ttl, seconds
 
+    def _resolve_group(
+        self, name: str, groups: dict[str, dict[str, Any]], targets: dict[str, tuple[str, str]]
+    ) -> str:
+        if name in groups:
+            return name
+        short = [key for key in groups if key.rsplit("/", 1)[-1] == name]
+        if len(short) == 1:
+            return short[0]
+        try:
+            return targets[self.registry.resolve(name).id][0]
+        except TargetLookupError as exc:
+            raise LeaseError(str(exc), status=404, code="unknown_target") from exc
+
+    def _untargeted_candidates(
+        self, client_id: str, groups: dict[str, dict[str, Any]], excluded: set[str]
+    ) -> list[dict[str, Any]]:
+        cutoff = self._clock() - RELEASE_RETRY_WINDOW_S
+        recent: dict[str, tuple[float, int]] = {}
+        for index, lease in enumerate(self._leases.values()):
+            if lease["client_id"] == client_id and lease["state"] == "released":
+                released = lease.get("released_ts", 0)
+                if released > cutoff:
+                    key = lease["group"]
+                    recent[key] = max(recent.get(key, (0, 0)), (released, index))
+        # Prefer fresh alternatives, then try the least recently released group.
+        keys = sorted((key for key in groups if key not in excluded), key=lambda key: recent.get(key, (0, 0)))
+        return [groups[key] for key in keys]
+
     def acquire(
         self,
         client_id: str,
@@ -585,9 +614,16 @@ class LeaseStore:
         ttl: str | None = None,
         *,
         manual: bool = False,
+        exclude: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         if type(manual) is not bool:
             raise LeaseError("manual must be a boolean")
+        if exclude is not None and (
+            isinstance(exclude, str)
+            or not isinstance(exclude, Sequence)
+            or any(not isinstance(name, str) or not name.strip() for name in exclude)
+        ):
+            raise LeaseError("exclude must be a list of non-empty group or target names")
         ttl, seconds = self._ttl(ttl, manual=manual)
         labels = _labels(labels)
         try:
@@ -598,20 +634,13 @@ class LeaseStore:
             self._sweep()
             client = self._client(client_id)
             groups, targets = self._membership()
+            excluded = {self._resolve_group(name, groups, targets) for name in exclude or ()}
             if target is not None:
-                if target in groups:
-                    selected = groups[target]
-                else:
-                    short = [g for k, g in groups.items() if k.rsplit("/", 1)[-1] == target]
-                    if len(short) == 1:
-                        selected = short[0]
-                    else:
-                        try:
-                            resolved = self.registry.resolve(target)
-                            selected = groups[targets[resolved.id][0]]
-                        except TargetLookupError as exc:
-                            raise LeaseError(str(exc), status=404, code="unknown_target") from exc
-                current = self._active(selected["group"])
+                key = self._resolve_group(target, groups, targets)
+                if key in excluded:
+                    raise LeaseError(f"target group {key} is excluded", code="target_excluded")
+                selected = groups[key]
+                current = self._active(key)
                 if current and current["client_id"] == client_id:
                     self._renew(current)
                     return {**self._view(current), "created": False}
@@ -627,7 +656,7 @@ class LeaseStore:
                 raise LeaseError(
                     "client holds the maximum number of leases", status=409, code="client_lease_limit"
                 )
-            candidates = [selected] if selected else list(groups.values())
+            candidates = [selected] if selected else self._untargeted_candidates(client_id, groups, excluded)
             views = []
             for candidate in candidates:
                 view = self._group_view(candidate, probe=True)
@@ -666,6 +695,7 @@ class LeaseStore:
                 retry = min(
                     (v["retry_after_s"] for v in views if v["state"] in ("leased", "cooling")), default=15
                 )
+                views.extend({"group": key, "state": "excluded"} for key in groups if key in excluded)
                 raise LeaseError(
                     "no lease group is available",
                     status=409,

@@ -160,6 +160,10 @@ def quickstart(service: HubService, base_url: str) -> str:
         ),
         "```",
         "",
+        "Omit `target` to accept any available group. The hub checks availability and grants it "
+        "exclusively to this client. For real constraints, send `exclude`: an array of group or "
+        "member target names. An explicit `target` cannot belong to an excluded group.",
+        "",
         "Send `lease_id` on each lease-aware request as a query/body field or `X-Privy-Lease` header. "
         "Release with `DELETE /v1/leases/{lease_id}?client_id={client_id}`. `GET /v1/groups` shows "
         "availability; `GET /v1/leases?label=repo=<owner/repo>` peeks at matching leases.",
