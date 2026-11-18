@@ -81,7 +81,7 @@ but does not block unleased commands.
 | `GET /v1/clients?active=true`                                    | List clients, optionally only those holding active leases.                                                                   |
 | `GET /v1/clients/{client_id}` / `DELETE /v1/clients/{client_id}` | Inspect a client or unregister it and release its leases.                                                                    |
 | `GET /v1/groups`                                                 | Show group members, current state, holder, and when it becomes leasable.                                                     |
-| `POST /v1/leases`                                                | Acquire by `target`, or omit it and optionally pass `exclude` to select an available group.                                 |
+| `POST /v1/leases`                                                | Acquire by `target`, or omit it and optionally pass `exclude` to select an available group.                                  |
 | `GET /v1/leases`                                                 | List leases; filter with `client_id`, `group`, repeated `label=key=value`, and `state`.                                      |
 | `GET /v1/leases/{lease_id}`                                      | Inspect a lease, its events, timers, and linked jobs.                                                                        |
 | `POST /v1/leases/{lease_id}/renew`                               | Renew as the holder; optionally supply `ttl` (capped at four hours).                                                         |
@@ -94,8 +94,8 @@ and `GET /v1/leases` return bare JSON arrays. Client registration and lease acqu
 
 Omit `target` to accept any available group. Use the assigned group; a historical lease list does
 not tell you which groups are available now. For a genuine constraint, pass
-`"exclude": ["dev/box1", "dev/box2_wsl"]` to `POST /v1/leases` or the MCP `acquire_lease` tool.
-Each name resolves just like `target` and excludes the whole group. Unknown names fail with
+`"exclude": ["dev/box1", "dev/box2_wsl"]` to `POST /v1/leases` or the MCP `acquire_lease` tool. Each
+name resolves just like `target` and excludes the whole group. Unknown names fail with
 `unknown_target`; an explicit target in an excluded group fails with `target_excluded` without
 picking another group. If no eligible group can be acquired, `none_available` lists excluded groups
 and gives a `retry_after_s` based on eligible groups' availability. Untargeted acquisition prefers
