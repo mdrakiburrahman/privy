@@ -70,7 +70,7 @@ or name any member to reserve the whole stack. Separate ANY requests can allocat
 Use the assigned free group rather than inferring availability from old lease lists. Use exclude
 only for real constraints; it lists group names or member targets to skip.
 Pass lease_id on every run, broadcast, transfer, sync, job poll or terminal call. Usage renews the
-30m idle TTL; jobs pin it until completion. Before a long wait, renew_lease with ttl up to 4h.
+30m idle TTL by default; jobs pin it until completion. Renew with a longer TTL before a long wait.
 Release with release_lease and client_id when pushed work is done. On none_available wait for
 retry_after_s; on group_leased for a user-named box ask before using someone else's group.
 Leases are advisory: unleased commands still run with a lease_warning and count as recent use,
@@ -185,9 +185,11 @@ class Param:
         """Validate ``value``; strings are accepted for scalars (REST query parameters)."""
         name = self.name
         if name == "ttl" and type(value) in (int, float):
-            if not math.isfinite(value) or value <= 0:
+            if (isinstance(value, float) and not math.isfinite(value)) or value <= 0:
                 raise _invalid("ttl seconds must be positive and finite")
-            return f"{value:g}s"
+            from decimal import Decimal
+
+            return f"{Decimal(str(value)):f}s"
         if name == "purpose":
             try:
                 return normalize_purpose(value)
@@ -335,7 +337,7 @@ _REQUIRED_LEASE_ID = Param(
 _CLIENT_ID = Param("client_id", "string", "Registered lease client id.")
 _REQUIRED_CLIENT_ID = Param("client_id", "string", "Registered lease client id.", required=True)
 _LABELS = Param("labels", "object", "Free-form string labels.")
-_TTL = Param("ttl", "string", "Lease duration, for example 30m or 2h.", max_length=32)
+_TTL = Param("ttl", "string", "Lease duration, for example 30m, 2h, 7d, or never.")
 PURPOSE_PARAM = Param(
     "purpose",
     "string",

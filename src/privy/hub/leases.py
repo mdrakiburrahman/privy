@@ -7,12 +7,14 @@ import datetime as dt
 import json
 import logging
 import math
+import random
 import re
 import string
 import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -27,8 +29,6 @@ DEFAULT_CONFIG = """\
 version: 1
 defaults:
   ttl: 30m
-  max_ttl: 4h
-  manual_max_ttl: 365d
   cooldown: 15m
   max_leases_per_client: 4
   client_idle_expiry: 24h
@@ -45,7 +45,6 @@ log = logging.getLogger("privy.hub")
 ENDED_LEASE_RETENTION_S = 24 * 3600
 MAX_LEASE_EVENTS = 100
 SAVE_DEBOUNCE_S = 5.0
-RELEASE_RETRY_WINDOW_S = 5 * 60
 
 
 class LeaseError(Exception):
@@ -56,21 +55,59 @@ class LeaseError(Exception):
         self.code, self.status, self.details = code, status, details
 
 
-def duration(value: Any) -> float:
+def duration(value: Any) -> Fraction:
     if type(value) in (int, float):
-        seconds = float(value)
-        if not math.isfinite(seconds) or not 0 < seconds <= 365 * 86400:
-            raise ValueError("duration seconds must be positive and at most 365 days")
-        return seconds
+        value = str(value)
     if not isinstance(value, str):
         raise ValueError("duration must be a positive duration string, e.g. 30m or 4h")
     match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(s|m|h|d)?", value)
     if match is None:
         raise ValueError("duration must be a positive duration string, e.g. 30m or 4h")
-    seconds = float(match[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match[2] or "s"]
-    if not 0 < seconds <= 365 * 86400:
-        raise ValueError("duration must be positive and at most 365 days")
+    seconds = Fraction(match[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match[2] or "s"]
+    if seconds <= 0:
+        raise ValueError("duration must be positive")
     return seconds
+
+
+def exact(value: Any) -> Fraction:
+    return Fraction(str(value))
+
+
+def exact_text(value: Fraction) -> str:
+    denominator = value.denominator
+    twos = fives = 0
+    while denominator % 2 == 0:
+        twos += 1
+        denominator //= 2
+    while denominator % 5 == 0:
+        fives += 1
+        denominator //= 5
+    if denominator != 1:
+        raise ValueError("value cannot be represented as a decimal")
+    places = max(twos, fives)
+    scaled = abs(value.numerator) * 2 ** (places - twos) * 5 ** (places - fives)
+    digits = str(scaled).zfill(places + 1)
+    text = digits if not places else f"{digits[:-places]}.{digits[-places:]}".rstrip("0").rstrip(".")
+    return ("-" if value < 0 else "") + text
+
+
+def wire_number(value: Fraction) -> int | str:
+    if value.denominator == 1 and abs(value.numerator) <= 9007199254740991:
+        return value.numerator
+    return exact_text(value)
+
+
+def deadline_iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        return utc_iso(float(exact(value)))
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def expiry(now: float, ttl: Any) -> int | str | None:
+    return None if ttl is None else wire_number(exact(now) + exact(ttl))
 
 
 def _labels(value: Any) -> dict[str, str]:
@@ -142,8 +179,10 @@ class LeaseStore:
                     if lease["running_jobs"]:
                         cleared_pins = True
                         lease["running_jobs"] = []
-                        if lease["state"] == "active":
-                            lease["expires_ts"] = max(lease["expires_ts"], self._clock() + lease["ttl_s"])
+                        if lease["state"] == "active" and lease["ttl_s"] is not None:
+                            lease["expires_ts"] = wire_number(
+                                max(exact(lease["expires_ts"]), exact(self._clock()) + exact(lease["ttl_s"]))
+                            )
                 self._sweep()
                 if cleared_pins:
                     self._save()
@@ -197,18 +236,12 @@ class LeaseStore:
         defaults = config.get("defaults")
         if not isinstance(defaults, dict):
             raise ValueError("defaults must be a mapping")
-        self.default_ttl = duration(defaults["ttl"])
-        self.max_ttl = duration(defaults["max_ttl"])
-        self.manual_max_ttl = duration(defaults.get("manual_max_ttl", "365d"))
-        self.cooldown = duration(defaults["cooldown"])
-        self.client_idle_expiry = duration(defaults["client_idle_expiry"])
+        self.default_ttl = float(duration(defaults["ttl"]))
+        self.cooldown = float(duration(defaults["cooldown"]))
+        self.client_idle_expiry = float(duration(defaults["client_idle_expiry"]))
         self.client_limit = defaults["max_leases_per_client"]
         if type(self.client_limit) is not int or self.client_limit < 1:
             raise ValueError("max_leases_per_client must be a positive integer")
-        if self.default_ttl > self.max_ttl or self.max_ttl > 4 * 3600:
-            raise ValueError("ttl must not exceed max_ttl and max_ttl must not exceed 4h")
-        if self.manual_max_ttl < self.default_ttl:
-            raise ValueError("manual_max_ttl must not be less than the default ttl")
         if not isinstance(config.get("groups"), list):
             raise ValueError("groups must be a list")
         names: set[str] = set()
@@ -260,14 +293,21 @@ class LeaseStore:
                 if lease["group"] in active_groups or lease["client_id"] not in self._clients:
                     raise ValueError("duplicate active group or missing active client")
                 active_groups.add(lease["group"])
-            if not all(timestamp(lease.get(k)) for k in ("acquired_ts", "renewed_ts", "expires_ts")):
+            if not all(timestamp(lease.get(k)) for k in ("acquired_ts", "renewed_ts")):
                 raise ValueError("invalid lease timestamps")
             if "last_used_ts" in lease and not timestamp(lease["last_used_ts"]):
                 raise ValueError("invalid lease last-use timestamp")
             if type(lease.get("manual", False)) is not bool:
                 raise ValueError("invalid manual lease marker")
-            maximum = self.manual_max_ttl if lease.get("manual") else self.max_ttl
-            if not timestamp(lease.get("ttl_s")) or not 0 < lease["ttl_s"] <= maximum:
+            ttl = lease.get("ttl_s")
+            deadline = lease.get("expires_ts")
+            try:
+                valid_ttl = ttl is None and deadline is None and lease.get("ttl") == "never"
+                if ttl is not None and deadline is not None and type(ttl) is not bool:
+                    valid_ttl = exact(ttl) > 0 and exact(deadline) >= 0
+            except (ValueError, TypeError, ZeroDivisionError, OverflowError):
+                valid_ttl = False
+            if not valid_ttl:
                 raise ValueError("invalid lease ttl")
             if not isinstance(lease.get("members"), dict) or not isinstance(lease.get("events"), list):
                 raise ValueError("invalid lease members or events")
@@ -334,10 +374,15 @@ class LeaseStore:
     def _sweep(self) -> None:
         now, changed = self._clock(), False
         for lease in self._leases.values():
-            if lease["state"] == "active" and not lease["running_jobs"] and lease["expires_ts"] <= now:
+            if (
+                lease["state"] == "active"
+                and not lease["running_jobs"]
+                and lease["expires_ts"] is not None
+                and exact(lease["expires_ts"]) <= exact(now)
+            ):
                 lease["state"] = "expired"
                 lease["expired_ts"] = lease["expires_ts"]
-                self._event(lease, "expired", expires_at=utc_iso(lease["expires_ts"]))
+                self._event(lease, "expired", expires_at=deadline_iso(lease["expires_ts"]))
                 changed = True
         active = {item["client_id"] for item in self._leases.values() if item["state"] == "active"}
         for client_id, client in list(self._clients.items()):
@@ -348,12 +393,13 @@ class LeaseStore:
         # Ended leases live on in audit.jsonl; keep each group's latest for cooldown and revival.
         latest = {item["group"]: lease_id for lease_id, item in self._leases.items()}
         for lease_id, lease in list(self._leases.items()):
-            ended = lease.get("released_ts", lease.get("expired_ts", lease["expires_ts"]))
+            ended = lease.get("released_ts", lease.get("expired_ts"))
             if (
                 lease["state"] != "active"
                 and not lease["running_jobs"]
                 and latest[lease["group"]] != lease_id
-                and now - ended >= ENDED_LEASE_RETENTION_S
+                and ended is not None
+                and exact(now) - exact(ended) >= ENDED_LEASE_RETENTION_S
             ):
                 del self._leases[lease_id]
                 changed = True
@@ -403,7 +449,8 @@ class LeaseStore:
             last_use_known="last_used_ts" in lease or last_used > 0,
             last_used_at=utc_iso(last_used) if last_used >= lease["acquired_ts"] else None,
             acquired_at=utc_iso(lease["acquired_ts"]),
-            expires_at=utc_iso(lease["expires_ts"]),
+            expires_at=deadline_iso(lease["expires_ts"]),
+            expires_unix_s=exact_text(exact(lease["expires_ts"])) if lease["expires_ts"] is not None else None,
             renewed_at=utc_iso(lease["renewed_ts"]),
             jobs_url=f"/v1/jobs?lease_id={lease['lease_id']}",
         )
@@ -510,10 +557,10 @@ class LeaseStore:
         lease = self._active(key)
         use = self._uses.get(key, {})
         allocation = self._latest(key)
-        latest = allocation.get("expired_ts", 0) if allocation and allocation["state"] == "expired" else 0
+        latest = exact(allocation.get("expired_ts", 0)) if allocation and allocation["state"] == "expired" else 0
         released = allocation.get("released_ts", 0) if allocation and allocation["state"] == "released" else 0
-        last = max(use.get("at", 0), latest)
-        leasable = last + self.cooldown if last > released else 0
+        last = max(exact(use.get("at", 0)), latest)
+        leasable = last + exact(self.cooldown) if last > exact(released) else 0
         online = True
         for layer in group["require_online"]:
             target_id = group["members"].get(layer)
@@ -534,16 +581,17 @@ class LeaseStore:
             if leasable > self._clock()
             else "free"
         )
+        deadline = lease["expires_ts"] if lease else leasable
+        retry = None if deadline is None else max(0, int(exact(deadline) - exact(self._clock())) + 1)
         return {
             **copy.deepcopy(group),
             "state": state,
             "lease": self._view(lease, events=False) if lease else None,
-            "leasable_at": utc_iso(lease["expires_ts"] if lease else leasable)
-            if (lease or leasable)
-            else None,
+            "leasable_at": deadline_iso(deadline) if deadline else None,
+            "leasable_unix_s": exact_text(exact(deadline)) if deadline else None,
             "last_used_at": utc_iso(use.get("at")),
             "last_used_by": use.get("by"),
-            "retry_after_s": max(0, int((lease["expires_ts"] if lease else leasable) - self._clock()) + 1),
+            "retry_after_s": wire_number(Fraction(retry)) if retry is not None else None,
         }
 
     def groups(self, *, probe: bool = False) -> list[dict[str, Any]]:
@@ -566,15 +614,14 @@ class LeaseStore:
                 "leasable_at": view["leasable_at"],
             }
 
-    def _ttl(self, ttl: str | None, *, manual: bool = False) -> tuple[str, float]:
+    def _ttl(self, ttl: str | None, *, manual: bool = False) -> tuple[str, int | str | None]:
         ttl = self.config["defaults"]["ttl"] if ttl is None else ttl
+        if ttl == "never":
+            return "never", None
         try:
-            seconds = duration(ttl)
-        except ValueError as exc:
+            seconds = wire_number(duration(ttl))
+        except (ValueError, OverflowError) as exc:
             raise LeaseError(str(exc)) from exc
-        maximum = self.manual_max_ttl if manual else self.max_ttl
-        if seconds > maximum:
-            raise LeaseError(f"ttl must not exceed {maximum:g} seconds")
         return ttl, seconds
 
     def _resolve_group(
@@ -593,17 +640,9 @@ class LeaseStore:
     def _untargeted_candidates(
         self, client_id: str, groups: dict[str, dict[str, Any]], excluded: set[str]
     ) -> list[dict[str, Any]]:
-        cutoff = self._clock() - RELEASE_RETRY_WINDOW_S
-        recent: dict[str, tuple[float, int]] = {}
-        for index, lease in enumerate(self._leases.values()):
-            if lease["client_id"] == client_id and lease["state"] == "released":
-                released = lease.get("released_ts", 0)
-                if released > cutoff:
-                    key = lease["group"]
-                    recent[key] = max(recent.get(key, (0, 0)), (released, index))
-        # Prefer fresh alternatives, then try the least recently released group.
-        keys = sorted((key for key in groups if key not in excluded), key=lambda key: recent.get(key, (0, 0)))
-        return [groups[key] for key in keys]
+        candidates = [group for key, group in groups.items() if key not in excluded]
+        random.shuffle(candidates)
+        return candidates
 
     def acquire(
         self,
@@ -665,6 +704,10 @@ class LeaseStore:
                 reclaim = previous and previous["state"] == "expired" and previous["client_id"] == client_id
                 if view["state"] == "free" or (view["state"] == "cooling" and reclaim):
                     now = self._clock()
+                    try:
+                        expires_ts = expiry(now, seconds)
+                    except (ValueError, OverflowError) as exc:
+                        raise LeaseError(f"cannot represent lease expiry: {exc}") from exc
                     lease_id = "ls-" + uuid.uuid4().hex
                     lease = {
                         "lease_id": lease_id,
@@ -682,18 +725,23 @@ class LeaseStore:
                         "acquired_ts": now,
                         "last_used_ts": 0,
                         "renewed_ts": now,
-                        "expires_ts": now + seconds,
+                        "expires_ts": expires_ts,
                         "running_jobs": [],
                         "events": [],
                     }
+                    self._view(lease)
                     self._leases[lease_id] = lease
                     client["last_seen_ts"] = now
                     self._event(lease, "acquired")
                     self._save()
                     return {**self._view(lease), "created": True}
             if target is None:
-                retry = min(
-                    (v["retry_after_s"] for v in views if v["state"] in ("leased", "cooling")), default=15
+                retries = [
+                    int(v["retry_after_s"]) for v in views
+                    if v["state"] in ("leased", "cooling") and v["retry_after_s"] is not None
+                ]
+                retry = wire_number(Fraction(min(retries))) if retries else (
+                    None if any(v["state"] == "leased" for v in views) else 15
                 )
                 views.extend({"group": key, "state": "excluded"} for key in groups if key in excluded)
                 raise LeaseError(
@@ -748,7 +796,7 @@ class LeaseStore:
             self._sweep()
             return self._view(self._lease(lease_id))
 
-    def _renew(self, lease: dict[str, Any]) -> None:
+    def _renew(self, lease: dict[str, Any], parsed: tuple[str, int | str | None] | None = None) -> None:
         if lease["state"] == "released":
             raise LeaseError("lease was released", status=409, code="lease_released")
         current = self._latest(lease["group"])
@@ -771,9 +819,15 @@ class LeaseStore:
             raise LeaseError(
                 "client holds the maximum number of leases", status=409, code="client_lease_limit"
             )
+        ttl, seconds = parsed if parsed is not None else (lease["ttl"], lease["ttl_s"])
+        try:
+            new_expiry = expiry(self._clock(), seconds)
+        except (ValueError, OverflowError) as exc:
+            raise LeaseError(f"cannot represent lease expiry: {exc}") from exc
+        lease["ttl"], lease["ttl_s"] = ttl, seconds
         lease["state"] = "active"
         lease["renewed_ts"] = self._clock()
-        lease["expires_ts"] = self._clock() + lease["ttl_s"]
+        lease["expires_ts"] = new_expiry
         client = self._clients.get(lease["client_id"])
         if client is None:
             client = copy.deepcopy(lease["client_record"])
@@ -795,9 +849,7 @@ class LeaseStore:
             if lease["client_id"] != client_id:
                 raise LeaseError("only the holder may renew this lease", status=403, code="not_lease_holder")
             parsed = self._ttl(ttl, manual=manual and lease.get("manual", False)) if ttl is not None else None
-            if parsed:
-                lease["ttl"], lease["ttl_s"] = parsed
-            self._renew(lease)
+            self._renew(lease, parsed)
             return self._view(lease)
 
     def release(
@@ -905,5 +957,5 @@ class LeaseStore:
                     self._event(lease, "unpinned", job_id=job.id, state=job.state)
                     if lease["state"] == "active" and not lease["running_jobs"]:
                         lease["renewed_ts"] = self._clock()
-                        lease["expires_ts"] = self._clock() + lease["ttl_s"]
+                        lease["expires_ts"] = expiry(self._clock(), lease["ttl_s"])
             self._save_soon()

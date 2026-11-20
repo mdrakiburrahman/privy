@@ -881,6 +881,10 @@ def lease_state(state: str) -> str:
 def lease_timer(lease: dict[str, Any], now: float) -> str:
     running = lease.get("running_jobs") or []
     ttl = str(lease.get("ttl") or f"{lease.get('ttl_s', 0)}s")
+    if ttl == "never":
+        return '<span class="sub">never expires</span>'
+    if lease.get("expires_unix_s") and not lease.get("expires_at"):
+        return f'<span class="sub">idle TTL {esc(ttl)} · deadline Unix seconds {esc(lease["expires_unix_s"])}</span>'
     if lease.get("state", "active") != "active":
         return f'<span class="sub">expires {lease_at(lease.get("expires_at"))}</span>'
     if running:
@@ -890,7 +894,7 @@ def lease_timer(lease: dict[str, Any], now: float) -> str:
         )
     expiry = lease_time(lease.get("expires_at"))
     remaining = max(0, expiry - now) if expiry is not None else 0
-    ttl_s = lease.get("ttl_s") or remaining or 1
+    ttl_s = float(lease.get("ttl_s") or remaining or 1)
     return (
         f'{hbar(remaining / ttl_s)}<span class="sub">expires {lease_at(lease.get("expires_at"))}'
         f" (in {esc(fmt_span(remaining))}) · idle TTL {esc(ttl)}, renews on use</span>"
@@ -975,7 +979,7 @@ def leases_page(service: Any, query: Mapping[str, list[str]], now: float) -> str
     toolbar = (
         '<div class="toolbar">'
         f'<button type="button" class="lease-button primary" id="take-lease" '
-        f'data-default-ttl="{store.default_ttl:g}" data-max-ttl="{store.manual_max_ttl:g}">Take lease</button>'
+        f'data-default-ttl="{store.default_ttl:g}">Take lease</button>'
         '<input type="search" id="leaseq" aria-label="Search leases, clients and groups" '
         f'value="{esc(_last(query, "q"))}" placeholder="filter by client, group, session or purpose…" autocomplete="off">'
         f'<input type="search" id="leaselabel" aria-label="Filter lease labels" value="{esc(_last(query, "label"))}" '

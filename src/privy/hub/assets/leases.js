@@ -249,32 +249,42 @@ window.PrivyLeases = (() => {
     purpose.placeholder = "Reserved for my work";
     const repo = field("Repository label (optional)", "lease-repo"); repo.maxLength = 1024;
     const duration = element("div", "", "duration-picker");
-    const maximum = Number(button.dataset.maxTtl), initial = Math.max(1, Math.ceil(Number(button.dataset.defaultTtl) / 60));
-    const timeLabel = minutes => `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+    const initial = Math.max(1, Math.ceil(Number(button.dataset.defaultTtl) / 60));
+    const timeLabel = minutes => `${String(minutes / 60n).padStart(2, "0")}:${String(minutes % 60n).padStart(2, "0")}`;
     const inputs = {};
-    for (const [part, label] of [["hours", "Hours"], ["minutes", "Minutes"]]) {
+    for (const [part, label] of [["days", "Days"], ["hours", "Hours"], ["minutes", "Minutes"]]) {
       const wrap = element("label", label), input = element("input", "");
       input.type = "number"; input.id = `lease-${part}`; input.min = "0"; input.step = "1"; input.required = true;
-      input.max = part === "hours" ? String(Math.floor(maximum / 3600)) : "59";
-      input.value = String(part === "hours" ? Math.floor(initial / 60) : initial % 60);
+      if (part === "minutes") input.max = "59";
+      input.value = String(part === "days" ? 0 : part === "hours" ? Math.floor(initial / 60) : initial % 60);
       inputs[part] = input;
       wrap.append(input); duration.append(wrap);
       for (const [sign, delta] of [["Decrease", -1], ["Increase", 1]]) {
         const step = element("button", delta > 0 ? "+" : "-", "lease-button");
         step.type = "button"; step.setAttribute("aria-label", `${sign} ${part}`);
         step.onclick = () => {
-          const minutes = Number(inputs.hours.value) * 60 + Number(inputs.minutes.value) + delta * (part === "hours" ? 60 : 1);
-          if (!Number.isInteger(minutes) || minutes < 1 || minutes * 60 > maximum) return;
-          inputs.hours.value = String(Math.floor(minutes / 60)); inputs.minutes.value = String(minutes % 60);
+          if (part === "minutes" && /^\d+$/.test(inputs.hours.value) && /^\d+$/.test(input.value)) {
+            const total = BigInt(inputs.hours.value) * 60n + BigInt(input.value) + BigInt(delta);
+            if (total < 0n) return;
+            inputs.hours.value = String(total / 60n); input.value = String(total % 60n);
+            updateDuration();
+            return;
+          }
+          if (!/^\d+$/.test(input.value)) return;
+          const value = BigInt(input.value) + BigInt(delta);
+          if (value < 0n || (part === "minutes" && value > 59n)) return;
+          input.value = String(value);
           updateDuration();
         };
         duration.append(step);
       }
     }
+    const neverLabel = element("label", "Never expires"), never = element("input", "");
+    never.type = "checkbox"; never.id = "lease-never"; neverLabel.append(never); form.append(neverLabel);
     const display = element("output", ""); display.id = "lease-duration"; duration.append(display);
     const expiry = element("p", "");
     form.append(duration, expiry, element("p",
-      `Duration HH:MM, up to ${timeLabel(Math.floor(maximum / 60))}. Reserves the whole group. ` +
+      "Duration in days, hours and minutes. Reserves the whole group. " +
       "Advisory: unleased commands can still run. Closing this page does not release or renew the lease."));
     const error = element("p", "", "lease-action-error"); error.id = "lease-create-error"; error.setAttribute("role", "alert");
     const actions = element("div", "", "lease-dialog-actions");
@@ -290,14 +300,26 @@ window.PrivyLeases = (() => {
     cancel.onclick = close;
     panel.addEventListener("cancel", event => { event.preventDefault(); close(); });
     function updateDuration() {
-      const hours = inputs.hours.valueAsNumber, minutes = inputs.minutes.valueAsNumber;
-      const total = hours * 60 + minutes;
-      const valid = Number.isInteger(hours) && Number.isInteger(minutes) && hours >= 0 &&
-        minutes >= 0 && minutes < 60 && total >= 1 && total * 60 <= maximum;
-      inputs.minutes.setCustomValidity(valid ? "" : `Choose a duration between 00:01 and ${timeLabel(Math.floor(maximum / 60))}.`);
-      display.textContent = valid ? timeLabel(total) : "--:--";
-      expiry.textContent = valid ? `Expires around ${new Date(Date.now() + total * 60000).toLocaleString()} (local time).` : "Enter a valid duration.";
-      return valid ? total * 60 : null;
+      for (const input of Object.values(inputs)) input.disabled = never.checked;
+      if (never.checked) {
+        inputs.minutes.setCustomValidity("");
+        display.textContent = "Never";
+        expiry.textContent = "Never expires; release the lease when finished.";
+        return "never";
+      }
+      const validParts = Object.values(inputs).every(input => /^\d+$/.test(input.value));
+      const days = validParts ? BigInt(inputs.days.value) : 0n;
+      const hours = validParts ? BigInt(inputs.hours.value) : 0n;
+      const minutes = validParts ? BigInt(inputs.minutes.value) : 0n;
+      const total = days * 1440n + hours * 60n + minutes;
+      const valid = validParts && minutes < 60n && total >= 1n;
+      inputs.minutes.setCustomValidity(valid ? "" : "Choose a positive duration with minutes from 0 to 59.");
+      display.textContent = valid ? `${days ? `${days}d ` : ""}${timeLabel(hours * 60n + minutes)}` : "--:--";
+      const millis = total * 60000n;
+      expiry.textContent = !valid ? "Enter a valid duration." : millis <= 8640000000000000n - BigInt(Date.now())
+        ? `Expires around ${new Date(Date.now() + Number(millis)).toLocaleString()} (local time).`
+        : `Finite duration: ${total * 60n} seconds; calendar date is outside the browser range.`;
+      return valid ? `${total * 60n}s` : null;
     }
     form.addEventListener("input", updateDuration);
     form.onsubmit = async event => {
@@ -360,7 +382,8 @@ window.PrivyLeases = (() => {
     const holder = typeof lease.holder === "object" && lease.holder ? lease.holder : {name: lease.holder};
     panel.append(element("p",
       `${holder.name || lease.client_id || "Unknown holder"} (${holder.kind || "client"}, session ${holder.session_id || "not provided"}) ` +
-      `holds group ${lease.group || target} until ${at(lease.expires_at)}.`));
+      `holds group ${lease.group || target} ${lease.ttl === "never" ? "without expiry" :
+        lease.expires_at ? `until ${at(lease.expires_at)}` : `until Unix second ${lease.expires_unix_s}`}.`));
     if (lease.running_jobs?.length) {
       panel.append(element("p", `Pinned by ${lease.running_jobs.length} running job(s); idle TTL ${lease.ttl || ""} starts after the last job ends.`));
     }

@@ -7,12 +7,14 @@ from privy.hub.rest import REST_OPERATIONS, ROUTES, RestApi, write_job_stream
 from privy.hub.service import OPERATIONS
 
 
-def test_long_dashboard_reservation_requires_same_origin_and_preserves_agent_limit(tmp_path):
+def test_long_dashboard_reservation_requires_same_origin_and_agent_can_use_long_ttl(tmp_path):
     hub = Hub(tmp_path)
     owner = hub.call("POST", "/v1/clients", {"name": "Manual", "kind": "human"}).payload["client_id"]
     body = {"client_id": owner, "target": "dev/box1_windows", "ttl": "8h"}
-    assert hub.call("POST", "/v1/leases", body).status == 400
     assert hub.call("POST", "/v1/leases", body, headers={"X-Privy-UI": "1"}).status == 403
+    agent = hub.call("POST", "/v1/leases", body)
+    assert agent.status == 201 and agent.payload["ttl_s"] == 8 * 3600
+    assert hub.call("DELETE", f"/v1/leases/{agent.payload['lease_id']}?client_id={owner}").status == 200
     headers = {"X-Privy-UI": "1", "Origin": f"http://{HOST}"}
     response = hub.call("POST", "/v1/leases", body, headers=headers)
     assert response.status == 201 and response.payload["manual"]
@@ -21,6 +23,24 @@ def test_long_dashboard_reservation_requires_same_origin_and_preserves_agent_lim
     conflict = hub.call("POST", "/v1/leases", {**body, "client_id": other, "ttl": "1h"})
     assert conflict.status == 409 and conflict.payload["error"]["code"] == "group_leased"
     assert hub.call("DELETE", f"/v1/leases/{response.payload['lease_id']}?client_id={owner}").status == 200
+
+
+def test_long_and_never_ttl_are_supported_by_rest_and_mcp(tmp_path):
+    hub = Hub(tmp_path, {"dev/box1_windows": FakeListener(hostname="BOX1")})
+    owner = hub.call("POST", "/v1/clients", {"name": "Agent"}).payload["client_id"]
+    response = hub.call("POST", "/v1/leases", {
+        "client_id": owner, "target": "dev/box1_windows", "ttl": "9999999d"
+    })
+    assert response.status == 201 and response.payload["ttl_s"] == 863999913600
+    assert response.payload["expires_at"] is None
+    renewal = hub.call("POST", "/mcp", {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "renew_lease", "arguments": {
+            "lease_id": response.payload["lease_id"], "client_id": owner, "ttl": "never"
+        }}
+    })
+    assert renewal.payload["result"]["structuredContent"]["ttl"] == "never"
+    assert hub.call("GET", f"/v1/leases/{response.payload['lease_id']}").payload["expires_at"] is None
 
 
 def test_lease_routes_and_schemas_are_exposed(tmp_path):
@@ -92,7 +112,7 @@ def test_rest_and_mcp_acquisition_honor_member_exclusions(tmp_path):
     owner = hub.call("POST", "/v1/clients", {"name": "Agent"}).payload["client_id"]
     args = {"client_id": owner, "exclude": ["dev/box1_windows"]}
     http = hub.call("POST", "/v1/leases", args)
-    assert http.status == 201 and http.payload["group"] == "dev/box2"
+    assert http.status == 201 and http.payload["group"] != "dev/box1"
     hub.call("DELETE", f"/v1/leases/{http.payload['lease_id']}?client_id={owner}")
     other = hub.call("POST", "/v1/clients", {"name": "MCP agent"}).payload["client_id"]
     mcp = hub.call(
@@ -105,7 +125,7 @@ def test_rest_and_mcp_acquisition_honor_member_exclusions(tmp_path):
             "params": {"name": "acquire_lease", "arguments": {**args, "client_id": other}},
         },
     )
-    assert mcp.payload["result"]["structuredContent"]["group"] == "dev/box2"
+    assert mcp.payload["result"]["structuredContent"]["group"] != "dev/box1"
     response = hub.call("POST", "/v1/leases", {**args, "exclude": [""]})
     assert response.status == 400
 

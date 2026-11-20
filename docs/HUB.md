@@ -98,9 +98,8 @@ not tell you which groups are available now. For a genuine constraint, pass
 name resolves just like `target` and excludes the whole group. Unknown names fail with
 `unknown_target`; an explicit target in an excluded group fails with `target_excluded` without
 picking another group. If no eligible group can be acquired, `none_available` lists excluded groups
-and gives a `retry_after_s` based on eligible groups' availability. Untargeted acquisition prefers
-not to return a group from a lease released by the same client in the past five minutes when an
-eligible alternative exists.
+and gives a `retry_after_s` based on eligible groups' availability. Untargeted acquisition gives
+each eligible group an equal chance, including groups recently released by the same client.
 
 Lease-aware execution endpoints accept `lease_id` in the query, JSON body, or `X-Privy-Lease`
 header. With a lease id, the hub validates group membership and renews the lease as the call is
@@ -116,14 +115,20 @@ rather than on every call.
 ### Reserve a devbox from the dashboard
 
 Open `http://localhost:7748/ui/leases` and choose **Take lease**. Select a devbox group, enter your
-holder name and purpose, optionally add a repository label, and set the duration with the **HH:MM**
-hours/minutes fields and **+ / -** buttons. The form shows the member layers and expected expiry
+holder name and purpose, optionally add a repository label, and set days, hours and minutes or
+choose **Never expires**. The form shows the member layers and expected expiry
 before you submit.
 
-Manual dashboard reservations can exceed four hours, up to `manual_max_ttl` (365 days by default).
-This optional setting lives in `leases.yaml` under `defaults`; existing configurations work without
-it. Ordinary agent leases still use `max_ttl`, which cannot exceed four hours. The picker measures a
-duration, not a time of day: `36:00` means 36 hours, without midnight wrapping.
+Both dashboard and API leases accept long finite durations without a policy maximum. Use a duration
+string such as `999h` or `9999999d`, or the explicit `never` token for a lease that must be
+released. Omitting TTL on acquisition still uses the configured default (30 minutes by default);
+omitting it on renewal preserves the lease's current duration or never-expiring mode. Existing
+`max_ttl` and `manual_max_ttl` configuration entries are accepted but no longer enforced.
+The picker measures a duration, not a time of day: `36:00` means 36 hours.
+
+Finite responses expose `expires_unix_s` as exact decimal Unix seconds, even when the deadline
+is beyond the calendar range and `expires_at` is null. A never-expiring lease has null expiry and
+TTL seconds and reports `ttl` as `never`. A never-expiring blocker has a null `retry_after_s`.
 
 The whole group is reserved, so selecting `raki-onebox-executor-1` covers its Windows, WSL, and
 devcontainer members. Another client cannot acquire any of them until the reservation expires or is

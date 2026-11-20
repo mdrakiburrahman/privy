@@ -50,31 +50,19 @@ def acquire(store, client_id, target="raki-windows-big", **kwargs):
     return store.acquire(client_id, target=target, **kwargs)
 
 
-def test_untargeted_release_retry_prefers_other_groups_after_restart(leasing, tmp_path):
+def test_untargeted_selection_can_choose_each_eligible_group_after_release(leasing, tmp_path, monkeypatch):
     hub, store, now = leasing
-    owner, other = client(store), client(store, "other")
-    first = store.acquire(owner)
-    store.release(first["lease_id"], owner)
+    owner = client(store)
     restored = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
-
-    second = restored.acquire(owner)
-    assert second["group"] != first["group"]
-    restored.release(second["lease_id"], owner)
-    other_lease = restored.acquire(other)
-    assert other_lease["group"] == first["group"]
-    restored.release(other_lease["lease_id"], other)
-
-    # A pinned request still grants and renews the requested group.
-    pinned = restored.acquire(owner, target=second["group"], exclude=[first["group"]])
-    assert pinned["group"] == second["group"]
-    assert restored.acquire(owner, target=second["group"])["lease_id"] == pinned["lease_id"]
-    restored.release(pinned["lease_id"], owner)
-    # Do not impose a cooldown when no alternative is eligible.
-    fallback = restored.acquire(owner, exclude=[second["group"], "dev/single"])
-    assert fallback["group"] == first["group"]
-    restored.release(fallback["lease_id"], owner)
-    now[0] += 301
-    assert restored.acquire(owner)["group"] == first["group"]
+    for selected in ("dev/raki-windows-big", "dev/raki-windows-big-3", "dev/single"):
+        monkeypatch.setattr("privy.hub.leases.random.shuffle", lambda values, selected=selected: values.sort(
+            key=lambda group: group["group"] != selected
+        ))
+        lease = restored.acquire(owner)
+        assert lease["group"] == selected
+        restored.release(lease["lease_id"], owner)
+        assert restored.acquire(owner)["group"] == selected
+        restored.release(restored.get_client(owner)["leases"][0], owner)
 
 
 def test_exclusions_filter_groups_and_diagnostics_before_availability(leasing):
@@ -121,20 +109,76 @@ def test_manual_duration_survives_restart_and_excludes_other_clients(leasing, tm
     assert acquire(restored, other)["created"]
 
 
-def test_manual_and_agent_duration_limits_are_separate(leasing):
-    _, store, now = leasing
+@pytest.mark.parametrize("manual", [False, True])
+@pytest.mark.parametrize("ttl,seconds", [("999h", 3596400), ("9999999h", 35999996400),
+                                         ("9999999d", 863999913600)])
+def test_long_finite_duration_round_trips_activity_and_restart(leasing, tmp_path, manual, ttl, seconds):
+    hub, store, now = leasing
     owner = client(store)
-    with pytest.raises(LeaseError, match="ttl"):
-        acquire(store, owner, ttl="5h")
-    for ttl in ("0m", "-1h", "366d"):
+    lease = acquire(store, owner, ttl=ttl, manual=manual)
+    assert lease["ttl_s"] == seconds
+    assert lease["expires_unix_s"] == str(int(now[0]) + seconds)
+    if ttl == "9999999d":
+        assert lease["expires_at"] is None
+    now[0] += 10
+    touched = store.touch(lease["lease_id"])
+    assert touched["expires_unix_s"] == str(int(now[0]) + seconds)
+    store.flush()
+    restored = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
+    assert restored.get_lease(lease["lease_id"])["expires_unix_s"] == touched["expires_unix_s"]
+    assert restored.renew(lease["lease_id"], owner)["ttl"] == ttl
+    for invalid in ("0m", "-1h", "nan", ""):
         with pytest.raises(LeaseError):
-            acquire(store, owner, ttl=ttl, manual=True)
-    lease = acquire(store, owner, ttl="365d", manual=True)
+            restored.renew(lease["lease_id"], owner, invalid)
+    assert restored.get_lease(lease["lease_id"])["ttl"] == ttl
+
+
+def test_never_expiry_restart_switch_and_release(leasing, tmp_path):
+    hub, store, now = leasing
+    owner = client(store)
+    lease = acquire(store, owner, ttl="never")
+    assert lease["ttl_s"] is None and lease["expires_at"] is None and lease["expires_unix_s"] is None
+    now[0] += 10**9
+    assert store.touch(lease["lease_id"])["state"] == "active"
+    group = next(group for group in store.groups() if group["group"] == lease["group"])
+    assert group["retry_after_s"] is None and group["leasable_at"] is None
+    other = client(store, "other")
+    with pytest.raises(LeaseError) as conflict:
+        acquire(store, other)
+    assert conflict.value.details["retry_after_s"] is None
+    store.flush()
+    restored = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
+    assert restored.renew(lease["lease_id"], owner)["ttl"] == "never"
+    assert restored.renew(lease["lease_id"], owner, "999h")["ttl_s"] == 3596400
+    assert restored.renew(lease["lease_id"], owner, "never")["ttl_s"] is None
+    restored.release(lease["lease_id"], owner)
+    assert acquire(restored, other)["created"]
+    with pytest.raises(LeaseError) as released:
+        restored.renew(lease["lease_id"], owner, "1h")
+    assert released.value.code == "lease_released"
+
+
+def test_invalid_duration_does_not_create_or_modify_lease(leasing):
+    _, store, _ = leasing
+    owner = client(store)
     with pytest.raises(LeaseError):
-        store.renew(lease["lease_id"], owner, ttl="5h")
-    assert store.renew(lease["lease_id"], owner, ttl="8h", manual=True)["ttl_s"] == 28800
-    now[0] += 28801
-    assert store.get_lease(lease["lease_id"])["state"] == "expired"
+        acquire(store, owner, ttl="9" * 4400 + "d")
+    assert store.list_leases() == []
+    lease = acquire(store, owner, ttl="never")
+    with pytest.raises(LeaseError):
+        store.renew(lease["lease_id"], owner, "9" * 4400 + "d")
+    assert store.get_lease(lease["lease_id"])["ttl"] == "never"
+
+
+def test_large_exact_seconds_and_fractional_duration(leasing, tmp_path):
+    hub, store, now = leasing
+    owner = client(store)
+    lease = acquire(store, owner, ttl="10000000000000000.125s")
+    assert lease["ttl_s"] == "10000000000000000.125"
+    assert lease["expires_unix_s"] == "10000001800000000.125"
+    store.flush()
+    restored = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
+    assert restored.get_lease(lease["lease_id"])["expires_unix_s"] == lease["expires_unix_s"]
 
 
 def test_legacy_config_and_state_remain_readable(leasing, tmp_path):
@@ -350,7 +394,7 @@ def test_holder_only_release_renew_and_max_ttl(leasing):
             operation(lease["lease_id"], other)
         assert error.value.code == "not_lease_holder" and error.value.status == 403
     assert store.renew(lease["lease_id"], owner, "4h")["ttl_s"] == 14400
-    for ttl in ("0m", "-1h", "5h", "bad", "nan", ""):
+    for ttl in ("0m", "-1h", "bad", "nan", ""):
         with pytest.raises(LeaseError):
             store.renew(lease["lease_id"], owner, ttl)
     store.release(lease["lease_id"], owner)
@@ -558,7 +602,6 @@ def test_client_idle_ageout_and_unregister_release(leasing):
         "version: 2",
         "version: 1\ndefaults: []",
         DEFAULT_CONFIG.replace("30m", "0m"),
-        DEFAULT_CONFIG.replace("4h", "5h"),
         DEFAULT_CONFIG.replace("match: '^", "match: '"),
         DEFAULT_CONFIG.replace("{relay}/{group}", "{missing}"),
         DEFAULT_CONFIG.replace("[windows]", "windows"),
