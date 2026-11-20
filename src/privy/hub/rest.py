@@ -742,7 +742,7 @@ def _operation_spec(route: Route, base_url: str, example: guide.Example) -> dict
                         "name": "X-Privy-UI",
                         "in": "header",
                         "required": route.operation == FORCE_RELEASE_OPERATION.name,
-                        "description": "Dashboard manual mode; acquisition may use manual_max_ttl. Requires same-origin Origin.",
+                        "description": "Dashboard manual mode. Requires same-origin Origin.",
                         "schema": {"type": "string", "const": "1"},
                     },
                 ]

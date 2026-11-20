@@ -216,6 +216,31 @@ def test_take_manual_lease_with_duration_picker_reload_and_release(lease_browser
     assert not errors
 
 
+@pytest.mark.parametrize("never", [False, True])
+def test_take_very_long_or_never_manual_lease(lease_browser, never):
+    page, hub, _, _, base, errors = lease_browser
+    page.goto(base + "/ui/leases")
+    page.get_by_role("button", name="Take lease", exact=True).click()
+    page.locator("#lease-group").select_option("dev/box2")
+    page.locator("#lease-purpose").fill("Long reservation")
+    if never:
+        page.locator("#lease-never").check()
+        browser_api.expect(page.locator("#lease-duration")).to_have_text("Never")
+    else:
+        page.locator("#lease-days").fill("9999999")
+        page.locator("#lease-hours").fill("999")
+        page.locator("#lease-minutes").fill("0")
+    page.locator("#lease-create").get_by_role("button", name="Take lease", exact=True).click()
+    browser_api.expect(page.locator("#s-lease-peek")).to_contain_text("Long reservation")
+    lease = next(item for item in hub.service.leases.list_leases() if item.get("manual"))
+    assert lease["ttl_s"] == (None if never else 863999913600 + 999 * 3600)
+    page.reload()
+    browser_api.expect(page.locator("#s-lease-peek")).to_contain_text(
+        "never expires" if never else str(863999913600 + 999 * 3600)
+    )
+    assert not errors
+
+
 def test_take_lease_validation_and_conflict_preserve_draft(lease_browser):
     page, _, _, _, base, errors = lease_browser
     page.goto(base + "/ui/leases")
