@@ -55,9 +55,10 @@ def test_untargeted_selection_can_choose_each_eligible_group_after_release(leasi
     owner = client(store)
     restored = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
     for selected in ("dev/raki-windows-big", "dev/raki-windows-big-3", "dev/single"):
-        monkeypatch.setattr("privy.hub.leases.random.shuffle", lambda values, selected=selected: values.sort(
-            key=lambda group: group["group"] != selected
-        ))
+        monkeypatch.setattr(
+            "privy.hub.leases.random.shuffle",
+            lambda values, selected=selected: values.sort(key=lambda group: group["group"] != selected),
+        )
         lease = restored.acquire(owner)
         assert lease["group"] == selected
         restored.release(lease["lease_id"], owner)
@@ -110,8 +111,9 @@ def test_manual_duration_survives_restart_and_excludes_other_clients(leasing, tm
 
 
 @pytest.mark.parametrize("manual", [False, True])
-@pytest.mark.parametrize("ttl,seconds", [("999h", 3596400), ("9999999h", 35999996400),
-                                         ("9999999d", 863999913600)])
+@pytest.mark.parametrize(
+    "ttl,seconds", [("999h", 3596400), ("9999999h", 35999996400), ("9999999d", 863999913600)]
+)
 def test_long_finite_duration_round_trips_activity_and_restart(leasing, tmp_path, manual, ttl, seconds):
     hub, store, now = leasing
     owner = client(store)
@@ -179,6 +181,38 @@ def test_large_exact_seconds_and_fractional_duration(leasing, tmp_path):
     store.flush()
     restored = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
     assert restored.get_lease(lease["lease_id"])["expires_unix_s"] == lease["expires_unix_s"]
+
+
+def test_far_future_lease_expires_without_calendar_conversion(leasing):
+    _, store, now = leasing
+    owner = client(store)
+    lease = acquire(store, owner, ttl="9999999d")
+    now[0] += 863999913600
+    expired = store.get_lease(lease["lease_id"])
+    assert expired["state"] == "expired"
+    assert expired["events"][-1]["event"] == "expired"
+    assert expired["events"][-1]["at"] is None
+
+
+def test_never_expiry_survives_job_completion_and_stale_pin_recovery(leasing, tmp_path):
+    hub, store, now = leasing
+    lease = acquire(store, client(store), ttl="never")
+    job = SimpleNamespace(
+        target=SimpleNamespace(id=lease["members"]["wsl"]),
+        lease_id=lease["lease_id"],
+        origin="test",
+        purpose=None,
+        id="job-1",
+        state="succeeded",
+    )
+    store.job_started(job)
+    store.job_finished(job)
+    assert store.get_lease(lease["lease_id"])["ttl"] == "never"
+    store.job_started(job)
+    store.flush()
+    restored = LeaseStore(hub.registry, home=tmp_path, clock=lambda: now[0])
+    assert restored.get_lease(lease["lease_id"])["running_jobs"] == []
+    assert restored.get_lease(lease["lease_id"])["expires_unix_s"] is None
 
 
 def test_legacy_config_and_state_remain_readable(leasing, tmp_path):

@@ -360,7 +360,10 @@ class LeaseStore:
                 self._save()
 
     def _event(self, lease: dict[str, Any], event: str, **details: Any) -> None:
-        entry = {"at": utc_iso(self._clock()), "event": event, **details}
+        now = self._clock()
+        entry = {"at": deadline_iso(now), "event": event, **details}
+        if entry["at"] is None:
+            entry["at_unix_s"] = exact_text(exact(now))
         lease["events"].append(entry)
         del lease["events"][:-MAX_LEASE_EVENTS]
         self.audit.record(
@@ -420,8 +423,8 @@ class LeaseStore:
 
     def _client_view(self, client: dict[str, Any]) -> dict[str, Any]:
         return {k: copy.deepcopy(v) for k, v in client.items() if not k.endswith("_ts")} | {
-            "registered_at": utc_iso(client["registered_ts"]),
-            "last_seen_at": utc_iso(client["last_seen_ts"]),
+            "registered_at": deadline_iso(client["registered_ts"]),
+            "last_seen_at": deadline_iso(client["last_seen_ts"]),
             "leases": [
                 item["lease_id"]
                 for item in self._leases.values()
@@ -441,17 +444,19 @@ class LeaseStore:
             last_used = max(last_used, use.get("at", 0))
         if "last_used_ts" not in lease:
             for event in lease.get("events", []):
-                if event["event"] in ("pinned", "unpinned"):
+                if event["event"] in ("pinned", "unpinned") and event.get("at"):
                     last_used = max(
                         last_used, dt.datetime.fromisoformat(event["at"].replace("Z", "+00:00")).timestamp()
                     )
         view.update(
             last_use_known="last_used_ts" in lease or last_used > 0,
-            last_used_at=utc_iso(last_used) if last_used >= lease["acquired_ts"] else None,
-            acquired_at=utc_iso(lease["acquired_ts"]),
+            last_used_at=deadline_iso(last_used) if last_used >= lease["acquired_ts"] else None,
+            acquired_at=deadline_iso(lease["acquired_ts"]),
             expires_at=deadline_iso(lease["expires_ts"]),
-            expires_unix_s=exact_text(exact(lease["expires_ts"])) if lease["expires_ts"] is not None else None,
-            renewed_at=utc_iso(lease["renewed_ts"]),
+            expires_unix_s=exact_text(exact(lease["expires_ts"]))
+            if lease["expires_ts"] is not None
+            else None,
+            renewed_at=deadline_iso(lease["renewed_ts"]),
             jobs_url=f"/v1/jobs?lease_id={lease['lease_id']}",
         )
         client = self._clients.get(lease["client_id"])
@@ -557,7 +562,9 @@ class LeaseStore:
         lease = self._active(key)
         use = self._uses.get(key, {})
         allocation = self._latest(key)
-        latest = exact(allocation.get("expired_ts", 0)) if allocation and allocation["state"] == "expired" else 0
+        latest = (
+            exact(allocation.get("expired_ts", 0)) if allocation and allocation["state"] == "expired" else 0
+        )
         released = allocation.get("released_ts", 0) if allocation and allocation["state"] == "released" else 0
         last = max(exact(use.get("at", 0)), latest)
         leasable = last + exact(self.cooldown) if last > exact(released) else 0
@@ -589,7 +596,7 @@ class LeaseStore:
             "lease": self._view(lease, events=False) if lease else None,
             "leasable_at": deadline_iso(deadline) if deadline else None,
             "leasable_unix_s": exact_text(exact(deadline)) if deadline else None,
-            "last_used_at": utc_iso(use.get("at")),
+            "last_used_at": deadline_iso(use.get("at")),
             "last_used_by": use.get("by"),
             "retry_after_s": wire_number(Fraction(retry)) if retry is not None else None,
         }
@@ -737,11 +744,14 @@ class LeaseStore:
                     return {**self._view(lease), "created": True}
             if target is None:
                 retries = [
-                    int(v["retry_after_s"]) for v in views
+                    int(v["retry_after_s"])
+                    for v in views
                     if v["state"] in ("leased", "cooling") and v["retry_after_s"] is not None
                 ]
-                retry = wire_number(Fraction(min(retries))) if retries else (
-                    None if any(v["state"] == "leased" for v in views) else 15
+                retry = (
+                    wire_number(Fraction(min(retries)))
+                    if retries
+                    else (None if any(v["state"] == "leased" for v in views) else 15)
                 )
                 views.extend({"group": key, "state": "excluded"} for key in groups if key in excluded)
                 raise LeaseError(
@@ -757,6 +767,7 @@ class LeaseStore:
                     "holder": holder["holder"],
                     "lease_id": holder["lease_id"],
                     "expires_at": holder["expires_at"],
+                    "expires_unix_s": holder["expires_unix_s"],
                     "retry_after_s": view["retry_after_s"],
                 }
                 code = "group_leased"

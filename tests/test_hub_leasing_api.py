@@ -28,17 +28,24 @@ def test_long_dashboard_reservation_requires_same_origin_and_agent_can_use_long_
 def test_long_and_never_ttl_are_supported_by_rest_and_mcp(tmp_path):
     hub = Hub(tmp_path, {"dev/box1_windows": FakeListener(hostname="BOX1")})
     owner = hub.call("POST", "/v1/clients", {"name": "Agent"}).payload["client_id"]
-    response = hub.call("POST", "/v1/leases", {
-        "client_id": owner, "target": "dev/box1_windows", "ttl": "9999999d"
-    })
+    response = hub.call(
+        "POST", "/v1/leases", {"client_id": owner, "target": "dev/box1_windows", "ttl": "9999999d"}
+    )
     assert response.status == 201 and response.payload["ttl_s"] == 863999913600
     assert response.payload["expires_at"] is None
-    renewal = hub.call("POST", "/mcp", {
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": "renew_lease", "arguments": {
-            "lease_id": response.payload["lease_id"], "client_id": owner, "ttl": "never"
-        }}
-    })
+    renewal = hub.call(
+        "POST",
+        "/mcp",
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "renew_lease",
+                "arguments": {"lease_id": response.payload["lease_id"], "client_id": owner, "ttl": "never"},
+            },
+        },
+    )
     assert renewal.payload["result"]["structuredContent"]["ttl"] == "never"
     assert hub.call("GET", f"/v1/leases/{response.payload['lease_id']}").payload["expires_at"] is None
 

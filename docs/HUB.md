@@ -116,19 +116,18 @@ rather than on every call.
 
 Open `http://localhost:7748/ui/leases` and choose **Take lease**. Select a devbox group, enter your
 holder name and purpose, optionally add a repository label, and set days, hours and minutes or
-choose **Never expires**. The form shows the member layers and expected expiry
-before you submit.
+choose **Never expires**. The form shows the member layers and expected expiry before you submit.
 
 Both dashboard and API leases accept long finite durations without a policy maximum. Use a duration
 string such as `999h` or `9999999d`, or the explicit `never` token for a lease that must be
 released. Omitting TTL on acquisition still uses the configured default (30 minutes by default);
 omitting it on renewal preserves the lease's current duration or never-expiring mode. Existing
-`max_ttl` and `manual_max_ttl` configuration entries are accepted but no longer enforced.
-The picker measures a duration, not a time of day: `36:00` means 36 hours.
+`max_ttl` and `manual_max_ttl` configuration entries are accepted but no longer enforced. The picker
+measures a duration, not a time of day: `36:00` means 36 hours.
 
-Finite responses expose `expires_unix_s` as exact decimal Unix seconds, even when the deadline
-is beyond the calendar range and `expires_at` is null. A never-expiring lease has null expiry and
-TTL seconds and reports `ttl` as `never`. A never-expiring blocker has a null `retry_after_s`.
+Finite responses expose `expires_unix_s` as exact decimal Unix seconds, even when the deadline is
+beyond the calendar range and `expires_at` is null. A never-expiring lease has null expiry and TTL
+seconds and reports `ttl` as `never`. A never-expiring blocker has a null `retry_after_s`.
 
 The whole group is reserved, so selecting `raki-onebox-executor-1` covers its Windows, WSL, and
 devcontainer members. Another client cannot acquire any of them until the reservation expires or is
